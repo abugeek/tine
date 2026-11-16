@@ -497,11 +497,7 @@ fn calibration_replaces_preset_values() {
         "thresh anchored on calibration"
     );
     // 0.85 + 0.25 exceeds the SPECS max of 1.0 — clamped through SPECS.
-    assert!(
-        out.denoise_mix == 1.0,
-        "mix clamped at SPECS max: {}",
-        out.denoise_mix
-    );
+    assert!(out.denoise_mix == 1.0, "mix clamped at SPECS max: {}", out.denoise_mix);
 
     // Without calibration the same macros anchor on the preset base.
     let out = MacroMapper::apply(&DYNAMIC, None, m, PinSet::EMPTY, &DspParams::DEFAULT);
