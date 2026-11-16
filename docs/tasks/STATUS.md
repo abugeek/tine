@@ -17,7 +17,7 @@
 | T13 | Virtual-cable DSP routing loop (`D-018`) | B — Virtual Cable | done | `task/T13-virtual-cable` | #13 | T13-worker |
 | T14 | Virtual cable discovery, DeviceWatcher & endpoint admin (`D-018`) | B — Virtual Cable | done | `task/T14-endpoint-admin` | #12 | T14-worker |
 | T15 | Engine core: shm client, controller, persistence, devices | C — Engine / App | done | `task/T15-engine-core` | #17 | t15 (GLM) |
-| T16 | Engine audio services: spectrum, Auto-Tune runner, Hear Myself | C — Engine / App | todo | — | — | — |
+| T16 | Engine audio services: spectrum, Auto-Tune runner, Hear Myself | C — Engine / App | done | `task/T16-engine-audio-services` | #23 | t16 (GLM) |
 | T17 | `tine.exe` shell: Rune App, tray, single instance, CLI, logging | C — Engine / App | done | `task/T17-app-shell` | #22 | t17 (GLM) |
 | T18 | UI foundation: view model, theme, headless harness | D — UI | done | `task/T18-ui-foundation` | #6 | T18-worker |
 | T19 | Header + Golden Line canvas | D — UI | done | `task/T19-ui-main-screen` | #18 | t19 (GLM) |
