@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: tine-worker) |
 | Lane | D — UI |
 | Depends on | T11, T19 |
 | Unblocks | T21 |
