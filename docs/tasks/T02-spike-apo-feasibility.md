@@ -38,9 +38,9 @@ Write down everything T13/T14 need to know.
 11. RAW-mode capture (e.g. some games/Discord settings): does it bypass us, and can we detect it?
 
 ## Safety first (no VM or spare PC is available, D-016) — do this before any install
-- [ ] Create a System Restore point (`Checkpoint-Computer -Description "Before Tine APO spike"` in elevated PowerShell).
-- [ ] Export the full capture registry: `reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture" %USERPROFILE%\tine-capture-backup.reg`.
-- [ ] Write `spikes/apo-spike/recover.cmd` (pure `reg`/`sc` commands, no Rust needed) that:
+- [x] Create a System Restore point (`Checkpoint-Computer -Description "Before Tine APO spike"` in elevated PowerShell).
+- [x] Export the full capture registry: `reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture" %USERPROFILE%\tine-capture-backup.reg`.
+- [x] Write `spikes/apo-spike/recover.cmd` (pure `reg`/`sc` commands, no Rust needed) that:
   1. removes the spike CLSID and APO registration keys
   2. re-imports the backup `.reg`
   3. restarts `audiosrv`
@@ -49,10 +49,10 @@ Write down everything T13/T14 need to know.
 - [ ] Only install on **one** endpoint at a time, and never on the endpoint you're using for voice chat at the moment. If audio dies: run `recover.cmd`; if that fails, boot to Safe Mode and run it; last resort, use the restore point.
 
 ## Steps
-- [ ] `spikes/apo-spike` cdylib: class factory, `DllGetClassObject`, `DllCanUnloadNow`; COM object via `windows::core::implement` with the minimal interface set; `APOProcess` multiplies by 0.25 and bumps an atomic heartbeat in shm.
-- [ ] `LockForProcess` writes the negotiated format to `%ProgramData%\TineSpike\format.log` (non-RT call).
-- [ ] All entry points wrapped in `catch_unwind`; a registry flag (`HKLM\SOFTWARE\TineSpike\ForcePanic`), read in `LockForProcess`, triggers a panic in `APOProcess` for question 9.
-- [ ] Spike CLI (`spikes/apo-spike/src/bin/apo-spike.rs`): `list` endpoints · `install <id>` (back up original values to JSON first) · `uninstall <id>` (restore exactly) · `heartbeat` (opens mapping, prints counter/s) · `reload <id>`.
+- [x] `spikes/apo-spike` cdylib: class factory, `DllGetClassObject`, `DllCanUnloadNow`; COM object via `windows::core::implement` with the minimal interface set; `APOProcess` multiplies by 0.25 and bumps an atomic heartbeat in shm.
+- [x] `LockForProcess` writes the negotiated format to `%ProgramData%\TineSpike\format.log` (non-RT call).
+- [x] All entry points wrapped in `catch_unwind`; a registry flag (`HKLM\SOFTWARE\TineSpike\ForcePanic`), read in `LockForProcess`, triggers a panic in `APOProcess` for question 9.
+- [x] Spike CLI (`spikes/apo-spike/src/bin/apo-spike.rs`): `list` endpoints · `install <id>` (back up original values to JSON first) · `uninstall <id>` (restore exactly) · `heartbeat` (opens mapping, prints counter/s) · `reload <id>`.
 - [ ] Run the test matrix on the hardware available (D-016): **dynamic mic** and **gaming headset** × {unsigned, enhancements on/off, RAW mode, each sample rate the device offers}. Record results in a table.
 - [ ] Rows that can't be tested locally (Realtek jack with vendor APO, Bluetooth HFP, webcam/laptop array) are marked `untested — beta` and become mandatory rows of the T22 community-beta matrix. If a Windows laptop can be borrowed for an afternoon, run the spike there too (it covers Realtek + vendor APO + laptop mic).
 - [ ] Write the T13/T14 design notes in `## Result`: interface set, slot, registry recipe, ACL procedure, reload procedure, vendor-wrapping approach.
