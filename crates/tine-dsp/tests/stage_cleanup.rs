@@ -136,7 +136,10 @@ fn denoise_reduces_noise_in_gaps_and_preserves_speech() {
 
 #[test]
 fn latency_is_exact_and_constant_across_rates_and_toggles() {
-    for &(fs, expected_48k) in &[(48_000.0f32, Some(960u32)), (44_100.0f32, None)] {
+    // Full-pipeline latency since T08: CleanupStage 960 (480-sample FIFO framing +
+    // 480-sample `nnnoiseless` overlap-add synthesis delay) + LimiterStage 76
+    // (1.5 ms lookahead = 72 samples + 4-sample true-peak FIR group delay).
+    for &(fs, expected_48k) in &[(48_000.0f32, Some(1_036u32)), (44_100.0f32, None)] {
         let mut pipe = DspPipeline::new(fs, 512);
         let lat = pipe.latency_samples();
         if let Some(exp) = expected_48k {

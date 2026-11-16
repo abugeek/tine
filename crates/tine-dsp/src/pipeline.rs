@@ -108,14 +108,25 @@ impl DspPipeline {
             let n = chunk.len();
 
             // Snapshot input for metering and populate latency-aligned dry path.
+            let mut input_non_finite = false;
             for ((&x, in_slot), dry_slot) in chunk
                 .iter()
                 .zip(self.in_buf.iter_mut().take(n))
                 .zip(self.dry_buf.iter_mut().take(n))
             {
                 *in_slot = x;
-                let safe_x = if x.is_finite() { x } else { 0.0 };
+                let safe_x = if x.is_finite() {
+                    x
+                } else {
+                    input_non_finite = true;
+                    0.0
+                };
                 *dry_slot = self.dry_delay.push_read(safe_x, delay);
+            }
+
+            if input_non_finite && !self.passthrough_latched {
+                self.reset_stages();
+                self.passthrough_latched = true;
             }
 
             let mut stage_meters = StageMeters::default();

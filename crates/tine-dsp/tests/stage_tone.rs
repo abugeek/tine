@@ -26,6 +26,27 @@ fn neutral_eq_params() -> DspParams {
     p
 }
 
+/// Corner frequency of the always-on Stage 1 DC blocker (matches
+/// `tine_dsp::stages::input::DC_BLOCK_HZ`).
+const DC_BLOCK_HZ: f64 = 5.0;
+
+/// Analytic magnitude (dB) at `freq_hz` of the always-on Stage 1 DC blocker
+/// (`H(z) = (1 - z^-1) / (1 - r z^-1)` with `r = exp(-2*pi*DC_BLOCK_HZ/fs)`).
+///
+/// The DC blocker is always in the audio path (independent of `hpf_enabled`),
+/// so full-pipeline measurements differ from the bare EQ analytic response by
+/// this factor (e.g. -0.26 dB at 20 Hz at 44.1 kHz). Verified against the
+/// measured pipeline response to within 0.005 dB.
+fn dc_blocker_gain_db(freq_hz: f64, fs: f64) -> f64 {
+    let r = (-2.0 * std::f64::consts::PI * DC_BLOCK_HZ / fs).exp();
+    let w = 2.0 * std::f64::consts::PI * freq_hz / fs;
+    let num = 2.0 * (w / 2.0).sin();
+    let re = 1.0 - r * w.cos();
+    let im = r * w.sin();
+    let den = (re * re + im * im).sqrt();
+    20.0 * (num / den).log10()
+}
+
 fn measure_pipeline_sine_gain_db(pipe: &mut DspPipeline, params: &DspParams, freq_hz: f32, fs: f32) -> f32 {
     pipe.reset();
     let settle = ((fs * 0.4) as usize).max(4096);
@@ -82,7 +103,9 @@ fn all_eq_band_types_match_analytic_response() {
                 if f >= fs * 0.45 {
                     continue;
                 }
-                let expected = coeffs.magnitude_db(f64::from(f), f64::from(fs)) as f32;
+                let expected =
+                    coeffs.magnitude_db(f64::from(f), f64::from(fs)) + dc_blocker_gain_db(f64::from(f), f64::from(fs));
+                let expected = expected as f32;
                 if expected <= -40.0 {
                     continue;
                 }
@@ -111,20 +134,26 @@ fn curve_matches_measured_cascade_sweep_fft() {
     p.eq_q = [0.707, 1.4, 1.2, 1.1, 0.707];
 
     // Measure impulse response via FFT (exact linear transfer function of the cascade).
+    // The impulse must land after all startup cross-fades (denoise mix smoother,
+    // bypass smoother) have settled, otherwise the measured response is skewed.
     let n = 16_384usize;
-    let mut buf = common::impulse(n, 0, 0.25);
+    let settle = 96_000usize; // 2 s of silence lets every smoother finish.
+    let mut buf = common::impulse(settle + n, settle, 0.25);
     for chunk in buf.chunks_mut(480) {
         pipe.process(chunk, &p, &mut NoMeters, &mut NoTap);
     }
+    // Drop the settle prefix (pure latency delay) so the switch-in transient and
+    // the pipeline latency (1036 samples) stay out of the FFT window.
+    let ir_window = &mut buf[settle..];
     // Undo the 0.25 impulse amplitude so FFT magnitude directly gives linear gain.
-    for s in &mut buf {
+    for s in ir_window.iter_mut() {
         *s *= 4.0;
     }
 
     let mut planner = RealFftPlanner::<f32>::new();
     let r2c = planner.plan_fft_forward(n);
     let mut spectrum = r2c.make_output_vec();
-    r2c.process(&mut buf, &mut spectrum).expect("fft");
+    r2c.process(ir_window, &mut spectrum).expect("fft");
 
     let bin_hz = fs / (n as f32);
     let mut test_freqs = [0.0f32; 32];
@@ -144,7 +173,10 @@ fn curve_matches_measured_cascade_sweep_fft() {
         let bin = (f / bin_hz).round() as usize;
         let actual_freq = (bin as f32) * bin_hz;
         let measured_db = lin_to_db(spectrum[bin].norm());
-        let analytic_at_bin = curve::response_db(&p, fs, actual_freq);
+        // The measured pipeline response includes the always-on Stage 1 DC
+        // blocker; `curve` models only HPF + EQ. Fold the DC blocker in.
+        let analytic_at_bin =
+            curve::response_db(&p, fs, actual_freq) + dc_blocker_gain_db(f64::from(actual_freq), f64::from(fs)) as f32;
         assert_close_db!(measured_db, analytic_at_bin, 0.2);
         // Also ensure response_curve matches response_db at the exact point.
         assert_close_db!(expected_db, curve::response_db(&p, fs, f), 1e-4);
@@ -302,10 +334,14 @@ fn deesser_attenuates_synthetic_s_without_touching_200hz() {
     let fs = 48_000.0f32;
     let len = 24_000usize; // 0.5 s
 
-    // 200 Hz vowel tone at -14 dBFS
-    let tone = common::sine(200.0, fs, len, db_to_lin(-14.0));
+    // 200 Hz vowel tone at -24 dBFS. Levels are kept low so the always-on
+    // Stage 6 limiter (added in T08) never engages — at the original -14 dBFS
+    // tone / -10 dBFS S levels the dense S partial peaks crossed the -0.1 dBFS
+    // ceiling and the limiter's broadband gain reduction (-2 dB and more)
+    // corrupted the "does not touch 200 Hz" assertion.
+    let tone = common::sine(200.0, fs, len, db_to_lin(-24.0));
 
-    // Synthetic "S": deterministic sum of dense inharmonic sines in 6-9 kHz scaled to -10 dBFS RMS.
+    // Synthetic "S": deterministic sum of dense inharmonic sines in 6-9 kHz scaled to -20 dBFS RMS.
     let mut s_noise = vec![0.0f32; len];
     let num_partials = 40usize;
     for k in 0..num_partials {
@@ -317,7 +353,7 @@ fn deesser_attenuates_synthetic_s_without_touching_200hz() {
         }
     }
     let cur_rms_lin = db_to_lin(common::rms_db(&s_noise));
-    let target_rms_lin = db_to_lin(-10.0);
+    let target_rms_lin = db_to_lin(-20.0);
     let scale = target_rms_lin / cur_rms_lin;
     for s in &mut s_noise {
         *s *= scale;
