@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T02-worker) |
 | Lane | B — Windows / APO |
 | Depends on | T01 |
 | Unblocks | T13, T14 |
