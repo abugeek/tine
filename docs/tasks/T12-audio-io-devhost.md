@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T12-worker) |
 | Lane | C — Engine / App |
 | Depends on | T03, T05 |
 | Unblocks | T15, T16 |
