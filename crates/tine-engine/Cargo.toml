@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 tine-protocol = { workspace = true, features = ["std", "serde"] }
 tine-dsp = { workspace = true, features = ["std"] }
+bytemuck.workspace = true
 cpal.workspace = true
 realfft.workspace = true
 rubato.workspace = true
