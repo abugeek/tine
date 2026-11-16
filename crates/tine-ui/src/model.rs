@@ -74,18 +74,19 @@ pub struct CalibrationUi {
     pub noise_rms_db: f32,
     /// Measured vocal speech RMS in dBFS.
     pub speech_rms_db: f32,
+    /// Output peak of `finish()`'s offline full-pipeline verification (dBFS),
+    /// proven to land in `-6..-3` (T11).
+    pub simulated_peak_db: f32,
+    /// Output RMS of the offline verification (dBFS).
+    pub simulated_rms_db: f32,
     /// Parameters modified by the calibration.
     pub changes: Vec<CalibrationParamDiff>,
 }
 
-/// UI-side view-model mirror of the `tine-dsp` `CalFailure` contract (T11,
-/// `docs/tasks/T11-auto-calibrator.md`).
-///
-/// TODO(T11): while `tine-dsp::calibrator` is in flight, this plain-data enum carries the
-/// documented failure variants into the wizard. When T11 merges, the engine runner (`tine-app`,
-/// T21) maps `tine_dsp::calibrator::CalFailure` into this type in **one place** — the narrow
-/// adapter documented next to `views/autotune.rs` — and this mirror keeps only the fields the
-/// wizard's failure card needs.
+/// UI view-model of a calibration rejection: `tine_dsp::calibrator::CalFailure`
+/// (T11, `docs/tasks/T11-auto-calibrator.md`) mapped into `tine-ui` in **one
+/// place** (`views/autotune.rs` — the narrow adapter between the engine-side
+/// state machine and this wizard's view model).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CalFailureUi {
     /// Signal (and room) stayed below every usable threshold.
@@ -134,14 +135,20 @@ impl CalFailureUi {
     }
 }
 
-/// Current step of the 8-second Auto-Tune wizard modal.
+/// Current step of the 8-second Auto-Tune wizard modal, mapped 1:1 from
+/// `tine_dsp::calibrator::CalPhase` (Countdown → Noise → Voice → Analyzing →
+/// Done/Failed) by the adapter in `views/autotune.rs`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum AutoTuneStep {
     /// Wizard is closed.
     #[default]
     Idle,
-    /// Preparation screen before silence capture begins.
-    Prepare,
+    /// Countdown phase: the first second, discarded (get ready / settle) —
+    /// tips plus a 1 s countdown ring.
+    Prepare {
+        /// Remaining seconds in the countdown phase.
+        remaining_secs: f32,
+    },
     /// Phase 1: 3 seconds of room silence capture.
     Silence {
         /// Remaining seconds in this phase.
@@ -172,6 +179,9 @@ pub struct AutoTuneUi {
     pub level_db: f32,
     /// Prompt sentence shown during the Speak phase.
     pub prompt_text: String,
+    /// Total voiced audio detected so far in the voice phase (ms)
+    /// (`CalProgress::voiced_ms`).
+    pub voiced_ms: u32,
 }
 
 impl Default for AutoTuneUi {
@@ -181,6 +191,7 @@ impl Default for AutoTuneUi {
             progress: 0.0,
             level_db: -60.0,
             prompt_text: String::from("The quick brown fox jumps over the lazy dog."),
+            voiced_ms: 0,
         }
     }
 }

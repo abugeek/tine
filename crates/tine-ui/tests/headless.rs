@@ -782,9 +782,10 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
     set_step(
         &mut rt,
         AutoTuneUi {
-            step: AutoTuneStep::Prepare,
+            step: AutoTuneStep::Prepare { remaining_secs: 0.9 },
             progress: 0.0,
             level_db: -48.0,
+            voiced_ms: 0,
             prompt_text: String::new(),
         },
     );
@@ -802,6 +803,7 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
         AutoTuneUi {
             step: AutoTuneStep::Silence { remaining_secs: 2.1 },
             progress: 0.3,
+            voiced_ms: 0,
             level_db: -51.4,
             prompt_text: String::new(),
         },
@@ -818,6 +820,7 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
         AutoTuneUi {
             step: AutoTuneStep::Speak { remaining_secs: 3.2 },
             progress: 0.66,
+            voiced_ms: 2600,
             level_db: -21.5,
             prompt_text: String::new(),
         },
@@ -830,6 +833,7 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
         AutoTuneUi {
             step: AutoTuneStep::Analyzing,
             progress: 0.92,
+            voiced_ms: 3200,
             level_db: -24.0,
             prompt_text: String::new(),
         },
@@ -841,6 +845,8 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
         // set before the set_step below, which invalidates
         noise_rms_db: -51.4,
         speech_rms_db: -21.5,
+        simulated_peak_db: -4.5,
+        simulated_rms_db: -17.2,
         changes: vec![tine_ui::CalibrationParamDiff {
             param: tine_protocol::params::ParamId::CompRatio,
             label: "Comp Ratio",
@@ -854,6 +860,7 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
         AutoTuneUi {
             step: AutoTuneStep::Results,
             progress: 1.0,
+            voiced_ms: 4800,
             level_db: -18.0,
             prompt_text: String::new(),
         },
@@ -882,6 +889,7 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
         AutoTuneUi {
             step: AutoTuneStep::Failed(CalFailureUi::Clipping { pct: 0.02 }),
             progress: 0.0,
+            voiced_ms: 400,
             level_db: -2.0,
             prompt_text: String::new(),
         },
@@ -909,6 +917,7 @@ fn auto_tune_wizard_scripted_run_through_every_step() {
         AutoTuneUi {
             step: AutoTuneStep::Silence { remaining_secs: 1.0 },
             progress: 0.5,
+            voiced_ms: 0,
             level_db: -50.0,
             prompt_text: String::new(),
         },

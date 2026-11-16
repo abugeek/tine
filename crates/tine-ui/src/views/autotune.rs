@@ -1,40 +1,142 @@
 //! Auto-Tune (8 s) wizard overlay: a focus-trapping modal over the Golden Line
-//! that walks the documented phase machine — Prepare (tips) → Silence 3 s
-//! (countdown ring + live level) → Speak 5 s (suggested sentence + level) →
-//! Analyzing → Results (noise floor, speech level, SNR, before → after diffs,
-//! "Keep my Pro pins", Apply/Discard/Retry) or a Failed card with a concrete
-//! remedy for each `CalFailure` variant.
+//! that walks the real calibration phase machine —
+//! `tine_dsp::calibrator::CalPhase`: Countdown 1 s (Prepare: tips + countdown
+//! ring) → Noise 3 s (Silence: ring + live level) → Voice 5 s (Speak: suggested
+//! sentence + level + voiced-so-far) → Analyzing → Results (noise floor, speech
+//! level, SNR, verified output peak, before → after diffs, "Keep my Pro pins",
+//! Apply/Discard/Retry) or a Failed card with a concrete remedy for each
+//! `CalFailure` variant.
 //!
-//! Phase/progress data arrives through the view model's `AutoTuneUi` / `AutoTuneStep`
-//! machinery (T18/T19): the engine pushes step transitions, per-phase countdowns and
-//! the live input level; the view is a pure function of them.
+//! ## Narrow T11 adapter (view-model plumbing only)
 //!
-//! ## Narrow T11 adapter
+//! The bridge between the engine-side state machine
+//! (`tine_dsp::calibrator`: `CalProgress`, `CalFailure`, `CalibrationReport`)
+//! and this wizard's view model lives in **this module, in the functions
+//! below** — nothing else in `tine-ui` knows the DSP types:
 //!
-//! TODO(T11): `tine-dsp::calibrator` (`CalPhase`/`CalProgress`/`CalFailure`,
-//! `finish → CalibrationReport`) is in flight; its contract is documented in
-//! `docs/tasks/T11-auto-calibrator.md`. When it lands, the engine runner maps
-//! `CalibrationReport → CalibrationUi` and `CalFailure → CalFailureUi` through
-//! **one** adapter beside this view, and the wizard renders unchanged. Until then
-//! the wizard is exercised through the same `AutoTuneStep` states (headless scenes
-//! and the scripted wizard run use fake progress), and no `tine-dsp`/`tine-protocol`
-//! edit is needed here.
+//! * [`autotune_from_progress`] — `CalProgress` → `AutoTuneUi` (phase,
+//!   per-phase countdown derived from `phase_progress`, live level,
+//!   `voiced_ms`);
+//! * [`CalFailureUi::from`] — `CalFailure` → the failure card's payload;
+//! * [`calibration_from_report`] — `CalibrationReport` → the results card.
+//!
+//! TODO(T11): the only remaining gap is engine-side: `tine-app`'s Auto-Tune
+//! runner (T16/T21, which owns the capture thread that `push`es raw mic
+//! blocks) calls these three functions to fill `UiModel::autotune` /
+//! `calibration`, and applies `Intent::ApplyCalibration { keep_pins }` by
+//! replaying the report's changes (pinned parameters keep their value per
+//! D-007). `tine-ui` itself depends only on `tine-protocol` + `tine-dsp`,
+//! never `tine-engine`.
 
 use rune::{El, Shape, col, el, row, text};
+use tine_dsp::calibrator::{COUNTDOWN_S, CalFailure, CalPhase, CalProgress, CalibrationReport, NOISE_S, VOICE_S};
 use tine_protocol::params::ParamId;
 
 use crate::intent::Intent;
-use crate::model::{AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationUi, UiModel};
+use crate::model::{
+    AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, UiModel,
+};
 use crate::state::AppState;
 use crate::theme::{TineTheme, radii, spacing, typography};
 
 /// Suggested sentence read during the Speak phase.
 pub const SENTENCE: &str = "The quick brown fox jumps over the lazy dog.";
 
-/// Seconds in the measured silence phase (`docs/tasks/T11-auto-calibrator.md`).
-pub const SILENCE_SECS: f32 = 3.0;
-/// Seconds in the measured speech phase.
-pub const SPEAK_SECS: f32 = 5.0;
+/// Seconds in the measured silence phase (Noise — the real `tine-dsp` constant).
+pub const SILENCE_SECS: f32 = NOISE_S;
+/// Seconds in the measured speech phase (Voice — the real `tine-dsp` constant).
+pub const SPEAK_SECS: f32 = VOICE_S;
+
+/// Narrow adapter: one `CalProgress` push → the wizard's whole view model.
+///
+/// Per-phase countdowns are derived from the real `phase_progress` (the
+/// fraction of the current phase already captured), so the ring always matches
+/// what the calibrator actually consumed. The overall `progress` covers the
+/// 8 measured seconds (Noise + Voice; the Countdown second is discarded by
+/// design).
+///
+/// `failure` must be `Some` exactly when `phase` is [`CalPhase::Failed`]:
+/// `finish()`'s `Err(CalFailure)` payload — `CalProgress` alone doesn't carry
+/// it. The runner (T16/T21) keeps it from the `finish` call that ended the
+/// capture and passes both here.
+#[must_use]
+pub fn autotune_from_progress(p: &CalProgress, failure: Option<CalFailure>) -> AutoTuneUi {
+    let remaining = |total: f32| total * (1.0 - p.phase_progress.clamp(0.0, 1.0));
+    let step = match p.phase {
+        CalPhase::Countdown => AutoTuneStep::Prepare {
+            remaining_secs: remaining(COUNTDOWN_S),
+        },
+        CalPhase::Noise => AutoTuneStep::Silence {
+            remaining_secs: remaining(NOISE_S),
+        },
+        CalPhase::Voice => AutoTuneStep::Speak {
+            remaining_secs: remaining(VOICE_S),
+        },
+        CalPhase::Analyzing => AutoTuneStep::Analyzing,
+        CalPhase::Done => AutoTuneStep::Results,
+        CalPhase::Failed => AutoTuneStep::Failed(CalFailureUi::from(failure.unwrap_or(CalFailure::TooQuiet))),
+    };
+    let measured = match p.phase {
+        CalPhase::Countdown => 0.0,
+        CalPhase::Noise => p.phase_progress * NOISE_S,
+        CalPhase::Voice => NOISE_S + p.phase_progress * VOICE_S,
+        CalPhase::Analyzing | CalPhase::Done | CalPhase::Failed => NOISE_S + VOICE_S,
+    };
+    AutoTuneUi {
+        step,
+        progress: (measured / (NOISE_S + VOICE_S)).clamp(0.0, 1.0),
+        level_db: p.live_level_db,
+        prompt_text: String::new(),
+        voiced_ms: p.voiced_ms,
+    }
+}
+
+/// Narrow adapter: one `CalibrationReport` → the results card's view model.
+#[must_use]
+pub fn calibration_from_report(report: &CalibrationReport) -> CalibrationUi {
+    let cal = &report.calibration;
+    CalibrationUi {
+        noise_rms_db: cal.noise_rms_db,
+        speech_rms_db: cal.speech_rms_db,
+        simulated_peak_db: report.simulated_peak_db,
+        simulated_rms_db: report.simulated_rms_db,
+        changes: report
+            .changes
+            .iter()
+            .map(|&(id, before, after)| CalibrationParamDiff {
+                param: id,
+                label: id.spec().label,
+                before,
+                after,
+                unit: unit_suffix(id),
+            })
+            .collect(),
+    }
+}
+
+/// Viewer-facing unit suffix for a diff row.
+fn unit_suffix(id: ParamId) -> &'static str {
+    use tine_protocol::params::Unit;
+    match id.spec().unit {
+        Unit::Db => "dB",
+        Unit::Dbfs => "dBFS",
+        Unit::Hz => "Hz",
+        Unit::Ms => "ms",
+        Unit::Ratio | Unit::None => "",
+    }
+}
+
+impl From<CalFailure> for CalFailureUi {
+    fn from(f: CalFailure) -> Self {
+        match f {
+            CalFailure::TooQuiet => Self::TooQuiet,
+            CalFailure::TooNoisy { snr_db } => Self::TooNoisy { snr_db },
+            CalFailure::Clipping { pct } => Self::Clipping { pct },
+            CalFailure::NotEnoughSpeech { voiced_ms } => Self::NotEnoughSpeech { voiced_ms },
+            CalFailure::GainOutOfRange { needed_db } => Self::GainOutOfRange { needed_db },
+        }
+    }
+}
 
 /// Speech-to-noise ratio in dB from the calibration's measured levels.
 #[must_use]
@@ -93,11 +195,11 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
 
     match &au.step {
         AutoTuneStep::Idle => {}
-        AutoTuneStep::Prepare => {
+        AutoTuneStep::Prepare { remaining_secs } => {
             card = card
                 .child(title("Get ready", t.text))
                 .child(
-                    text("Tine measures your room, then your voice. Eight seconds total.")
+                    text("Tine measures your room first, then your voice: 8 seconds total.")
                         .font(typography::BODY)
                         .color(t.text_dim),
                 )
@@ -108,6 +210,7 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
                     format!("Read this when prompted: \u{201c}{SENTENCE}\u{201d}"),
                     t,
                 ))
+                .child(countdown_ring(*remaining_secs, COUNTDOWN_S, t))
                 .child(level_bar(au.level_db, t))
                 .child(cancel_row(t));
         }
@@ -132,9 +235,15 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
                         .color(t.text),
                 )
                 .child(
-                    text("Speak at your usual volume and distance.")
-                        .font(typography::CAPTION)
-                        .color(t.text_dim),
+                    text(format!(
+                        "Speak at your usual volume and distance. {:.1} s of speech captured so far.",
+                        f32::from(au.voiced_ms as f32 / 1000.0)
+                    ))
+                    .key("autotune/voiced-so-far")
+                    .role("label")
+                    .label(format!("{} ms of speech captured so far", au.voiced_ms))
+                    .font(typography::CAPTION)
+                    .color(t.text_dim),
                 )
                 .child(countdown_ring(*remaining_secs, SPEAK_SECS, t))
                 .child(level_bar(au.level_db, t))
@@ -209,7 +318,7 @@ fn scrim() -> El {
 fn step_indicator(au: &AutoTuneUi, t: TineTheme) -> El {
     const STEPS: [&str; 5] = ["Prepare", "Silence 3 s", "Speak 5 s", "Analyze", "Results"];
     let idx = match &au.step {
-        AutoTuneStep::Idle | AutoTuneStep::Prepare => 0,
+        AutoTuneStep::Idle | AutoTuneStep::Prepare { .. } => 0,
         AutoTuneStep::Silence { .. } => 1,
         AutoTuneStep::Speak { .. } => 2,
         AutoTuneStep::Analyzing => 3,
@@ -385,14 +494,34 @@ fn results_card(model: &UiModel, t: TineTheme) -> El {
             .gap(spacing::LG)
             .child(measurement("Noise floor", format!("{:.1} dBFS", cal.noise_rms_db), t))
             .child(measurement("Speech level", format!("{:.1} dBFS", cal.speech_rms_db), t))
-            .child(measurement("SNR", format!("{:.1} dB", snr_db(cal)), t)),
+            .child(measurement("SNR", format!("{:.1} dB", snr_db(cal)), t))
+            .child(
+                measurement(
+                    "Verified peak",
+                    format!("{:.1} dBFS", cal.simulated_peak_db),
+                    t,
+                ),
+            ),
     );
 
     for diff in &cal.changes {
         card = card.child(diff_row(diff.param, diff.label, diff.before, diff.after, diff.unit, t));
     }
 
-    card
+    card.child(
+        text(format!(
+            "Checked by simulating the full pipeline over your captured voice: output peak {:.1} dBFS, RMS {:.1} dBFS.",
+            cal.simulated_peak_db, cal.simulated_rms_db
+        ))
+        .key("autotune/verified-note")
+        .role("label")
+        .label(format!(
+            "Verified simulated output: peak {:.1} dBFS, RMS {:.1} dBFS",
+            cal.simulated_peak_db, cal.simulated_rms_db
+        ))
+        .font(typography::CAPTION)
+        .color(t.text_dim),
+    )
 }
 
 fn measurement(label: &str, value: String, t: TineTheme) -> El {
@@ -511,6 +640,10 @@ fn button(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tine_dsp::calibrator::{COUNTDOWN_S, AutoCalibrator};
+    use tine_dsp::presets::builtin;
+    use tine_protocol::params::DspParams;
+    use tine_protocol::presets::{Archetype, PinSet};
 
     #[test]
     fn every_failure_has_a_concrete_remedy() {
@@ -536,8 +669,172 @@ mod tests {
         let c = CalibrationUi {
             noise_rms_db: -51.4,
             speech_rms_db: -21.5,
+            simulated_peak_db: -4.2,
+            simulated_rms_db: -16.8,
             changes: Vec::new(),
         };
         assert!((snr_db(&c) - 29.9).abs() < 1e-4);
+    }
+
+    /// Deterministic uniform noise in `[-1, 1]` (tiny LCG, no `rand` dep).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) as i32) as f32 / (i32::MAX as f32)
+        }
+    }
+
+    /// Drives the wizard adapter against the **real** `tine_dsp` calibrator
+    /// (T11): a synthetic but spec-clean 48 kHz capture — 1 s countdown
+    /// (discarded), 3 s room noise near -51 dBFS RMS, 5 s continuous 150 Hz
+    /// sine at -23 dBFS RMS (fully voiced, ~26 dB SNR) — pushed in host-sized
+    /// 480-sample blocks, exactly the way the capture thread (T16/T21) will.
+    #[test]
+    fn adapter_tracks_the_real_calibrator_state_machine() {
+        const FS: f32 = 48_000.0;
+        const BLOCK: usize = 480;
+        let mut cal = AutoCalibrator::new(FS);
+
+        // Countdown (first second, discarded): Prepare with a ~1 s ring.
+        let mut p = cal.push(&[0.0; BLOCK]);
+        assert_eq!(p.phase, CalPhase::Countdown);
+        let ui = autotune_from_progress(&p, None);
+        match ui.step {
+            AutoTuneStep::Prepare { remaining_secs } => {
+                assert!(
+                    (0.98..=COUNTDOWN_S).contains(&remaining_secs),
+                    "remaining {remaining_secs}"
+                );
+            }
+            other => panic!("expected Prepare, got {other:?}"),
+        }
+
+        // Finish the countdown second: the next view is Silence (Noise phase)
+        // with the full NOISE_S ring.
+        for _ in 0..(FS as usize / BLOCK - 1) {
+            p = cal.push(&[0.0; BLOCK]);
+        }
+        assert_eq!(p.phase, CalPhase::Noise);
+        let ui = autotune_from_progress(&p, None);
+        match ui.step {
+            AutoTuneStep::Silence { remaining_secs } => {
+                assert!(
+                    (2.98..=SILENCE_SECS).contains(&remaining_secs),
+                    "remaining {remaining_secs}"
+                );
+            }
+            other => panic!("expected Silence, got {other:?}"),
+        }
+        assert_eq!(ui.prompt_text, String::new(), "runner fills the prompt");
+
+        // Half the noise segment captured: the ring is at ~1.5 s and the
+        // overall progress is measured / (NOISE_S + VOICE_S).
+        let mut rng = Lcg(0x2545_F491_4F6C_DD1D);
+        let mut noise_block = [0.0f32; BLOCK];
+        for _ in 0..((SILENCE_SECS * 0.5 * FS / BLOCK as f32) as usize) {
+            for s in &mut noise_block {
+                *s = rng.next() * 0.005;
+            }
+            p = cal.push(&noise_block);
+        }
+        let ui = autotune_from_progress(&p, None);
+        match ui.step {
+            AutoTuneStep::Silence { remaining_secs } => {
+                assert!(
+                    (remaining_secs - 1.5).abs() < 0.06,
+                    "remaining {remaining_secs}"
+                );
+            }
+            other => panic!("expected Silence, got {other:?}"),
+        }
+        assert!((ui.progress - 1.5 / (SILENCE_SECS + SPEAK_SECS)).abs() < 0.02);
+
+        // Second half of the noise segment: the phase flips to Voice next.
+        for _ in 0..((SILENCE_SECS * 0.5 * FS / BLOCK as f32) as usize) {
+            for s in &mut noise_block {
+                *s = rng.next() * 0.005;
+            }
+            p = cal.push(&noise_block);
+        }
+        assert_eq!(p.phase, CalPhase::Voice);
+        let mut speech_block = [0.0f32; BLOCK];
+        let mut voiced = 0u32;
+        for i in 0..((SPEAK_SECS * FS / BLOCK as f32) as usize) {
+            for (j, s) in speech_block.iter_mut().enumerate() {
+                let t = ((i * BLOCK + j) as u32 as f32) / FS;
+                *s = 0.1 * (2.0 * core::f32::consts::PI * 150.0 * t).sin();
+            }
+            p = cal.push(&speech_block);
+            voiced = voiced.max(p.voiced_ms);
+            if i == (FS as usize / BLOCK) {
+                // 1 s in: the Speak view mirrors the engine's `voiced_ms`.
+                let ui = autotune_from_progress(&p, None);
+                assert_eq!(ui.voiced_ms, p.voiced_ms);
+                assert!(matches!(ui.step, AutoTuneStep::Speak { .. }));
+                assert!(ui.voiced_ms > 0, "voiced {}", ui.voiced_ms);
+            }
+        }
+        assert!(voiced >= 1_500, "voiced {voiced}");
+
+        // 9 s captured: Analyzing latches and ignores further audio.
+        assert_eq!(p.phase, CalPhase::Analyzing);
+        p = cal.push(&speech_block);
+        assert_eq!(p.phase, CalPhase::Analyzing);
+        let ui = autotune_from_progress(&p, None);
+        assert_eq!(ui.step, AutoTuneStep::Analyzing);
+        assert!((ui.progress - 1.0).abs() < 1e-6, "progress {}", ui.progress);
+
+        // finish() succeeds -> Done -> Results, and the report maps into the
+        // results view model with exact measurements and 5 labelled diffs.
+        let preset = builtin(Archetype::Dynamic);
+        let report = cal
+            .finish(preset, preset.macro_defaults, PinSet::EMPTY, &DspParams::DEFAULT)
+            .expect("synthetic capture must calibrate");
+        p = cal.push(&[]);
+        assert_eq!(p.phase, CalPhase::Done);
+        let ui = autotune_from_progress(&p, None);
+        assert_eq!(ui.step, AutoTuneStep::Results);
+
+        let results = calibration_from_report(&report);
+        assert_eq!(results.changes.len(), report.changes.len());
+        assert_eq!(results.noise_rms_db, report.calibration.noise_rms_db);
+        assert_eq!(results.speech_rms_db, report.calibration.speech_rms_db);
+        assert_eq!(results.simulated_peak_db, report.simulated_peak_db);
+        assert_eq!(results.simulated_rms_db, report.simulated_rms_db);
+        for (diff, &(id, before, after)) in results.changes.iter().zip(report.changes.iter()) {
+            assert_eq!(diff.param, id);
+            assert!((diff.before - before).abs() < 1e-6);
+            assert!((diff.after - after).abs() < 1e-6);
+            assert!(!diff.label.is_empty(), "label for {id:?}");
+        }
+        // Uniform noise at +-0.005 has ~-50.8 dBFS RMS: a quiet room.
+        assert!(results.noise_rms_db < -48.0);
+        // The report's offline verification proves the -6..-3 dBFS window.
+        assert!(
+            (-6.0..=-3.0).contains(&results.simulated_peak_db),
+            "simulated peak {}",
+            results.simulated_peak_db
+        );
+
+        // A dead-mic capture (digital silence) fails exactly like the engine:
+        // TooQuiet -> the Failed card, whose remedy names the mic.
+        let mut dead = AutoCalibrator::new(FS);
+        for _ in 0..9 * (FS as usize / BLOCK) {
+            dead.push(&[0.0; BLOCK]);
+        }
+        let failure = dead
+            .finish(preset, preset.macro_defaults, PinSet::EMPTY, &DspParams::DEFAULT)
+            .expect_err("silence must fail");
+        p = dead.push(&[]);
+        assert_eq!(p.phase, CalPhase::Failed);
+        let ui = autotune_from_progress(&p, Some(failure));
+        assert_eq!(ui.step, AutoTuneStep::Failed(CalFailureUi::TooQuiet));
+        let remedy = failure_remedy(CalFailureUi::TooQuiet);
+        assert!(remedy.contains("mic"), "remedy {remedy}");
     }
 }

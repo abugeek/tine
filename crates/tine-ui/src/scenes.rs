@@ -66,8 +66,9 @@ pub fn make_pro_drawer_open() -> AppState {
 pub fn make_auto_tune_prepare() -> AppState {
     let mut s = make_golden_line();
     s.model.autotune = AutoTuneUi {
-        step: AutoTuneStep::Prepare,
+        step: AutoTuneStep::Prepare { remaining_secs: 0.7 },
         progress: 0.0,
+        voiced_ms: 0,
         level_db: -48.0,
         prompt_text: String::from("Find a quiet spot, then press Start to measure room noise."),
     };
@@ -81,6 +82,7 @@ pub fn make_auto_tune_silence() -> AppState {
     s.model.autotune = AutoTuneUi {
         step: AutoTuneStep::Silence { remaining_secs: 1.8 },
         progress: 0.15,
+        voiced_ms: 0,
         level_db: -51.4,
         prompt_text: String::from("Stay quiet for a moment while Tine measures your room noise floor."),
     };
@@ -94,6 +96,7 @@ pub fn make_auto_tune_speak() -> AppState {
     s.model.autotune = AutoTuneUi {
         step: AutoTuneStep::Speak { remaining_secs: 3.2 },
         progress: 0.60,
+        voiced_ms: 2400,
         level_db: -21.5,
         prompt_text: String::from("The quick brown fox jumps over the lazy dog."),
     };
@@ -107,6 +110,7 @@ pub fn make_auto_tune_analyzing() -> AppState {
     s.model.autotune = AutoTuneUi {
         step: AutoTuneStep::Analyzing,
         progress: 0.92,
+        voiced_ms: 5400,
         level_db: -24.0,
         prompt_text: String::from("Analyzing vocal crest factor and spectral tilt..."),
     };
@@ -120,12 +124,15 @@ pub fn make_auto_tune_results() -> AppState {
     s.model.autotune = AutoTuneUi {
         step: AutoTuneStep::Results,
         progress: 1.0,
+        voiced_ms: 5400,
         level_db: -18.0,
         prompt_text: String::from("Calibration complete."),
     };
     s.model.calibration = Some(CalibrationUi {
         noise_rms_db: -51.4,
         speech_rms_db: -21.5,
+        simulated_peak_db: -4.2,
+        simulated_rms_db: -16.8,
         changes: vec![
             CalibrationParamDiff {
                 param: ParamId::InputGainDb,
@@ -160,6 +167,7 @@ pub fn make_auto_tune_failed() -> AppState {
     s.model.autotune = AutoTuneUi {
         step: AutoTuneStep::Failed(CalFailureUi::NotEnoughSpeech { voiced_ms: 800 }),
         progress: 0.0,
+        voiced_ms: 800,
         level_db: -58.0,
         prompt_text: String::new(),
     };
