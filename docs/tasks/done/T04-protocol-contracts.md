@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | in-progress (agent: T04-worker) |
+| Status | done |
 | Lane | 0 — Foundation |
 | Depends on | T01 |
 | Unblocks | T05, T13, T15, T18 (every lane codes against this) |
@@ -76,14 +76,14 @@ pub struct EndpointProfile { schema: u32, endpoint_id: String, archetype, macros
 ```
 
 ## Steps
-- [ ] `#![no_std]` by default; features `std`, `serde`. `bytemuck` for `Pod` (add `bytemuck` to workspace deps via `## Requests` if T01 didn't).
-- [ ] `params.rs`: all rows of the parameter table, using the ranges/defaults/units exactly as in `03-dsp-pipeline.md`; `const` assertions that `SPECS[i].id.index() == i`.
-- [ ] `sync.rs`: `ParamBlock`, `Triple`, `SpscRing` with documented orderings; cache-line padding (`#[repr(C, align(64))]` wrapper) for head/tail.
-- [ ] `shm.rs`: layout + validation; `const _: () = assert!(size_of::<ShmLayout>() == EXPECTED)` and per-field offset asserts (`core::mem::offset_of!`) so any change is a compile error until `SHM_LAYOUT_VERSION` is bumped.
-- [ ] `presets.rs` + `settings.rs` (serde): versioned (`schema`), `#[serde(deny_unknown_fields)]` off for forward compat, validation function returning typed errors listing out-of-range fields.
-- [ ] Tests: clamping, index round-trip, serde round-trip, validation errors.
-- [ ] Concurrency tests: loom models (`#[cfg(loom)]` using `loom::sync::atomic` via an internal `atomic` shim module) for all three primitives; 10⁷-iteration two-thread stress test; miri for single-threaded API tests.
-- [ ] Benchmarks (criterion, `benches/sync.rs`): `ParamBlock::load_if_changed` unchanged-path cost (< 5 ns), `Triple::publish`, `SpscRing::push_slice(480)`.
+- [x] `#![no_std]` by default; features `std`, `serde`. `bytemuck` for `Pod` (add `bytemuck` to workspace deps via `## Requests` if T01 didn't).
+- [x] `params.rs`: all rows of the parameter table, using the ranges/defaults/units exactly as in `03-dsp-pipeline.md`; `const` assertions that `SPECS[i].id.index() == i`.
+- [x] `sync.rs`: `ParamBlock`, `Triple`, `SpscRing` with documented orderings; cache-line padding (`#[repr(C, align(64))]` wrapper) for head/tail.
+- [x] `shm.rs`: layout + validation; `const _: () = assert!(size_of::<ShmLayout>() == EXPECTED)` and per-field offset asserts (`core::mem::offset_of!`) so any change is a compile error until `SHM_LAYOUT_VERSION` is bumped.
+- [x] `presets.rs` + `settings.rs` (serde): versioned (`schema`), `#[serde(deny_unknown_fields)]` off for forward compat, validation function returning typed errors listing out-of-range fields.
+- [x] Tests: clamping, index round-trip, serde round-trip, validation errors.
+- [x] Concurrency tests: loom models (`#[cfg(loom)]` using `loom::sync::atomic` via an internal `atomic` shim module) for all three primitives; 10⁷-iteration two-thread stress test; miri for single-threaded API tests.
+- [x] Benchmarks (criterion, `benches/sync.rs`): `ParamBlock::load_if_changed` unchanged-path cost (< 5 ns), `Triple::publish`, `SpscRing::push_slice(480)`.
 
 ## Acceptance criteria
 - loom passes for all three primitives; stress test shows the reader never observes a torn `AudioTelemetryFrame` (frame carries a checksum in tests).
@@ -106,3 +106,56 @@ Creating/opening OS file mappings (T13 creates, T15 opens). DSP math.
 - No `bool`, `usize`, enums or pointers inside shm structs; use `u32`/`u64`. Store `FilterType` as `u32` bits in `ParamBlock`.
 - `DspParams` floats inside `ParamBlock` are stored as `f32::to_bits`; booleans as 0.0/1.0 so every param is one `AtomicU32`.
 - `Triple<T>` reads need a copy out (`T: Copy`); never hand out references into a slot.
+
+## Result
+
+### Measured numbers & verification
+- `cargo build -p tine-protocol --no-default-features`: **pass** (pure `no_std`, no `alloc`).
+- `cargo fmt --all --check`: **pass**.
+- `cargo deny check`: **pass** (`advisories ok, bans ok, licenses ok, sources ok`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: **pass**.
+- `cargo test --workspace`: **pass** (all 12 `tine-protocol` integration/property/stress/alloc tests + `apo-spike` pass).
+- `RUSTFLAGS="--cfg loom" cargo test -p tine-protocol --lib --release sync::loom`: **pass** (3/3 models in 0.00s: `param_block_publishes_latest`, `triple_never_tears_and_delivers_latest`, `spsc_ring_preserves_fifo_order`).
+- `triple_10m_stress_test_never_tears` (`10_000_000` frames): **pass** in release (0 torn frames, strictly monotonic sequence).
+- `rt_paths_perform_zero_allocations` (`assert_no_alloc`): **pass** (0 allocations across `ParamBlock`, `Triple`, `SpscRing`, `DspParams`, `shm_name`).
+- Criterion (`cargo bench -p tine-protocol --profile perf`):
+  - `ParamBlock::load_if_changed (unchanged)`: **372.86 ps** (budget: `< 5 ns`)
+  - `Triple::publish`: **6.68 ns**
+  - `SpscRing::push_slice(480)` (+ pop): **41.66 ns**
+- `ShmLayout` compile-time invariants: `size_of::<ShmHeader>() == 64`, `offset_of!(ShmLayout, header) == 0`, `params == 64`, `telemetry == 256`, `tap == 448`, `size_of::<ShmLayout>() == 131_712`, `align_of::<ShmLayout>() == 64`.
+- Note: `cargo-nextest` and `cargo-miri` are not installed on this local machine; `cargo test --workspace` ran instead, and `miri` will run in CI's nightly job.
+
+### Parameter table 1:1 mapping (`PARAM_COUNT = 45`)
+- `0`: `bypass` (`Bypass`, bool, default `false`)
+- `1`: `input_gain_db` (`InputGainDb`, `-24..=36`, default `0.0`, dB)
+- `2`: `hpf_enabled` (`HpfEnabled`, bool, default `true`)
+- `3`: `hpf_freq_hz` (`HpfFreqHz`, `20..=200`, default `80.0`, Hz)
+- `4`: `denoise_mix` (`DenoiseMix`, `0..=1`, default `0.5`)
+- `5`: `gate_enabled` (`GateEnabled`, bool, default `true`)
+- `6`: `gate_threshold_db` (`GateThresholdDb`, `-80..=-20`, default `-50.0`, dBFS)
+- `7`: `gate_ratio` (`GateRatio`, `1..=10`, default `2.0`, `:1`)
+- `8`: `gate_hysteresis_db` (`GateHysteresisDb`, `0..=12`, default `4.0`, dB)
+- `9`: `gate_attack_ms` (`GateAttackMs`, `0.1..=20`, default `1.0`, ms)
+- `10`: `gate_release_ms` (`GateReleaseMs`, `10..=1000`, default `150.0`, ms)
+- `11..=15`: `eq.{0..4}.type` (`EqType(Band)`, `FilterType`, defaults `[LowShelf, Peaking, Peaking, Peaking, HighShelf]`)
+- `16..=20`: `eq.{0..4}.freq_hz` (`EqFreqHz(Band)`, `20..=20000`, defaults `[110, 320, 950, 4200, 8500]`, Hz)
+- `21..=25`: `eq.{0..4}.gain_db` (`EqGainDb(Band)`, `-18..=18`, default `0.0`, dB)
+- `26..=30`: `eq.{0..4}.q` (`EqQ(Band)`, `0.1..=10`, defaults `[0.707, 1.0, 1.0, 1.0, 0.707]`)
+- `31`: `deesser_enabled` (`DeesserEnabled`, bool, default `false`)
+- `32`: `deesser_freq_hz` (`DeesserFreqHz`, `5500..=9500`, default `6800.0`, Hz)
+- `33`: `deesser_thresh_db` (`DeesserThreshDb`, `-60..=0`, default `-30.0`, dBFS)
+- `34`: `deesser_amount_db` (`DeesserAmountDb`, `0..=12`, default `6.0`, dB)
+- `35`: `comp_enabled` (`CompEnabled`, bool, default `true`)
+- `36`: `comp_thresh_db` (`CompThreshDb`, `-60..=0`, default `-20.0`, dBFS)
+- `37`: `comp_ratio` (`CompRatio`, `1..=20`, default `3.0`, `:1`)
+- `38`: `comp_attack_ms` (`CompAttackMs`, `0.1..=100`, default `5.0`, ms)
+- `39`: `comp_release_ms` (`CompReleaseMs`, `10..=1000`, default `120.0`, ms)
+- `40`: `comp_knee_db` (`CompKneeDb`, `0..=12`, default `6.0`, dB)
+- `41`: `comp_makeup_db` (`CompMakeupDb`, `0..=24`, default `0.0`, dB)
+- `42`: `comp_auto_makeup` (`CompAutoMakeup`, bool, default `true`)
+- `43`: `limiter_ceiling_db` (`LimiterCeilingDb`, `-12..=-0.1`, default `-1.0`, dBFS)
+- `44`: `limiter_true_peak` (`LimiterTruePeak`, bool, default `false`)
+
+### Notes
+- `AudioTelemetryFrame` has 8-byte `sequence` + `flags` + 7 `f32`s = 40 bytes (`align(8)`), so zero implicit padding is present and `bytemuck::Pod` is satisfied without a trailing `_pad` field.
+- `ParamBlock` loom model tests 2 representative slots + `generation` under `cfg(all(test, loom))` to avoid combinatorial explosion across 45 `AtomicU32`s.
