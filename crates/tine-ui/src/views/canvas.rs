@@ -16,11 +16,12 @@ use rune::{
     text,
 };
 use tine_dsp::curve::response_curve;
-use tine_protocol::params::{DspParams, EQ_BAND_COUNT, ParamId};
-use tine_protocol::presets::{MacroPositions, PinSet};
+use tine_dsp::macros::{ExplainBuf, ExplainRow, Macro as DspMacro, MacroMapper};
+use tine_dsp::presets;
+use tine_protocol::params::{DspParams, EQ_BAND_COUNT, ParamId, Unit};
 use tine_protocol::telemetry::AudioTelemetryFrame;
 
-use crate::model::Macro;
+use crate::model::{Macro, UiModel};
 use crate::state::AppState;
 use crate::theme::{TineTheme, radii, spacing, typography};
 
@@ -75,46 +76,58 @@ pub fn macro_x(m: Macro, plot_w: f32) -> f32 {
 
 /// Explanation rows for a macro tooltip (e.g. `"+2.9 dB @ 110 Hz"`).
 ///
-/// Deterministic placeholder strings derived from the macro value until the macro
-/// mapping engine lands.
-// TODO(T10): replace with `MacroMapper::explain` rows once tine-dsp's macro mapping
-// is merged and re-exported through this helper.
-// TODO(T10): replace with `MacroMapper::explain` rows once tine-dsp's macro mapping
-// is merged and re-exported through this helper.
+/// Rows come straight from [`MacroMapper::explain`] for the current archetype
+/// preset: the parameters the macro drives, the effective base (`before`), the
+/// value the macro maps to (`after`), and a `pinned (Pro)` marker when the
+/// parameter is pinned (D-007).
 #[must_use]
-pub fn macro_explanation_rows(m: Macro, value: f32, pins: &PinSet) -> Vec<String> {
-    let v = value.clamp(0.0, 1.0);
-    let mut rows = Vec::new();
-    match m {
-        Macro::Purity => {
-            rows.push(format!("Denoise mix: {:.0}%", v * 100.0));
-            rows.push(format!("Gate threshold: {:.1} dBFS", -60.0 + v * 18.0));
-            pinned_row(*pins, ParamId::DenoiseMix, &mut rows);
-        }
-        Macro::Body => {
-            let boost = (v - 0.5) * 8.0;
-            rows.push(format!("{boost:+.1} dB @ 110 Hz"));
-            rows.push(format!("{:+.1} dB @ 320 Hz", -boost * 0.55));
-            pinned_row(*pins, ParamId::EqGainDb(tine_protocol::params::Band::B1), &mut rows);
-        }
-        Macro::Presence => {
-            let lift = (v - 0.5) * 7.0;
-            rows.push(format!("{lift:+.1} dB @ 4.2 kHz"));
-            rows.push(format!("De-ess max: {:.1} dB", 12.0 - v * 3.0));
-            pinned_row(*pins, ParamId::EqGainDb(tine_protocol::params::Band::B3), &mut rows);
-        }
-        Macro::Leveler => {
-            rows.push(format!("Gain reduction: {:.1} dB", (0.5 - v) * 6.0));
-            rows.push(format!("Ratio: {:.1}:1", 1.5 + v * 3.0));
-            pinned_row(*pins, ParamId::CompThreshDb, &mut rows);
-        }
-    }
-    rows
+pub fn macro_explanation_rows(m: Macro, model: &UiModel) -> Vec<String> {
+    let preset = presets::builtin(model.archetype);
+    let mut buf = ExplainBuf::new();
+    MacroMapper::explain(preset, None, model.macros, model.pins, dsp_macro(m), &mut buf);
+    buf.rows().iter().map(|row| explain_row_string(row, model)).collect()
 }
 
-fn pinned_row(pins: PinSet, id: ParamId, rows: &mut Vec<String>) {
-    if pins.is_pinned(id) {
-        rows.push(String::from("pinned (Pro)"));
+/// Maps `tine-ui`'s macro node onto the DSP macro enum of the same node.
+const fn dsp_macro(m: Macro) -> DspMacro {
+    match m {
+        Macro::Purity => DspMacro::Purity,
+        Macro::Body => DspMacro::Body,
+        Macro::Presence => DspMacro::Presence,
+        Macro::Leveler => DspMacro::Leveler,
+    }
+}
+
+/// Formats one [`ExplainRow`] the way `docs/project/05-ui-ux.md` shows tooltips:
+/// EQ gains as `"+2.9 dB @ 110 Hz"`, toggles as `"on" / "off"`, ratios as
+/// `":1"`, everything else as `"before → after"` with its unit.
+fn explain_row_string(row: &ExplainRow, model: &UiModel) -> String {
+    let spec = row.id.spec();
+    let body = match row.id {
+        ParamId::EqGainDb(band) => {
+            let hz = model.params.eq_freq_hz.get(band.index()).map_or(1000.0, |f| *f);
+            format!("{:+.1} dB @ {hz:.0} Hz", row.after)
+        }
+        ParamId::DeesserEnabled | ParamId::CompAutoMakeup => {
+            format!("{}: {}", spec.label, if row.after >= 0.5 { "on" } else { "off" })
+        }
+        ParamId::CompRatio => format!("{}: {:.1}:1", spec.label, row.after),
+        ParamId::DenoiseMix => format!("{}: {:.0}%", spec.label, row.after * 100.0),
+        _ => {
+            let unit = match spec.unit {
+                Unit::Db => " dB",
+                Unit::Dbfs => " dBFS",
+                Unit::Hz => " Hz",
+                Unit::Ms => " ms",
+                Unit::Ratio | Unit::None => "",
+            };
+            format!("{}: {:.1} \u{2192} {:.1}{unit}", spec.label, row.before, row.after)
+        }
+    };
+    if row.pinned {
+        format!("{body} \u{00b7} pinned (Pro)")
+    } else {
+        body
     }
 }
 
@@ -313,7 +326,7 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     }
 
     if let Some(m) = s.ui.hovered_macro {
-        plot = plot.child(tooltip_for(m, m.get(s.model.macros), s.model.pins, t));
+        plot = plot.child(tooltip_for(m, &s.model, t));
     }
 
     // --- Meters column (right edge) ---
@@ -477,8 +490,8 @@ fn macro_node(m: Macro, value: f32, plot_w: f32, plot_h: f32, t: TineTheme) -> E
             tx.animated();
         })
         .on_double_press(move |s: &mut AppState| {
-            // Reset to the preset default until per-archetype macro defaults land (T10).
-            let defaults = MacroPositions::default();
+            // Reset to the current archetype's preset default (T10 macro_defaults).
+            let defaults = presets::builtin(s.model.archetype).macro_defaults;
             s.set_macro_optimistic(m, m.get(defaults));
         })
         .on_drag(move |s: &mut AppState, d: &mut Drag, _tx: &mut Tx| {
@@ -518,8 +531,9 @@ fn macro_node(m: Macro, value: f32, plot_w: f32, plot_h: f32, t: TineTheme) -> E
 }
 
 /// Spring-animated tooltip card shown while a node is hovered or dragged.
-fn tooltip_for(m: Macro, value: f32, pins: PinSet, t: TineTheme) -> El {
-    let rows = macro_explanation_rows(m, value, &pins);
+fn tooltip_for(m: Macro, model: &UiModel, t: TineTheme) -> El {
+    let value = m.get(model.macros);
+    let rows = macro_explanation_rows(m, model);
     let title = format!("{} {value:.2}", m.label());
 
     let mut card = col()
@@ -660,6 +674,7 @@ fn gr_shape(w: f32, amount: f32, t: TineTheme) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tine_protocol::params::Band;
 
     #[test]
     fn freq_axis_places_macro_zones() {
@@ -724,17 +739,34 @@ mod tests {
     }
 
     #[test]
-    fn explanation_rows_are_deterministic_and_show_pins() {
-        let pins = PinSet::EMPTY;
-        let rows = macro_explanation_rows(Macro::Body, 0.62, &pins);
-        assert_eq!(rows[0], "+1.0 dB @ 110 Hz");
-        assert_eq!(macro_explanation_rows(Macro::Body, 0.62, &pins), rows);
+    fn explanation_rows_come_from_macro_mapper_and_show_pins() {
+        // Same model as `make_golden_line()` in scenes.rs.
+        let model = crate::scenes::make_golden_line().model;
 
-        let mut pinned = PinSet::EMPTY;
-        pinned.pin(ParamId::EqGainDb(tine_protocol::params::Band::B1));
-        let pinned_rows = macro_explanation_rows(Macro::Body, 0.62, &pinned);
-        assert!(pinned_rows.iter().any(|r| r == "pinned (Pro)"));
-        assert!(pins.is_empty());
+        // MacroMapper drive sets: Purity 2, Body 2, Presence 4, Leveler 3 rows.
+        assert_eq!(macro_explanation_rows(Macro::Purity, &model).len(), 2);
+        assert_eq!(macro_explanation_rows(Macro::Body, &model).len(), 2);
+        assert_eq!(macro_explanation_rows(Macro::Presence, &model).len(), 4);
+        assert_eq!(macro_explanation_rows(Macro::Leveler, &model).len(), 3);
+
+        // EQ-gain rows read like the spec example: "+x.y dB @ 110 Hz".
+        let rows = macro_explanation_rows(Macro::Body, &model);
+        assert!(
+            rows.iter().all(|r| r.contains("dB @") || r.contains("pinned (Pro)")),
+            "EQ gain rows show their band frequency: {rows:?}"
+        );
+        // Deterministic for identical inputs.
+        assert_eq!(macro_explanation_rows(Macro::Body, &model), rows);
+
+        // A pinned driven parameter shows the D-007 tag on its row.
+        let mut pinned = model.clone();
+        pinned.pins.pin(ParamId::EqGainDb(Band::B1));
+        let rows = macro_explanation_rows(Macro::Body, &pinned);
+        assert!(
+            rows.iter().any(|r| r.contains("pinned (Pro)")),
+            "pinned row must be tagged: {rows:?}"
+        );
+        assert_eq!(rows.len(), 2, "pinning replaces, never adds rows");
     }
 
     #[test]
