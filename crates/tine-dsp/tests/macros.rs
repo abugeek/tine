@@ -108,6 +108,9 @@ fn json_matches_const_table() {
 
 #[test]
 fn builtin_matches_archetype_identity() {
+    // The const fn must be usable in const context.
+    const D: &PresetDef = builtin(Archetype::Dynamic);
+    assert_eq!(D.id, "dynamic");
     for a in ARCHETYPES {
         let def = builtin(a);
         assert_eq!(def.archetype, a);
@@ -115,9 +118,6 @@ fn builtin_matches_archetype_identity() {
         assert_eq!(def.name, a.display_name());
         assert_eq!(def, builtin(a), "builtin must be deterministic");
     }
-    // The const fn must be usable in const context.
-    const D: &PresetDef = builtin(Archetype::Dynamic);
-    assert_eq!(D.id, "dynamic");
 }
 
 // ---------------------------------------------------------------- golden archetypes
@@ -291,23 +291,24 @@ proptest! {
             for id in MacroMapper::drives(which) {
                 let va = out_a.get(*id);
                 let vb = out_b.get(*id);
-                let increasing = match which {
-                    Macro::Purity => true,
-                    Macro::Body => !matches!(id, ParamId::EqGainDb(Band::B1)),
-                    Macro::Presence => true,
-                    Macro::Leveler => !matches!(id, ParamId::CompThreshDb),
-                };
                 // CompAutoMakeup is a constant side of Leveler (non-strict).
-                if matches!(id, ParamId::CompAutoMakeup) { continue; }
-                if !matches!(id, ParamId::DeesserEnabled) {
+                if matches!(id, ParamId::CompAutoMakeup) {
+                    continue;
+                }
+                if matches!(id, ParamId::DeesserEnabled) {
+                    // Enabled (0/1) may only turn on as the macro rises.
+                    prop_assert!(vb >= va, "{which:?} {id:?}: enabled {va} -> {vb} must not turn off");
+                } else {
+                    let increasing = !matches!(
+                        (which, id),
+                        (Macro::Body, ParamId::EqGainDb(Band::B1))
+                            | (Macro::Leveler, ParamId::CompThreshDb)
+                    );
                     if increasing {
                         prop_assert!(vb >= va - 1e-5, "{which:?} {id:?}: {va} -> {vb} must not decrease");
                     } else {
                         prop_assert!(vb <= va + 1e-5, "{which:?} {id:?}: {va} -> {vb} must not increase");
                     }
-                } else {
-                    prop_assert!((va == 0.0 && vb == 0.0) || (va == 0.0 && vb == 1.0) || (va == 1.0 && vb == 1.0),
-                        "{which:?} {id:?}: enabled may only turn on, got {va} -> {vb}");
                 }
             }
         }
@@ -497,7 +498,7 @@ fn calibration_replaces_preset_values() {
     );
     // 0.85 + 0.25 exceeds the SPECS max of 1.0 — clamped through SPECS.
     assert!(
-        out.denoise_mix >= 0.999999,
+        out.denoise_mix == 1.0,
         "mix clamped at SPECS max: {}",
         out.denoise_mix
     );
@@ -572,6 +573,9 @@ fn apply_is_allocation_free() {
 
 #[test]
 fn apply_meets_time_budget() {
+    const BATCH: u32 = 500;
+    const BUDGET_NS: f64 = if cfg!(debug_assertions) { 50_000.0 } else { 2_000.0 };
+
     let cal = cal_fixture();
     let worst = MacroPositions {
         purity: 0.37,
@@ -584,7 +588,6 @@ fn apply_meets_time_budget() {
         let _ = MacroMapper::apply(&CONDENSER, Some(&cal), worst, PinSet::EMPTY, &DspParams::DEFAULT);
     }
     // Best-of-batches to filter out scheduler noise.
-    const BATCH: u32 = 500;
     let mut best_ns = f64::MAX;
     for _ in 0..20 {
         let start = Instant::now();
@@ -595,9 +598,8 @@ fn apply_meets_time_budget() {
         let dt = start.elapsed().as_secs_f64();
         best_ns = best_ns.min(dt / f64::from(BATCH) * 1e9);
     }
-    let budget_ns = if cfg!(debug_assertions) { 50_000.0 } else { 2_000.0 };
-    println!("apply best-of-batches: {best_ns:.1} ns/call (budget {budget_ns:.0} ns)");
-    assert!(best_ns < budget_ns, "apply too slow: {best_ns:.1} ns/call");
+    println!("apply best-of-batches: {best_ns:.1} ns/call (budget {BUDGET_NS:.0} ns)");
+    assert!(best_ns < BUDGET_NS, "apply too slow: {best_ns:.1} ns/call");
 }
 
 fn cal_fixture() -> Calibration {
