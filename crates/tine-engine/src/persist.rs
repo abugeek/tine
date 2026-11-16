@@ -216,24 +216,26 @@ fn is_win32(source: &windows::core::Error, code: windows::Win32::Foundation::WIN
     source.code() == windows::core::HRESULT::from_win32(code.0)
 }
 
-/// Reads and parses a JSON file; `Ok(None)` when it does not exist.
-fn read_value(path: &Path) -> Result<Option<Value>, PersistError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(PersistError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-    };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|source| PersistError::Json {
+/// Reads a file's raw bytes; `Ok(None)` when it does not exist. Parse errors
+/// are deliberately *not* raised here: an unparseable file is "corrupt", and
+/// corruption is handled by the caller (backup + defaults).
+fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, PersistError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(PersistError::Io {
             path: path.to_path_buf(),
             source,
-        })
+        }),
+    }
+}
+
+/// Parses raw bytes as JSON.
+fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<Value, PersistError> {
+    serde_json::from_slice(bytes).map_err(|source| PersistError::Json {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Migrates a raw JSON document to the current schema in place.
@@ -284,14 +286,14 @@ where
     T: DeserializeOwned,
     V: FnOnce(&T) -> Result<(), ValidationError>,
 {
-    let value = match read_value(path) {
+    let bytes = match read_bytes(path) {
         Ok(None) => return Loaded::Missing(default),
-        Ok(Some(v)) => v,
+        Ok(Some(b)) => b,
         Err(source) => return Loaded::Failed(default, source),
     };
 
     let outcome: Result<T, PersistError> = (|| {
-        let mut value = value;
+        let mut value = parse_bytes(path, &bytes)?;
         migrate_value(path, &mut value)?;
         let typed: T = serde_json::from_value(value).map_err(|source| PersistError::Json {
             path: path.to_path_buf(),

@@ -627,7 +627,6 @@ mod tests {
         let sent = handle.send(Command::SetMacro(Macro::Purity, 0.1));
         assert!(sent.is_ok(), "send must succeed while the handle is alive");
         let mut visible = None;
-        let mut last_gen = 0u64;
         let mut params = DspParams::DEFAULT;
         // Consume the startup snapshot first so the next change is the
         // command's, not the initial publish.
@@ -641,7 +640,7 @@ mod tests {
             (warmup.denoise_mix - 0.5).abs() < f32::EPSILON,
             "startup snapshot is neutral (macro 0.5)"
         );
-        last_gen = warm_gen;
+        let mut last_gen = warm_gen;
         while t0.elapsed() < Duration::from_secs(2) {
             let mut probe = DspParams::DEFAULT;
             if block.load_if_changed(&mut last_gen, &mut probe) {

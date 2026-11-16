@@ -683,16 +683,8 @@ mod tests {
         fn set_layout_version(&mut self, version: u32) {
             // SAFETY: `base` is a mapped `ShmLayout` created by `create`;
             // this field write races with no reader (test-only).
-            let layout_ptr = self.base.cast::<ShmLayout>();
-            let layout_ref = unsafe { &mut *layout_ptr };
-            let hdr = &raw mut layout_ref.header;
-            unsafe {
-                (*hdr).layout_version = version;
-            }
-        }
-        fn layout_mut(&mut self) -> &mut ShmLayout {
-            // SAFETY: `base` is a mapped `ShmLayout` created by `create`.
-            unsafe { &mut *self.base.cast::<ShmLayout>() }
+            let layout_ref = unsafe { &mut *self.base.cast::<ShmLayout>() };
+            layout_ref.header.layout_version = version;
         }
 
         fn publish_telemetry(&self, seq: u64) {
