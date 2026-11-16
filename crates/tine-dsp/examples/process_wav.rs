@@ -114,8 +114,7 @@ fn read_wav_mono(path: &PathBuf) -> Result<(Vec<f32>, u32), String> {
     let is_flac = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("flac"))
-        .unwrap_or(false);
+        .is_some_and(|e| e.eq_ignore_ascii_case("flac"));
     if is_flac {
         let mut reader = claxon::FlacReader::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let spec = reader.streaminfo();
@@ -124,7 +123,7 @@ fn read_wav_mono(path: &PathBuf) -> Result<(Vec<f32>, u32), String> {
         let raw: Vec<f32> = reader
             .samples()
             .map(|s| {
-                s.map(|v| ((v as f64) / max) as f32)
+                s.map(|v| (f64::from(v) / max) as f32)
                     .map_err(|e| format!("sample error: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;

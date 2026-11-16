@@ -57,7 +57,7 @@ fn bench_pipeline_rate(c: &mut Criterion, name: &str, sample_rate: f32) {
             buf.copy_from_slice(&orig);
             pipe.process(black_box(&mut buf), black_box(&params), &mut NoMeters, &mut NoTap);
             black_box(&buf);
-        })
+        });
     });
 }
 
@@ -68,7 +68,7 @@ fn bench_stage_breakdown(c: &mut Criterion) {
     let fs = sample_rate;
     let orig = bench_input(0x1234_5678_9abc_def0, 0.25);
 
-    let mut case = |c: &mut Criterion, name: &str, params: &DspParams| {
+    let case = |c: &mut Criterion, name: &str, params: &DspParams| {
         let mut pipe = DspPipeline::new(fs, 480);
         let mut buf = orig.clone();
         c.bench_function(name, |b| {
@@ -76,7 +76,7 @@ fn bench_stage_breakdown(c: &mut Criterion) {
                 buf.copy_from_slice(&orig);
                 pipe.process(black_box(&mut buf), black_box(params), &mut NoMeters, &mut NoTap);
                 black_box(&buf);
-            })
+            });
         });
     };
 

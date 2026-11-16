@@ -255,7 +255,7 @@ pub fn read_flac_mono(path: &Path) -> (Vec<f32>, u32) {
     let depth = f64::from(spec.bits_per_sample);
     let raw: Vec<f32> = reader
         .samples()
-        .map(|s| ((s.expect("flac sample") as f64) / 2.0f64.powf(depth - 1.0)) as f32)
+        .map(|s| (f64::from(s.expect("flac sample")) / 2.0f64.powf(depth - 1.0)) as f32)
         .collect();
     let mono = if ch <= 1 {
         raw

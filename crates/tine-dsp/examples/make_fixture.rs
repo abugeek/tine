@@ -115,7 +115,7 @@ fn crc8_byte(mut crc: u8, byte: u8) -> u8 {
 
 /// CRC-16 (poly x^16 + x^15 + x^2 + 1, init 0, MSB-first) as required by FLAC.
 fn crc16_byte(mut crc: u16, byte: u8) -> u16 {
-    crc ^= (byte as u16) << 8;
+    crc ^= u16::from(byte) << 8;
     for _ in 0..8 {
         crc = if crc & 0x8000 != 0 {
             (crc << 1) ^ 0x8005
@@ -141,9 +141,9 @@ fn utf8_coded_number(value: u64) -> Vec<u8> {
     let mut out = vec![0u8; count];
     let lead_mask: u8 = 0xFFu8 << (7 - count);
     out[0] = lead_mask | ((value >> (6 * (count - 1))) as u8 & !lead_mask);
-    for i in 1..count {
+    for (i, slot) in out.iter_mut().enumerate().skip(1) {
         let shift = 6 * (count - 1 - i);
-        out[i] = 0x80 | (((value >> shift) as u8) & 0x3F);
+        *slot = 0x80 | (((value >> shift) as u8) & 0x3F);
     }
     out
 }
@@ -187,7 +187,7 @@ fn write_pcm16_flac(path: &Path, samples: &[f32]) {
         let bs = chunk_end - pos;
 
         let mut h = BitWriter::new();
-        h.push(0b1111_1111_1111_10, 14); // sync code
+        h.push(0b11_1111_1111_1110, 14); // sync code
         h.push(0, 1); // reserved
         h.push(0, 1); // fixed blocksize strategy
         let full_block = bs == blocksize;
@@ -201,7 +201,7 @@ fn write_pcm16_flac(path: &Path, samples: &[f32]) {
         h.push(0b100, 3); // 16 bits per sample
         h.push(0, 1); // reserved
         for &b in &utf8_coded_number(frame_number) {
-            h.push(b as u32, 8);
+            h.push(u32::from(b), 8);
         }
         if !full_block {
             h.push((bs - 1) as u32, 16); // blocksize - 1
@@ -219,7 +219,7 @@ fn write_pcm16_flac(path: &Path, samples: &[f32]) {
         sub.push(0b000_001, 6); // subframe type: VERBATIM
         sub.push(0, 1); // no wasted bits
         for &s in &pcms[pos..chunk_end] {
-            sub.push(s as u16 as u32, 16);
+            sub.push(u32::from(s as u16), 16);
         }
         assert_eq!(sub.nbits, 0);
 
