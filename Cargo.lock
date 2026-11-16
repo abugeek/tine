@@ -3653,8 +3653,11 @@ dependencies = [
 name = "tine-devhost"
 version = "0.1.0"
 dependencies = [
+ "assert_no_alloc",
+ "cpal",
  "hound",
  "lexopt",
+ "serde_json",
  "tine-dsp",
  "tine-engine",
  "tine-protocol",
