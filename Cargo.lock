@@ -3628,6 +3628,8 @@ name = "tine-engine"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
+ "bytemuck",
+ "claxon",
  "cpal",
  "proptest",
  "realfft",
