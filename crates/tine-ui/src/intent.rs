@@ -43,6 +43,8 @@ pub enum Intent {
     RepairApo,
     /// Open the settings / monitor device popover.
     OpenSettings,
+    /// Set the Pro Rack drawer's open state (persisted by the engine).
+    SetProDrawerOpen(bool),
     /// Request closing the UI window.
     CloseWindow,
 }

@@ -74,18 +74,81 @@ pub struct CalibrationUi {
     pub noise_rms_db: f32,
     /// Measured vocal speech RMS in dBFS.
     pub speech_rms_db: f32,
+    /// Output peak of `finish()`'s offline full-pipeline verification (dBFS),
+    /// proven to land in `-6..-3` (T11).
+    pub simulated_peak_db: f32,
+    /// Output RMS of the offline verification (dBFS).
+    pub simulated_rms_db: f32,
     /// Parameters modified by the calibration.
     pub changes: Vec<CalibrationParamDiff>,
 }
 
-/// Current step of the 8-second Auto-Tune wizard modal.
+/// UI view-model of a calibration rejection: `tine_dsp::calibrator::CalFailure`
+/// (T11, `docs/tasks/T11-auto-calibrator.md`) mapped into `tine-ui` in **one
+/// place** (`views/autotune.rs` — the narrow adapter between the engine-side
+/// state machine and this wizard's view model).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CalFailureUi {
+    /// Signal (and room) stayed below every usable threshold.
+    TooQuiet,
+    /// Room speech-to-noise ratio fell under the 10 dB minimum (`snr_db` measured).
+    TooNoisy {
+        /// Measured speech-to-noise ratio in dB.
+        snr_db: f32,
+    },
+    /// More than 0.5 % of captured samples clipped at -0.3 dBFS.
+    Clipping {
+        /// Fraction of clipped samples (0.0..=1.0).
+        pct: f32,
+    },
+    /// Fewer than 1.5 s of voiced audio in the 5 s speech phase.
+    NotEnoughSpeech {
+        /// Total voiced audio in milliseconds.
+        voiced_ms: u32,
+    },
+    /// The gain needed to reach -18 dBFS speech exceeds the +36 dB range.
+    GainOutOfRange {
+        /// Gain the calibration would have needed, in dB.
+        needed_db: f32,
+    },
+}
+
+impl CalFailureUi {
+    /// Short machine-stable summary (`AutoTuneStep::Failed` payload used in logs and tests).
+    #[must_use]
+    pub fn summary(self) -> String {
+        match self {
+            Self::TooQuiet => String::from("Your microphone stayed nearly silent."),
+            Self::TooNoisy { snr_db } => {
+                format!("Your room is too noisy for a clean measurement (SNR {snr_db:.1} dB).")
+            }
+            Self::Clipping { pct } => {
+                format!("Your mic is clipping ({:.1} % of samples clipped).", pct * 100.0)
+            }
+            Self::NotEnoughSpeech { voiced_ms } => {
+                format!("Only {voiced_ms} ms of speech detected in the 5-second sample.")
+            }
+            Self::GainOutOfRange { needed_db } => {
+                format!("Your mic needs about {needed_db:+.0} dB of gain — beyond Tine's range.")
+            }
+        }
+    }
+}
+
+/// Current step of the 8-second Auto-Tune wizard modal, mapped 1:1 from
+/// `tine_dsp::calibrator::CalPhase` (Countdown → Noise → Voice → Analyzing →
+/// Done/Failed) by the adapter in `views/autotune.rs`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum AutoTuneStep {
     /// Wizard is closed.
     #[default]
     Idle,
-    /// Preparation screen before silence capture begins.
-    Prepare,
+    /// Countdown phase: the first second, discarded (get ready / settle) —
+    /// tips plus a 1 s countdown ring.
+    Prepare {
+        /// Remaining seconds in the countdown phase.
+        remaining_secs: f32,
+    },
     /// Phase 1: 3 seconds of room silence capture.
     Silence {
         /// Remaining seconds in this phase.
@@ -100,8 +163,9 @@ pub enum AutoTuneStep {
     Analyzing,
     /// Displaying before/after parameter diffs for confirmation.
     Results,
-    /// Calibration failed or was rejected (e.g. clipping or silence).
-    Failed(String),
+    /// Calibration failed or was rejected; the workaround for each variant is
+    /// rendered by the failure card (`views/autotune.rs`).
+    Failed(CalFailureUi),
 }
 
 /// Auto-Tune wizard state mirrored from the engine.
@@ -115,6 +179,9 @@ pub struct AutoTuneUi {
     pub level_db: f32,
     /// Prompt sentence shown during the Speak phase.
     pub prompt_text: String,
+    /// Total voiced audio detected so far in the voice phase (ms)
+    /// (`CalProgress::voiced_ms`).
+    pub voiced_ms: u32,
 }
 
 impl Default for AutoTuneUi {
@@ -124,6 +191,7 @@ impl Default for AutoTuneUi {
             progress: 0.0,
             level_db: -60.0,
             prompt_text: String::from("The quick brown fox jumps over the lazy dog."),
+            voiced_ms: 0,
         }
     }
 }
