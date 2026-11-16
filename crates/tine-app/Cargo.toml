@@ -16,17 +16,23 @@ ui-tooling = ["tine-ui/tooling", "rune/tooling"]
 
 [dependencies]
 tine-engine.workspace = true
+tine-protocol.workspace = true
 tine-ui.workspace = true
 lexopt.workspace = true
 rune.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 windows = { workspace = true, features = [
+    "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
 
