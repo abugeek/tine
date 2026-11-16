@@ -49,25 +49,16 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     views::root::view(s, cx)
 }
 
-fn on_key(s: &mut AppState, ev: &KeyEvent, tx: &mut Tx) -> bool {
+/// Window-level key handler: `Space` toggles A/B when no focused control took it
+/// (a focused text field or dropdown keeps its Space; macro nodes handle Space
+/// themselves through [`rune::El::on_key`]).
+#[must_use]
+pub fn on_key(s: &mut AppState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
     match &ev.key {
         Key::Text(t) if t == " " && !ev.mods.cmd && !ev.mods.ctrl && !ev.mods.alt => {
             // Space toggles A/B bypass when not handled by a focused control.
             s.toggle_bypass_optimistic();
             true
-        }
-        Key::Up | Key::Down => {
-            let focused = tx.focused().unwrap_or("");
-            let target = Macro::ALL.into_iter().find(|m| m.key() == focused);
-            if let Some(m) = target {
-                let delta = if ev.mods.shift { 0.1 } else { 0.01 };
-                let signed = if matches!(ev.key, Key::Up) { delta } else { -delta };
-                let next = m.get(s.model.macros) + signed;
-                s.set_macro_optimistic(m, next);
-                true
-            } else {
-                false
-            }
         }
         _ => false,
     }
