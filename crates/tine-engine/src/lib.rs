@@ -13,5 +13,6 @@ pub mod paths;
 pub mod persist;
 pub mod shm_client;
 pub mod spectrum;
+pub mod virtual_cable;
 pub mod visualizer;
 pub mod win;

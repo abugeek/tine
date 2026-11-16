@@ -1,0 +1,243 @@
+//! Virtual-cable DSP routing loop (`D-018`).
+//!
+//! Runs `DspPipeline` in-process inside `tine-engine`: captures mono `f32`
+//! from the selected physical microphone via [`crate::audio_io::open_capture`],
+//! processes it through [`tine_dsp::DspPipeline`] (reading [`ParamBlock`]
+//! lock-free and publishing [`AudioTelemetryFrame`] + post-DSP audio tap), and
+//! outputs continuously to the virtual audio cable sink via
+//! [`crate::audio_io::open_playback`].
+//!
+//! All real-time callback paths live in the [`rt`] submodule and are strictly
+//! lock-free, allocation-free, and panic-free.
+
+use std::sync::Arc;
+
+use tine_protocol::sync::{ParamBlock, SpscRing, Triple};
+use tine_protocol::telemetry::AudioTelemetryFrame;
+
+use crate::audio_io::{
+    AudioIoError, CaptureStream, DeviceRef, PlaybackStream, StreamStats, list_inputs, open_capture, open_playback,
+};
+
+/// Inter-stream ring capacity between capture+DSP and playback (32,768 samples ≈ 682 ms @ 48 kHz).
+const AUDIO_RING_CAP: usize = 32_768;
+
+/// Default maximum block size preallocated for [`tine_dsp::DspPipeline`].
+const DEFAULT_DSP_MAX_BLOCK: usize = 8192;
+
+/// Fallback sample rate when the input device's default rate cannot be queried up front.
+const FALLBACK_SAMPLE_RATE: u32 = 48_000;
+
+/// Real-time DSP callback processor for the virtual-cable routing loop.
+///
+/// Separated from `cpal` stream setup so the exact callback path can be verified
+/// with `assert_no_alloc` in tests without requiring hardware audio devices.
+pub mod rt {
+    #![deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
+
+    use std::sync::Arc;
+
+    use tine_dsp::{DspPipeline, MeterSink, TapSink};
+    use tine_protocol::params::DspParams;
+    use tine_protocol::sync::{ParamBlock, SpscRing, Triple};
+    use tine_protocol::telemetry::AudioTelemetryFrame;
+
+    /// `MeterSink` publishing ~60 Hz telemetry frames into a lock-free [`Triple`].
+    struct TripleMeterSink {
+        triple: Arc<Triple<AudioTelemetryFrame>>,
+    }
+
+    impl MeterSink for TripleMeterSink {
+        #[inline]
+        fn publish(&mut self, f: &AudioTelemetryFrame) {
+            self.triple.publish(f);
+        }
+    }
+
+    /// `TapSink` pushing post-DSP mono samples into a lock-free [`SpscRing`].
+    struct RingTapSink<const TAP_N: usize> {
+        ring: Arc<SpscRing<TAP_N>>,
+    }
+
+    impl<const TAP_N: usize> TapSink for RingTapSink<TAP_N> {
+        #[inline]
+        fn push(&mut self, post: &[f32]) {
+            let _ = self.ring.push_slice(post);
+        }
+    }
+
+    /// Allocation-free, lock-free real-time DSP processor invoked from the capture callback.
+    pub struct VirtualCableProcessor<const TAP_N: usize> {
+        pipeline: DspPipeline,
+        params: Arc<ParamBlock>,
+        cached_params: DspParams,
+        last_gen: u64,
+        meters: TripleMeterSink,
+        tap: RingTapSink<TAP_N>,
+    }
+
+    impl<const TAP_N: usize> VirtualCableProcessor<TAP_N> {
+        /// Allocates and prepares the [`DspPipeline`] once outside the real-time thread.
+        #[must_use]
+        pub fn new(
+            sample_rate: f32,
+            max_block: usize,
+            params: Arc<ParamBlock>,
+            telemetry: Arc<Triple<AudioTelemetryFrame>>,
+            tap: Arc<SpscRing<TAP_N>>,
+        ) -> Self {
+            let mut cached_params = DspParams::DEFAULT;
+            let mut last_gen = 0u64;
+            params.load_if_changed(&mut last_gen, &mut cached_params);
+
+            Self {
+                pipeline: DspPipeline::new(sample_rate, max_block),
+                params,
+                cached_params,
+                last_gen,
+                meters: TripleMeterSink { triple: telemetry },
+                tap: RingTapSink { ring: tap },
+            }
+        }
+
+        /// Processes one mono `f32` capture block in-place (zero allocations, zero locks).
+        #[inline]
+        pub fn process_block(&mut self, block: &mut [f32]) {
+            self.params.load_if_changed(&mut self.last_gen, &mut self.cached_params);
+            self.pipeline
+                .process(block, &self.cached_params, &mut self.meters, &mut self.tap);
+        }
+    }
+}
+
+pub use rt::VirtualCableProcessor;
+
+/// Active capture -> `DspPipeline` -> virtual-cable playback routing loop.
+pub struct VirtualCableRouter {
+    capture: CaptureStream,
+    playback: PlaybackStream,
+}
+
+impl VirtualCableRouter {
+    /// Starts continuous capture from `input_id`, processes mono `f32` through
+    /// [`tine_dsp::DspPipeline`], publishes telemetry to `telemetry` and post-DSP
+    /// samples to `tap`, and plays the result to `output_id`.
+    pub fn start<const TAP_N: usize>(
+        input_id: &DeviceRef,
+        output_id: &DeviceRef,
+        params: Arc<ParamBlock>,
+        telemetry: Arc<Triple<AudioTelemetryFrame>>,
+        tap: Arc<SpscRing<TAP_N>>,
+    ) -> Result<Self, AudioIoError> {
+        let target_rate = resolve_input_rate(input_id).unwrap_or(FALLBACK_SAMPLE_RATE);
+        let mut processor =
+            VirtualCableProcessor::new(target_rate as f32, DEFAULT_DSP_MAX_BLOCK, params, telemetry, tap);
+
+        let audio_ring = Arc::new(SpscRing::<AUDIO_RING_CAP>::new());
+        let capture = open_capture(input_id, Some(target_rate), Arc::clone(&audio_ring), move |block| {
+            processor.process_block(block);
+        })?;
+
+        let actual_in_rate = capture.sample_rate();
+        let playback = open_playback(output_id, audio_ring, actual_in_rate)?;
+
+        Ok(Self { capture, playback })
+    }
+
+    /// Stops both capture and playback streams and releases audio resources.
+    pub fn stop(self) {
+        let _ = self.capture.pause();
+        let _ = self.playback.pause();
+        drop(self.capture);
+        drop(self.playback);
+    }
+
+    /// Returns combined real-time stream health and timing statistics.
+    #[must_use]
+    pub fn stats(&self) -> StreamStats {
+        let c = self.capture.stats();
+        let p = self.playback.stats();
+        StreamStats {
+            underruns: p.underruns,
+            overruns: c.overruns,
+            callbacks: c.callbacks.saturating_add(p.callbacks),
+            max_callback_us: c.max_callback_us.max(p.max_callback_us),
+        }
+    }
+
+    /// Returns capture-side stream statistics (includes DSP processing time).
+    #[must_use]
+    pub fn capture_stats(&self) -> StreamStats {
+        self.capture.stats()
+    }
+
+    /// Returns playback-side stream statistics.
+    #[must_use]
+    pub fn playback_stats(&self) -> StreamStats {
+        self.playback.stats()
+    }
+
+    /// Returns `true` if either the capture or playback stream reported a backend error.
+    #[must_use]
+    pub fn has_error(&self) -> bool {
+        self.capture.has_error() || self.playback.has_error()
+    }
+
+    /// Negotiated capture sample rate in Hz.
+    #[must_use]
+    pub const fn input_rate(&self) -> u32 {
+        self.capture.sample_rate()
+    }
+
+    /// Negotiated playback sample rate in Hz.
+    #[must_use]
+    pub const fn output_rate(&self) -> u32 {
+        self.playback.sample_rate()
+    }
+}
+
+fn resolve_input_rate(input_id: &DeviceRef) -> Option<u32> {
+    let inputs = list_inputs().ok()?;
+    let matched = match input_id {
+        DeviceRef::Default => inputs.iter().find(|d| d.is_default),
+        DeviceRef::Id(target) => inputs.iter().find(|d| d.id == *target),
+        DeviceRef::Name(query) => {
+            let q = query.to_ascii_lowercase();
+            inputs
+                .iter()
+                .find(|d| d.name.to_ascii_lowercase() == q)
+                .or_else(|| inputs.iter().find(|d| d.name.to_ascii_lowercase().contains(&q)))
+        }
+    }?;
+    (matched.default_rate > 0).then_some(matched.default_rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_returns_device_not_found_for_missing_input() {
+        let params = Arc::new(ParamBlock::new());
+        let telemetry = Arc::new(Triple::new(AudioTelemetryFrame::default()));
+        let tap = Arc::new(SpscRing::<1024>::new());
+
+        let err = match VirtualCableRouter::start(
+            &DeviceRef::Name("__nonexistent_tine_input_device_12345__".to_owned()),
+            &DeviceRef::Default,
+            params,
+            telemetry,
+            tap,
+        ) {
+            Ok(_) => panic!("expected DeviceNotFound error"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AudioIoError::DeviceNotFound(_)));
+    }
+}
