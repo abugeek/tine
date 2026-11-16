@@ -23,5 +23,9 @@ proptest.workspace = true
 realfft.workspace = true
 serde_json.workspace = true
 
+[[bench]]
+name = "pipeline"
+harness = false
+
 [lints]
 workspace = true
