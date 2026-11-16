@@ -16,11 +16,11 @@
 | T12 | cpal audio I/O module + `tine-devhost` | C — Engine / App | done | `task/T12-audio-io` | #9 | T12-worker |
 | T13 | Virtual-cable DSP routing loop (`D-018`) | B — Virtual Cable | done | `task/T13-virtual-cable` | #13 | T13-worker |
 | T14 | Virtual cable discovery, DeviceWatcher & endpoint admin (`D-018`) | B — Virtual Cable | done | `task/T14-endpoint-admin` | #12 | T14-worker |
-| T15 | Engine core: shm client, controller, persistence, devices | C — Engine / App | todo | — | — | — |
+| T15 | Engine core: shm client, controller, persistence, devices | C — Engine / App | done | `task/T15-engine-core` | #17 | t15 (GLM) |
 | T16 | Engine audio services: spectrum, Auto-Tune runner, Hear Myself | C — Engine / App | todo | — | — | — |
 | T17 | `tine.exe` shell: Rune App, tray, single instance, CLI, logging | C — Engine / App | todo | — | — | — |
 | T18 | UI foundation: view model, theme, headless harness | D — UI | done | `task/T18-ui-foundation` | #6 | T18-worker |
-| T19 | Header + Golden Line canvas | D — UI | todo | — | — | — |
+| T19 | Header + Golden Line canvas | D — UI | done | `task/T19-ui-main-screen` | #18 | t19 (GLM) |
 | T20 | Pro rack, Auto-Tune overlay, onboarding | D — UI | todo | — | — | — |
 | T21 | End-to-end integration in `tine.exe` | Z — Integration & ship | todo | — | — | — |
 | T22 | QA: soak, perf, mic/app matrix, listening tests | Z — Integration & ship | todo | — | — | — |
