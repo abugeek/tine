@@ -148,10 +148,14 @@ fn every_command_reaches_the_model_and_the_param_target() {
     assert_eq!(p.input_gain_db, 9.5);
     assert_eq!(p.comp_makeup_db, 2.5);
     assert!(!p.bypass);
-    // NOTE(T10): `denoise_mix` is *not* expected to equal the calibrated
-    // 0.85 here — the Purity macro was moved to 0.9 and left unpinned, so
-    // under the temporary mapping the macro drives it (the real semantics —
-    // MacroMapper offsetting from calibrated values — land with T10).
+    // D-021: the calibrated denoise_mix 0.85 is now the anchor the Purity
+    // macro (left at 0.9) swings around: 0.85 + 0.4 = 1.25, clamped by SPECS
+    // to 1.0 — the calibrated value is reproduced exactly only at m = 0.5.
+    assert!((p.denoise_mix - 1.0).abs() < 1e-6);
+    assert!(
+        (p.gate_threshold_db - (-43.0)).abs() < 1e-3,
+        "calibrated -55 dB + 0.8 * 15 dB span"
+    );
 
     drop(handle);
     drop(rx);
@@ -172,11 +176,12 @@ fn set_macro_pins_and_unpin_restores_macro_control() {
     // pinned parameter stays put.
     let sent = handle.send(Command::SetMacro(Macro::Purity, 1.0));
     assert!(sent.is_ok());
-    // The assertion runs inside `wait_params`: gate threshold reaches ~-30 dB
-    // while the pinned denoise_mix stays at 0.25.
+    // The assertion runs inside `wait_params`: with Purity at 1.0 the gate
+    // threshold (Dynamic base -50 dB + half of D-021's 30 dB span) reaches
+    // ~-35 dB while the pinned denoise_mix stays at 0.25.
     wait_params(
         &rx,
-        |p| (p.denoise_mix - 0.25).abs() < 1e-6 && p.gate_threshold_db > -31.5 && p.gate_threshold_db < -28.5,
+        |p| (p.denoise_mix - 0.25).abs() < 1e-6 && p.gate_threshold_db > -36.5 && p.gate_threshold_db < -33.5,
         "purity at 1.0, denoise still pinned",
     );
 
@@ -184,6 +189,37 @@ fn set_macro_pins_and_unpin_restores_macro_control() {
     let sent = handle.send(Command::Unpin(ParamId::DenoiseMix));
     assert!(sent.is_ok());
     wait_params(&rx, |p| (p.denoise_mix - 1.0).abs() < 1e-6, "macro drives again");
+
+    drop(handle);
+    drop(rx);
+}
+
+#[test]
+fn macro_midpoint_reproduces_the_archetype_base() {
+    let (handle, rx, _paths) = spawn_block("mic-mid", "mid");
+    let ready = wait_model(&rx, |_| true, "startup ModelChanged");
+    assert!(ready.is_some());
+
+    // Rest state (all macros at their 0.5 default) resolves to the preset
+    // base curve exactly (resolve at rest == base is also proven by the
+    // `model::tests::midpoint_macros_reproduce_the_preset_base` unit test),
+    // so the controller publishes the base after its first macro round-trip.
+    let base = tine_dsp::presets::builtin(Archetype::Dynamic).base;
+
+    // Moving Purity away from the centre moves its params (D-021 spans)...
+    let sent = handle.send(Command::SetMacro(Macro::Purity, 0.0));
+    assert!(sent.is_ok());
+    let low = wait_params(
+        &rx,
+        |p| (p.denoise_mix - 0.0).abs() < 1e-6 && (p.gate_threshold_db - (-65.0)).abs() < 1e-3,
+        "purity 0.0 lands base - span/2",
+    );
+    assert_ne!(low, base);
+
+    // ...and centreing all macros again reproduces the base *exactly*.
+    let sent = handle.send(Command::SetMacro(Macro::Purity, 0.5));
+    assert!(sent.is_ok());
+    wait_params(&rx, |p| *p == base, "m back to 0.5 reproduces the base");
 
     drop(handle);
     drop(rx);

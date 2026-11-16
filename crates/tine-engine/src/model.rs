@@ -5,23 +5,22 @@
 //! monitor state. [`resolve`] folds it into the [`DspParams`] snapshot the DSP
 //! consumes.
 //!
-//! Resolution order (per `docs/project/04-mic-adaptation.md`):
+//! Resolution order (per `docs/project/04-mic-adaptation.md`, D-007, D-021):
 //!
 //! ```text
-//! DspParams = MacroMapper( archetype_base ⊕ calibration , macros ) ⊕ pro_overrides
+//! DspParams = MacroMapper( archetype_base ⊕ calibration , macros , pins ) ⊕ pro_overrides
 //! ```
 //!
-//! **T10 not merged yet (early start):** the archetype base curve and
-//! `MacroMapper` live in `tine-dsp` (`tine_dsp::presets`, `tine_dsp::macros`)
-//! and are not on `main` yet. Until they land, [`resolve`] starts from the
-//! neutral [`DspParams::DEFAULT`] and applies a *temporary, local* macro
-//! mapping derived from `docs/project/04-mic-adaptation.md` so that Golden
-//! Line semantics (including D-007 pinning) are exercisable and testable.
-//! Every such site is marked `TODO(T10)`; folding `MacroMapper` in is a
-//! drop-in replacement of [`resolve`].
+//! The base curve and Golden Line mapping are the merged `tine-dsp` ones:
+//! `PresetDef::builtin` (Layer A) and `MacroMapper::apply` (Layers B and C
+//! plus the D-007 pin rule, curve semantics per D-021 — every macro position
+//! `m` is centred on the effective base, so `m = 0.5` reproduces the
+//! archetype, as calibrated).
 
 use std::fmt;
 
+use tine_dsp::macros::MacroMapper;
+use tine_dsp::presets::builtin;
 use tine_protocol::params::{Band, DspParams, FilterType, ParamId};
 use tine_protocol::presets::{Archetype, EndpointProfile, MacroPositions, PresetParams};
 
@@ -186,109 +185,34 @@ pub fn clamp_param(id: ParamId, v: f32) -> f32 {
     }
 }
 
-/// Linear interpolation helper for the temporary macro maps.
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
-/// Neutral `gate_threshold_db` the Purity macro swings around (`−60..=−30` dB
-/// around its midpoint of `−45` dB, so macro 0.5 is neutral).
-const NEUTRAL_GATE_THRESHOLD_DB: f32 = -45.0;
-
-/// Neutral de-esser amount (dB) below which Presence does not engage it.
-const DEESSER_ENGAGE: f32 = 0.6;
-
 /// Resolves the [`AppModel`] into the [`DspParams`] snapshot for the DSP.
 ///
-/// Layer order: neutral defaults → calibration → macros (skipping pinned
-/// parameters) → Pro-mode overrides → bypass.
+/// Layer order: `tine-dsp` [`MacroMapper::apply`] folds the archetype base
+/// curve (`PresetDef::builtin`, Layer A), the Auto-Tune calibration (Layer B)
+/// and the Golden Line macros (Layer C, centred spans per D-021) into one
+/// clamped snapshot → Pro-mode overrides → bypass.
+///
+/// Deterministic and idempotent for identical inputs; allocation-free and
+/// panic-free (safe to call on the control path).
 #[must_use]
 pub fn resolve(model: &AppModel) -> DspParams {
     let profile = &model.profile;
-    let macros = profile.macros.clamped();
-    let pins = profile.pins;
-    let cal = profile.calibration;
 
-    let mut p = DspParams::DEFAULT;
-    // TODO(T10): start from the archetype base curve:
-    //   let mut p = tine_dsp::presets::base(profile.archetype).to_dsp_params();
-    // instead of the neutral default, and route every macro-dependent value
-    // through `tine_dsp::macros::MacroMapper::map` instead of the local
-    // tables below.
-
-    // Layer B — calibration (drives the params Auto-Tune measured).
-    if let Some(cal) = cal {
-        p.set(ParamId::InputGainDb, cal.derived.input_gain_db);
-        p.set(ParamId::GateThresholdDb, cal.derived.gate_threshold_db);
-        p.set(ParamId::DenoiseMix, cal.derived.denoise_mix);
-        p.set(ParamId::CompThreshDb, cal.derived.comp_thresh_db);
-        p.set(ParamId::CompMakeupDb, cal.derived.comp_makeup_db);
-    }
-
-    // Layer C — Golden Line macros (temporary local mapping; TODO(T10)).
-    // Pinned parameters (D-007) keep their calibrated/overridden value.
-    let cal_gate = cal.map_or(NEUTRAL_GATE_THRESHOLD_DB, |c| c.derived.gate_threshold_db);
-    let cal_comp = cal.map_or(p.comp_thresh_db, |c| c.derived.comp_thresh_db);
-
-    if !pins.is_pinned(ParamId::DenoiseMix) {
-        // TODO(T10): route through MacroMapper::map — purity: mix 0.0 -> 1.0.
-        p.set(ParamId::DenoiseMix, macros.purity);
-    }
-    if !pins.is_pinned(ParamId::GateThresholdDb) {
-        // TODO(T10): MacroMapper — purity swings the calibrated threshold
-        // within the documented −60 .. −30 dB envelope around its midpoint.
-        p.set(
-            ParamId::GateThresholdDb,
-            cal_gate
-                + lerp(
-                    NEUTRAL_GATE_THRESHOLD_DB - 15.0,
-                    NEUTRAL_GATE_THRESHOLD_DB + 15.0,
-                    macros.purity,
-                )
-                - NEUTRAL_GATE_THRESHOLD_DB,
-        );
-    }
-    if !pins.is_pinned(ParamId::EqGainDb(Band::B0)) {
-        // TODO(T10): MacroMapper — body: low-shelf warmth −2 .. +6 dB.
-        p.set(ParamId::EqGainDb(Band::B0), lerp(-2.0, 6.0, macros.body));
-    }
-    if !pins.is_pinned(ParamId::EqGainDb(Band::B1)) {
-        // TODO(T10): MacroMapper — body: mud cut 0 .. −5 dB (deepens as body rises).
-        p.set(ParamId::EqGainDb(Band::B1), lerp(0.0, -5.0, macros.body));
-    }
-    if !pins.is_pinned(ParamId::EqGainDb(Band::B3)) {
-        // TODO(T10): MacroMapper — presence: 4.2 kHz peak 0 .. +5 dB.
-        p.set(ParamId::EqGainDb(Band::B3), lerp(0.0, 5.0, macros.presence));
-    }
-    if !pins.is_pinned(ParamId::EqGainDb(Band::B4)) {
-        // TODO(T10): MacroMapper — presence: 8.5 kHz air shelf 0 .. +6 dB.
-        p.set(ParamId::EqGainDb(Band::B4), lerp(0.0, 6.0, macros.presence));
-    }
-    if !pins.is_pinned(ParamId::DeesserEnabled) {
-        // TODO(T10): MacroMapper — presence engages the de-esser above 0.6.
-        p.set(
-            ParamId::DeesserEnabled,
-            if macros.presence > DEESSER_ENGAGE { 1.0 } else { 0.0 },
-        );
-    }
-    if !pins.is_pinned(ParamId::DeesserAmountDb) {
-        // TODO(T10): MacroMapper — amount scales 3 .. 8 dB over 0.6 -> 1.0.
-        let t = ((macros.presence - DEESSER_ENGAGE) / (1.0 - DEESSER_ENGAGE)).clamp(0.0, 1.0);
-        p.set(ParamId::DeesserAmountDb, lerp(3.0, 8.0, t));
-    }
-    if !pins.is_pinned(ParamId::CompRatio) {
-        // TODO(T10): MacroMapper — leveler: ratio 1.5:1 -> 5:1.
-        p.set(ParamId::CompRatio, lerp(1.5, 5.0, macros.leveler));
-    }
-    if !pins.is_pinned(ParamId::CompThreshDb) {
-        // TODO(T10): MacroMapper — leveler lowers the calibrated threshold
-        // by 0 .. 10 dB and enables auto-makeup.
-        p.set(ParamId::CompThreshDb, cal_comp - lerp(0.0, 10.0, macros.leveler));
-    }
-    if !pins.is_pinned(ParamId::CompAutoMakeup) {
-        // TODO(T10): MacroMapper — leveler enables auto-makeup.
-        p.set(ParamId::CompAutoMakeup, 1.0);
-    }
+    // Layers A–C plus the D-007 pin rule, in one frozen composition.
+    //
+    // `current` is the neutral snapshot here: every command path that pins a
+    // parameter also stores its Pro-mode override (`SetParam` sets both,
+    // `Unpin`/`UnpinAll` clear both), so a pinned parameter's real value always
+    // comes from the `profile.overrides` applied below. Only a hand-edited
+    // profile JSON can pin without an override — such a stale pin falls back
+    // to the neutral default rather than a stale live value.
+    let mut p = MacroMapper::apply(
+        builtin(profile.archetype),
+        profile.calibration.as_ref(),
+        profile.macros,
+        profile.pins,
+        &DspParams::DEFAULT,
+    );
 
     // Pro-mode direct overrides (pinned by definition; see D-007).
     profile.overrides.apply_to(&mut p);
@@ -403,6 +327,7 @@ pub fn clear_override(overrides: &mut PresetParams, id: ParamId) {
 #[cfg(test)]
 mod tests {
     use super::{AppModel, KeepPins, Macro, apply_override, clamp_param, clear_override, resolve};
+    use tine_dsp::presets::builtin;
     use tine_protocol::params::{Band, DspParams, ParamId};
     use tine_protocol::presets::{
         Archetype, Calibration, CalibrationOverrides, EndpointProfile, MacroPositions, PinSet,
@@ -413,17 +338,17 @@ mod tests {
     }
 
     #[test]
-    fn neutral_macros_keep_neutral_params() {
+    fn midpoint_macros_reproduce_the_preset_base() {
+        // D-021: every macro position is centred on the effective base, so
+        // the default macros (all 0.5) reproduce the archetype curve exactly.
         let m = model();
         let p = resolve(&m);
-        // Macro midpoint ≈ neutral curve (temporary mapping, TODO(T10)).
-        assert_eq!(p.denoise_mix, 0.5, "purity 0.5 keeps default denoise mix");
-        assert!(
-            (p.gate_threshold_db - (-45.0)).abs() < f32::EPSILON,
-            "purity 0.5 lands on the neutral gate threshold"
-        );
-        assert_eq!(p.comp_ratio, 3.25, "leveler 0.5 lands mid-range 1.5..5");
-        assert!(p.comp_auto_makeup, "leveler enables auto makeup");
+        assert_eq!(p, builtin(Archetype::Dynamic).base);
+
+        let mut m = model();
+        m.profile.archetype = Archetype::Condenser;
+        let p = resolve(&m);
+        assert_eq!(p, builtin(Archetype::Condenser).base);
     }
 
     #[test]
@@ -456,20 +381,24 @@ mod tests {
         let mut m = model();
         Macro::set(Macro::Purity, &mut m.profile.macros, 1.0);
         let p = resolve(&m);
-        assert_eq!(p.denoise_mix, 1.0);
-        assert!((p.gate_threshold_db - (-30.0)).abs() < 1e-4, "purity 1.0 -> -30 dB");
+        // Dynamic base mix 0.5 + half of the 1.0 purity span.
+        assert!((p.denoise_mix - 1.0).abs() < 1e-5);
+        // Dynamic base -50 dB + half of the 30 dB purity gate span.
+        assert!((p.gate_threshold_db - (-35.0)).abs() < 1e-4, "purity 1.0 -> -35 dB");
 
         let mut m = model();
         Macro::set(Macro::Body, &mut m.profile.macros, 1.0);
         let p = resolve(&m);
+        // Shelf base +2 dB +4 dB swing; mud base -3 dB cut by 5 dB.
         assert!((p.eq_gain_db[Band::B0.index()] - 6.0).abs() < f32::EPSILON);
-        assert!((p.eq_gain_db[Band::B1.index()] - (-5.0)).abs() < f32::EPSILON);
+        assert!((p.eq_gain_db[Band::B1.index()] - (-8.0)).abs() < f32::EPSILON);
 
         let mut m = model();
         Macro::set(Macro::Presence, &mut m.profile.macros, 0.8);
         let p = resolve(&m);
         assert!(p.deesser_enabled, "presence > 0.6 engages the de-esser");
-        assert!((p.deesser_amount_db - 5.5).abs() < 0.01);
+        // max(base 6.0 dB, curve 3 + 5*(0.8-0.6)/0.4 = 5.5 dB).
+        assert!((p.deesser_amount_db - 6.0).abs() < 0.01);
         assert!(
             !resolve(&{
                 let mut m = model();
@@ -482,11 +411,48 @@ mod tests {
         let mut m = model();
         Macro::set(Macro::Leveler, &mut m.profile.macros, 1.0);
         let p = resolve(&m);
-        assert!((p.comp_ratio - 5.0).abs() < f32::EPSILON);
+        // Base ratio 3.0 + half of the 3.5 span.
+        assert!((p.comp_ratio - 4.75).abs() < f32::EPSILON);
         assert!(
             (p.comp_thresh_db - (-30.0)).abs() < 1e-3,
             "leveler 1.0 lowers threshold by 10 dB"
         );
+    }
+
+    #[test]
+    fn midpoint_macros_reproduce_calibration_as_the_effective_base() {
+        // D-021: with a calibration present, m = 0.5 reproduces the
+        // calibrated values, and macros move *relative to* those anchors.
+        let mut m = model();
+        m.profile.calibration = Some(Calibration {
+            noise_rms_db: -60.0,
+            noise_peak_db: -55.0,
+            speech_rms_db: -28.0,
+            crest_db: 12.0,
+            tilt_db: 3.0,
+            derived: CalibrationOverrides {
+                input_gain_db: 10.0,
+                gate_threshold_db: -54.0,
+                denoise_mix: 0.35,
+                comp_thresh_db: -16.0,
+                comp_makeup_db: 2.0,
+            },
+        });
+        let p = resolve(&m);
+        assert!((p.denoise_mix - 0.35).abs() < 1e-5, "calibrated mix at m=0.5");
+        assert!((p.gate_threshold_db - (-54.0)).abs() < 1e-5);
+        assert!((p.comp_thresh_db - (-16.0)).abs() < 1e-5);
+        assert_eq!(p.comp_makeup_db, 2.0);
+        assert!(!p.comp_auto_makeup, "manual verified makeup disables auto-makeup");
+
+        // Macros now swing around the calibrated anchors.
+        Macro::set(Macro::Purity, &mut m.profile.macros, 1.0);
+        let p = resolve(&m);
+        assert!(
+            (p.denoise_mix - (0.35 + 0.5)).abs() < 1e-5,
+            "mix +0.5 around the anchor"
+        );
+        assert!((p.gate_threshold_db - (-54.0 + 15.0)).abs() < 1e-5);
     }
 
     #[test]
@@ -529,9 +495,11 @@ mod tests {
         });
         let p = resolve(&m);
         assert_eq!(p.input_gain_db, 10.0);
-        // Leveler 0.5 offsets the calibrated threshold by -5 dB (temp mapping).
-        assert!((p.comp_thresh_db - (-21.0)).abs() < 1e-3);
+        // D-021: leveler 0.5 is the centre, so the calibrated threshold (as
+        // the effective base) is reproduced exactly, not offset.
+        assert!((p.comp_thresh_db - (-16.0)).abs() < 1e-3);
         assert_eq!(p.comp_makeup_db, 2.0);
+        assert!(!p.comp_auto_makeup, "manual makeup replaces auto-makeup");
         assert!(m.profile.calibration.is_some());
     }
 
