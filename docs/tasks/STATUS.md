@@ -4,7 +4,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | T01 | Workspace, toolchain, CI, dependency baseline | 0 — Foundation | done | `task/T01-workspace` | #1 | T01-worker |
 | T02 | Spike (go/no-go): Rust APO on a capture endpoint | B — Windows / APO | in-progress | `task/T02-apo-spike` | — | T02-worker |
-| T03 | Spike: Rune windowless app, tray, GPU release, memory | C — Engine / App | in-progress | `task/T03-rune-spike` | — | T03-worker |
+| T03 | Spike: Rune windowless app, tray, GPU release, memory | C — Engine / App | done | `task/T03-rune-spike` | #3 | T03-worker |
 | T04 | `tine-protocol`: params, lock-free primitives, shm layout | 0 — Foundation | in-progress | `task/T04-protocol` | — | T04-worker |
 | T05 | DSP primitives, test/bench harness, `DspPipeline` skeleton | 0 — Foundation | todo | — | — | — |
 | T06 | Stage 1–2: gain/DC/HPF, RNNoise + expander | A — DSP | todo | — | — | — |
