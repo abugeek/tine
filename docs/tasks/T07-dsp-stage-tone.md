@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T07-worker) |
 | Lane | A — DSP (parallel with T06, T08) |
 | Depends on | T05 |
 | Unblocks | T09, T19 (curve math for the Golden Line) |
