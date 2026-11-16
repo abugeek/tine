@@ -1,23 +1,15 @@
 //! Root Rune view assembling header, Golden Line canvas, Pro drawer, and modal overlays.
 
 use rune::{Cx, El, col, el, row, text};
-use tine_protocol::presets::Archetype;
 
 use crate::intent::Intent;
-use crate::model::{ApoBadge, AutoTuneStep, Macro};
+use crate::model::AutoTuneStep;
 use crate::state::AppState;
 use crate::theme::{TineTheme, radii, spacing, typography};
 
-const ARCHETYPES: [(Archetype, &str); 4] = [
-    (Archetype::Dynamic, "Dynamic"),
-    (Archetype::Condenser, "Condenser"),
-    (Archetype::Headset, "Headset"),
-    (Archetype::Laptop, "Laptop"),
-];
-
 /// Renders the complete Tine UI tree.
 #[must_use]
-pub fn view(s: &AppState, _cx: &mut Cx<AppState>) -> El {
+pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     let t = TineTheme::dark();
     let modal_active =
         !matches!(s.model.autotune.step, AutoTuneStep::Idle) || (s.model.first_run && !s.ui.onboarding_dismissed);
@@ -30,8 +22,8 @@ pub fn view(s: &AppState, _cx: &mut Cx<AppState>) -> El {
         .px(spacing::LG)
         .py(spacing::MD)
         .gap(spacing::MD)
-        .child(header_placeholder(s, t))
-        .child(canvas_placeholder(s, t))
+        .child(crate::views::header::view(s, t))
+        .child(crate::views::canvas::view(s, cx))
         .child(pro_drawer_placeholder(s, t));
 
     if modal_active {
@@ -74,222 +66,6 @@ fn pill_button(
         .border(1.0, t.border)
         .on_press(on_press)
         .child(text(label_str).font(typography::LABEL).color(fg))
-}
-
-fn header_placeholder(s: &AppState, t: TineTheme) -> El {
-    let mic_name = s
-        .model
-        .selected
-        .and_then(|idx| s.model.endpoints.get(idx))
-        .map_or("No Microphone", |e| e.name.as_str());
-
-    let mic_btn = pill_button(
-        "header/mic-selector",
-        "combobox",
-        format!("Mic: {mic_name}"),
-        false,
-        t,
-        |s| {
-            if !s.model.endpoints.is_empty() {
-                let next = s.model.selected.map_or(0, |i| (i + 1) % s.model.endpoints.len());
-                s.model.selected = Some(next);
-                s.emit(Intent::SelectEndpoint(next));
-            }
-        },
-    );
-
-    let apo_color = match s.model.apo {
-        ApoBadge::Active => t.meter_green,
-        ApoBadge::Inactive => t.meter_amber,
-        ApoBadge::NotInstalled | ApoBadge::Error(_) => t.danger,
-    };
-
-    let mut apo_row = row()
-        .key("header/apo-status")
-        .gap(spacing::XS)
-        .center()
-        .px(spacing::SM)
-        .h(30.0)
-        .radius(radii::MD)
-        .fill(t.surface)
-        .border(1.0, t.border)
-        .child(el().key("header/apo-dot").size(8.0, 8.0).radius(4.0).fill(apo_color))
-        .child(
-            text(format!("APO: {}", s.model.apo.label()))
-                .font(typography::LABEL)
-                .color(t.text),
-        );
-
-    match s.model.apo {
-        ApoBadge::NotInstalled => {
-            apo_row = apo_row.child(pill_button(
-                "header/apo-install",
-                "button",
-                "Install APO",
-                true,
-                t,
-                |s| s.emit(Intent::InstallApo),
-            ));
-        }
-        ApoBadge::Inactive | ApoBadge::Error(_) => {
-            apo_row = apo_row.child(pill_button("header/apo-repair", "button", "Repair APO", true, t, |s| {
-                s.emit(Intent::RepairApo);
-            }));
-        }
-        ApoBadge::Active => {}
-    }
-
-    let mut arch_group = row()
-        .key("header/archetypes")
-        .role("radiogroup")
-        .label("Microphone archetype")
-        .gap(spacing::XS);
-
-    for (arch, name) in ARCHETYPES {
-        let key = match arch {
-            Archetype::Dynamic => "header/arch-dynamic",
-            Archetype::Condenser => "header/arch-condenser",
-            Archetype::Headset => "header/arch-headset",
-            Archetype::Laptop => "header/arch-laptop",
-        };
-        let selected = s.model.archetype == arch;
-        arch_group = arch_group.child(pill_button(key, "radio", name, selected, t, move |s| {
-            s.model.archetype = arch;
-            s.emit(Intent::SetArchetype(arch));
-        }));
-    }
-
-    let autotune_btn = pill_button("header/autotune", "button", "Auto-Tune (8s)", false, t, |s| {
-        s.emit(Intent::StartAutoTune);
-    });
-
-    let monitor_label = if s.model.monitor.enabled {
-        format!("Hear Myself ({:.0} ms)", s.model.monitor.estimated_latency_ms)
-    } else {
-        String::from("Hear Myself")
-    };
-    let monitor_btn = pill_button(
-        "header/monitor",
-        "switch",
-        monitor_label,
-        s.model.monitor.enabled,
-        t,
-        |s| {
-            s.model.monitor.enabled = !s.model.monitor.enabled;
-            s.emit(Intent::ToggleMonitor);
-        },
-    );
-
-    let bypass_label = if s.model.bypass { "A/B: Raw" } else { "A/B: Tine" };
-    let bypass_btn = pill_button("header/bypass", "switch", bypass_label, !s.model.bypass, t, |s| {
-        s.toggle_bypass_optimistic();
-    });
-
-    col()
-        .key("header")
-        .w_full()
-        .px(spacing::MD)
-        .py(spacing::MD)
-        .gap(spacing::SM)
-        .radius(radii::LG)
-        .fill(t.surface)
-        .border(1.0, t.border)
-        .child(
-            row()
-                .key("header/top-row")
-                .w_full()
-                .gap(spacing::SM)
-                .child(mic_btn)
-                .child(apo_row)
-                .child(el().key("header/spacer-1").grow(1.0))
-                .child(arch_group)
-                .child(autotune_btn),
-        )
-        .child(
-            row()
-                .key("header/bottom-row")
-                .w_full()
-                .gap(spacing::SM)
-                .child(el().key("header/spacer-2").grow(1.0))
-                .child(monitor_btn)
-                .child(bypass_btn),
-        )
-}
-
-fn canvas_placeholder(s: &AppState, t: TineTheme) -> El {
-    let mut spectrum_row = row().key("canvas/spectrum").w_full().h(72.0).gap(3.0).center();
-
-    for (idx, &mag) in s.live.spectrum.iter().enumerate() {
-        let bar_h = (mag.clamp(0.0, 1.0) * 64.0).max(4.0);
-        spectrum_row = spectrum_row.child(
-            el().key(format!("canvas/bar-{idx}"))
-                .grow(1.0)
-                .h(bar_h)
-                .radius(2.0)
-                .fill(t.accent_glow),
-        );
-    }
-
-    let mut macro_row = row().key("canvas/macros").w_full().gap(spacing::LG).center();
-
-    for m in Macro::ALL {
-        let val = m.get(s.model.macros);
-        let pct = (val * 100.0).round() as u32;
-        macro_row = macro_row.child(
-            col()
-                .key(m.key())
-                .role("slider")
-                .label(format!("{} {pct}%", m.label()))
-                .focusable(true)
-                .w(140.0)
-                .px(spacing::MD)
-                .py(spacing::MD)
-                .gap(spacing::XS)
-                .center()
-                .radius(radii::MD)
-                .fill(t.surface_raised)
-                .border(1.0, t.accent)
-                .on_press(move |s: &mut AppState| {
-                    let next = (m.get(s.model.macros) + 0.05) % 1.05;
-                    s.set_macro_optimistic(m, next.min(1.0));
-                })
-                .child(text(m.label()).font(typography::LABEL).color(t.text))
-                .child(text(format!("{pct}%")).font(typography::CAPTION).color(t.text_dim)),
-        );
-    }
-
-    let in_db = s.live.telemetry.input_rms_db;
-    let out_db = s.live.telemetry.output_rms_db;
-
-    col()
-        .key("canvas")
-        .w_full()
-        .grow(1.0)
-        .min_h(160.0)
-        .px(spacing::LG)
-        .py(spacing::LG)
-        .gap(spacing::MD)
-        .radius(radii::LG)
-        .fill(t.surface)
-        .border(1.0, t.border)
-        .child(
-            row()
-                .key("canvas/title-row")
-                .w_full()
-                .child(
-                    text("Golden Line — Voice Conditioner")
-                        .font(typography::BODY)
-                        .color(t.text),
-                )
-                .child(el().key("canvas/title-spacer").grow(1.0))
-                .child(
-                    text(format!("In {in_db:.1} dBFS  |  Out {out_db:.1} dBFS"))
-                        .font(typography::CAPTION)
-                        .color(t.text_dim),
-                ),
-        )
-        .child(spectrum_row)
-        .child(macro_row)
 }
 
 fn pro_drawer_placeholder(s: &AppState, t: TineTheme) -> El {

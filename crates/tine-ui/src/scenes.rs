@@ -5,7 +5,7 @@ use tine_protocol::presets::{Archetype, MacroPositions};
 
 use crate::fake::scene_live_frame;
 use crate::model::{
-    ApoBadge, AutoTuneStep, AutoTuneUi, CalibrationParamDiff, CalibrationUi, EndpointRow, MonitorUi, UiModel,
+    ApoBadge, AutoTuneStep, AutoTuneUi, CalibrationParamDiff, CalibrationUi, EndpointRow, Macro, MonitorUi, UiModel,
 };
 use crate::state::AppState;
 
@@ -165,6 +165,14 @@ pub fn make_auto_tune_failed() -> AppState {
     s
 }
 
+/// Golden Line with a macro node hovered (spring tooltip shown).
+#[must_use]
+pub fn make_golden_line_tooltip() -> AppState {
+    let mut s = make_golden_line();
+    s.ui.hovered_macro = Some(Macro::Body);
+    s
+}
+
 /// Endpoint selected, but Windows APO is not yet installed.
 #[must_use]
 pub fn make_apo_not_installed() -> AppState {
@@ -218,6 +226,10 @@ fn apply_auto_tune_failed(s: &mut AppState) {
     *s = make_auto_tune_failed();
 }
 
+fn apply_golden_line_tooltip(s: &mut AppState) {
+    *s = make_golden_line_tooltip();
+}
+
 fn apply_apo_not_installed(s: &mut AppState) {
     *s = make_apo_not_installed();
 }
@@ -232,6 +244,7 @@ pub type SceneEntry = (&'static str, fn(&mut AppState));
 /// Scene registry passed to [`rune::AppSpec::scenes`].
 pub const SCENES: &[SceneEntry] = &[
     ("golden_line", apply_golden_line),
+    ("golden_line_tooltip", apply_golden_line_tooltip),
     ("pro_drawer_open", apply_pro_drawer_open),
     ("auto_tune_wizard", apply_auto_tune_wizard),
     ("auto_tune_prepare", apply_auto_tune_prepare),
