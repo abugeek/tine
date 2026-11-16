@@ -33,9 +33,7 @@ use tine_dsp::calibrator::{COUNTDOWN_S, CalFailure, CalPhase, CalProgress, Calib
 use tine_protocol::params::ParamId;
 
 use crate::intent::Intent;
-use crate::model::{
-    AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, UiModel,
-};
+use crate::model::{AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, UiModel};
 use crate::state::AppState;
 use crate::theme::{TineTheme, radii, spacing, typography};
 
@@ -495,13 +493,11 @@ fn results_card(model: &UiModel, t: TineTheme) -> El {
             .child(measurement("Noise floor", format!("{:.1} dBFS", cal.noise_rms_db), t))
             .child(measurement("Speech level", format!("{:.1} dBFS", cal.speech_rms_db), t))
             .child(measurement("SNR", format!("{:.1} dB", snr_db(cal)), t))
-            .child(
-                measurement(
-                    "Verified peak",
-                    format!("{:.1} dBFS", cal.simulated_peak_db),
-                    t,
-                ),
-            ),
+            .child(measurement(
+                "Verified peak",
+                format!("{:.1} dBFS", cal.simulated_peak_db),
+                t,
+            )),
     );
 
     for diff in &cal.changes {
@@ -640,7 +636,7 @@ fn button(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tine_dsp::calibrator::{COUNTDOWN_S, AutoCalibrator};
+    use tine_dsp::calibrator::{AutoCalibrator, COUNTDOWN_S};
     use tine_dsp::presets::builtin;
     use tine_protocol::params::DspParams;
     use tine_protocol::presets::{Archetype, PinSet};
@@ -745,10 +741,7 @@ mod tests {
         let ui = autotune_from_progress(&p, None);
         match ui.step {
             AutoTuneStep::Silence { remaining_secs } => {
-                assert!(
-                    (remaining_secs - 1.5).abs() < 0.06,
-                    "remaining {remaining_secs}"
-                );
+                assert!((remaining_secs - 1.5).abs() < 0.06, "remaining {remaining_secs}");
             }
             other => panic!("expected Silence, got {other:?}"),
         }
