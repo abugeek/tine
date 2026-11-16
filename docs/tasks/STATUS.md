@@ -21,7 +21,7 @@
 | T17 | `tine.exe` shell: Rune App, tray, single instance, CLI, logging | C — Engine / App | todo | — | — | — |
 | T18 | UI foundation: view model, theme, headless harness | D — UI | done | `task/T18-ui-foundation` | #6 | T18-worker |
 | T19 | Header + Golden Line canvas | D — UI | done | `task/T19-ui-main-screen` | #18 | t19 (GLM) |
-| T20 | Pro rack, Auto-Tune overlay, onboarding | D — UI | todo | — | — | — |
+| T20 | Pro rack, Auto-Tune overlay, onboarding | D — UI | done | `task/T20-ui-pro-autotune-onboarding` | #21 | t20 (GLM) |
 | T21 | End-to-end integration in `tine.exe` | Z — Integration & ship | todo | — | — | — |
 | T22 | QA: soak, perf, mic/app matrix, listening tests | Z — Integration & ship | todo | — | — | — |
 | T23 | Installer, signing, release, OSS docs | Z — Integration & ship | todo | — | — | — |
