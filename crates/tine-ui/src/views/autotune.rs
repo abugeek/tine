@@ -235,7 +235,7 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
                 .child(
                     text(format!(
                         "Speak at your usual volume and distance. {:.1} s of speech captured so far.",
-                        f32::from(au.voiced_ms as f32 / 1000.0)
+                        au.voiced_ms as f32 / 1000.0
                     ))
                     .key("autotune/voiced-so-far")
                     .role("label")
