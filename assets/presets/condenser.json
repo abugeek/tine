@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "condenser",
+  "name": "Studio Condenser",
+  "params": {
+    "hpf_freq_hz": 95.0,
+    "deesser_enabled": true,
+    "deesser_freq_hz": 6800.0,
+    "deesser_amount_db": 3.0,
+    "eq": [
+      { "type": "low_shelf", "freq_hz": 120.0, "gain_db": 0.5, "q": 0.707 },
+      { "type": "peaking", "freq_hz": 280.0, "gain_db": -2.0 },
+      {},
+      {},
+      { "type": "high_shelf", "freq_hz": 10000.0, "gain_db": 1.0, "q": 0.707 }
+    ]
+  },
+  "macro_defaults": { "purity": 0.5, "body": 0.5, "presence": 0.5, "leveler": 0.5 }
+}

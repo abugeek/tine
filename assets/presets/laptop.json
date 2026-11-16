@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "laptop",
+  "name": "Laptop / Webcam / Lav",
+  "params": {
+    "hpf_freq_hz": 110.0,
+    "denoise_mix": 0.9,
+    "gate_ratio": 4.0,
+    "eq": [
+      {},
+      {},
+      { "type": "peaking", "freq_hz": 2500.0, "gain_db": 3.0 },
+      {},
+      {}
+    ]
+  },
+  "macro_defaults": { "purity": 0.5, "body": 0.5, "presence": 0.5, "leveler": 0.5 }
+}

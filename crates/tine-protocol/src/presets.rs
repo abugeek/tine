@@ -142,9 +142,91 @@ impl PinSet {
     }
 }
 
+/// Parameters derived by the 8-second Auto-Tune wizard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CalibrationOverrides {
+    /// Calibrated pre-gain to bring speech RMS to `-18 dBFS`.
+    pub input_gain_db: f32,
+    /// Calibrated expander threshold (`noise_rms_db + 6 dB`).
+    pub gate_threshold_db: f32,
+    /// Calibrated `RNNoise` mix (`0.85` if noisy, else `0.50`).
+    pub denoise_mix: f32,
+    /// Calibrated compressor threshold (`vocal_rms_after_gain + 2 dB`).
+    pub comp_thresh_db: f32,
+    /// Calibrated compressor makeup gain (verified by offline simulation).
+    pub comp_makeup_db: f32,
+}
+
+/// Output of the 8-second Auto-Tune wizard stored per endpoint.
+///
+/// Plain data: always available (including `no_std` consumers such as
+/// `tine-dsp::macros`), independent of the optional `serde` feature.
+/// Serialization support is added by `serde`-aware consumers via the
+/// `cfg_attr` derives below; validation (which allocates) stays gated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Calibration {
+    /// Ambient room noise RMS (dBFS).
+    pub noise_rms_db: f32,
+    /// Ambient room noise peak (dBFS).
+    pub noise_peak_db: f32,
+    /// Integrated voiced speech RMS (dBFS).
+    pub speech_rms_db: f32,
+    /// Measured vocal crest factor (dB).
+    pub crest_db: f32,
+    /// Spectral tilt (`E(<350 Hz) / E(1-6 kHz)` in dB).
+    pub tilt_db: f32,
+    /// Derived DSP overrides.
+    pub derived: CalibrationOverrides,
+}
+
+#[cfg(feature = "serde")]
+impl Calibration {
+    /// Validates that all measured and derived calibration values are finite and within range.
+    pub fn validate(&self) -> Result<(), serde_types::ValidationError> {
+        use serde_types::{ValidationError, check_param, check_range};
+
+        let mut errors = Vec::new();
+        check_range(&mut errors, "calibration.noise_rms_db", self.noise_rms_db, -120.0, 0.0);
+        check_range(
+            &mut errors,
+            "calibration.noise_peak_db",
+            self.noise_peak_db,
+            -120.0,
+            6.0,
+        );
+        check_range(
+            &mut errors,
+            "calibration.speech_rms_db",
+            self.speech_rms_db,
+            -120.0,
+            0.0,
+        );
+        check_range(&mut errors, "calibration.crest_db", self.crest_db, 0.0, 40.0);
+        check_range(&mut errors, "calibration.tilt_db", self.tilt_db, -40.0, 40.0);
+
+        check_param(&mut errors, ParamId::InputGainDb, Some(self.derived.input_gain_db));
+        check_param(
+            &mut errors,
+            ParamId::GateThresholdDb,
+            Some(self.derived.gate_threshold_db),
+        );
+        check_param(&mut errors, ParamId::DenoiseMix, Some(self.derived.denoise_mix));
+        check_param(&mut errors, ParamId::CompThreshDb, Some(self.derived.comp_thresh_db));
+        check_param(&mut errors, ParamId::CompMakeupDb, Some(self.derived.comp_makeup_db));
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationError::OutOfRange(errors))
+        }
+    }
+}
+
 #[cfg(feature = "serde")]
 mod serde_types {
-    use super::{Archetype, MacroPositions, PinSet};
+    use super::{Archetype, Calibration, MacroPositions, PinSet};
     use crate::ids::SCHEMA_VERSION;
     use crate::params::{Band, DspParams, EQ_BAND_COUNT, FilterType, ParamId};
 
@@ -227,7 +309,7 @@ mod serde_types {
         }
     }
 
-    fn check_param(errors: &mut Vec<FieldError>, id: ParamId, value: Option<f32>) {
+    pub(crate) fn check_param(errors: &mut Vec<FieldError>, id: ParamId, value: Option<f32>) {
         if let Some(v) = value {
             let spec = id.spec();
             check_range(errors, spec.key, v, spec.min, spec.max);
@@ -549,78 +631,6 @@ mod serde_types {
         }
     }
 
-    /// Parameters derived by the 8-second Auto-Tune wizard.
-    #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-    pub struct CalibrationOverrides {
-        /// Calibrated pre-gain to bring speech RMS to `-18 dBFS`.
-        pub input_gain_db: f32,
-        /// Calibrated expander threshold (`noise_rms_db + 6 dB`).
-        pub gate_threshold_db: f32,
-        /// Calibrated `RNNoise` mix (`0.85` if noisy, else `0.50`).
-        pub denoise_mix: f32,
-        /// Calibrated compressor threshold (`vocal_rms_after_gain + 2 dB`).
-        pub comp_thresh_db: f32,
-        /// Calibrated compressor makeup gain (verified by offline simulation).
-        pub comp_makeup_db: f32,
-    }
-
-    /// Output of the 8-second Auto-Tune wizard stored per endpoint.
-    #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-    pub struct Calibration {
-        /// Ambient room noise RMS (dBFS).
-        pub noise_rms_db: f32,
-        /// Ambient room noise peak (dBFS).
-        pub noise_peak_db: f32,
-        /// Integrated voiced speech RMS (dBFS).
-        pub speech_rms_db: f32,
-        /// Measured vocal crest factor (dB).
-        pub crest_db: f32,
-        /// Spectral tilt (`E(<350 Hz) / E(1-6 kHz)` in dB).
-        pub tilt_db: f32,
-        /// Derived DSP overrides.
-        pub derived: CalibrationOverrides,
-    }
-
-    impl Calibration {
-        /// Validates that all measured and derived calibration values are finite and within range.
-        pub fn validate(&self) -> Result<(), ValidationError> {
-            let mut errors = Vec::new();
-            check_range(&mut errors, "calibration.noise_rms_db", self.noise_rms_db, -120.0, 0.0);
-            check_range(
-                &mut errors,
-                "calibration.noise_peak_db",
-                self.noise_peak_db,
-                -120.0,
-                6.0,
-            );
-            check_range(
-                &mut errors,
-                "calibration.speech_rms_db",
-                self.speech_rms_db,
-                -120.0,
-                0.0,
-            );
-            check_range(&mut errors, "calibration.crest_db", self.crest_db, 0.0, 40.0);
-            check_range(&mut errors, "calibration.tilt_db", self.tilt_db, -40.0, 40.0);
-
-            check_param(&mut errors, ParamId::InputGainDb, Some(self.derived.input_gain_db));
-            check_param(
-                &mut errors,
-                ParamId::GateThresholdDb,
-                Some(self.derived.gate_threshold_db),
-            );
-            check_param(&mut errors, ParamId::DenoiseMix, Some(self.derived.denoise_mix));
-            check_param(&mut errors, ParamId::CompThreshDb, Some(self.derived.comp_thresh_db));
-            check_param(&mut errors, ParamId::CompMakeupDb, Some(self.derived.comp_makeup_db));
-
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(ValidationError::OutOfRange(errors))
-            }
-        }
-    }
-
     /// Persisted per-microphone profile (`%APPDATA%\Tine\profiles\<endpoint>.json`).
     #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     pub struct EndpointProfile {
@@ -690,7 +700,4 @@ mod serde_types {
 }
 
 #[cfg(feature = "serde")]
-pub use serde_types::{
-    Calibration, CalibrationOverrides, EndpointProfile, EqBandOverride, FieldError, Preset, PresetParams,
-    ValidationError,
-};
+pub use serde_types::{EndpointProfile, EqBandOverride, FieldError, Preset, PresetParams, ValidationError};
