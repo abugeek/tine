@@ -39,7 +39,7 @@ pub trait ParamTarget { fn write(&self, p: &DspParams); }  // ShmClient or in-pr
 - [x] `ShmClient`: `OpenFileMappingW` + `MapViewOfFile` (RW), `layout_from_ptr` validation, version mismatch → `LinkState::VersionMismatch`, reconnect when the APO (re)creates the mapping (poll every 1 s only while not linked).
 - [x] `Controller` thread:
   - `crossbeam`-free (uses `std::sync::mpsc`)
-  - each command mutates the model, resolves (`MacroMapper::apply` pending T10 — see `## Requests`), `ParamTarget::write`, emits `ModelChanged`, and schedules persistence
+  - each command mutates the model, resolves through `MacroMapper::apply` (tine-dsp; D-007 pins, D-021 spans), `ParamTarget::write`, emits `ModelChanged`, and schedules persistence
   - debounces bursts from slider drags: params are written immediately, persistence is coalesced
 - [x] Persistence (`persist.rs`):
   - user settings → `%APPDATA%\Tine\settings.json`
@@ -87,17 +87,23 @@ Audio capture/monitor/spectrum (T16), tray/CLI (T17), APO install (T14).
 | Controller idle = 0 % CPU | `controller_idle_costs_no_cpu` (`controller.rs` unit test via `GetProcessTimes`): **0 ms** process CPU time over a 1_000 ms idle window while linked and settled. While linked the controller has *no* wakeups at all - `recv()` blocks until the next command; reconnect polling (1 Hz) runs only while unlinked. |
 
 ### Verification (all green, locally - CI cannot run, see R-14)
-- `cargo fmt --all --check` - clean (after `cargo fmt --all`).
+- `cargo fmt --all --check` - clean (exit 0).
 - `cargo clippy --workspace --all-targets -- -D warnings` - 0 warnings.
-- `cargo nextest run --workspace` - **126 passed, 1 skipped** (pre-existing skip).
-- `cargo nextest run -p tine-engine controller persist` - passes. Note: `nextest` ANDs the two positional filters, so this selects the subset of tests whose full ID contains both strings (7 tests); the whole `tine-engine` suite (56 tests) is green regardless.
-- `tine-engine` suite: **56/56** = 34 in-crate unit tests (incl. real Win32 mapping tests for ShmClient/ShmTarget) + 9 controller + 13 persist integration tests.
+- `cargo nextest run --workspace` - **145 passed, 1 skipped** (pre-existing skip; counts grew with T10's merged upstream tests and this task's macro-mapping tests).
+- `tine-engine` suite: **58/58** = 35 in-crate unit tests (incl. real Win32 mapping tests for ShmClient/ShmTarget and the D-021 `resolve` tests) + 10 controller + 13 persist integration tests; grew from 56 by 2 tests in the MacroMapper swap; stable over repeated runs (~6.2 s).
+
+### Macro-mapper swap evidence (T10 merged mid-task, orchestrator-authorized)
+- `model::tests::midpoint_macros_reproduce_the_preset_base`: `resolve(default model) == tine_dsp::presets::builtin(Dynamic).base` *bitwise* (and `Condenser` after an archetype switch) - D-021 m=0.5 invariant.
+- `model::tests::midpoint_macros_reproduce_calibration_as_the_effective_base`: with a calibration, m=0.5 reproduces the calibrated anchors exactly (mix 0.35, gate -54, threshold -16; manual makeup disables auto-makeup) and macros swing *around* those anchors (purity 1.0 -> mix 0.85, gate -39).
+- `controller macro_midpoint_reproduces_the_archetype_base` (integration end-to-end through the command channel): purity 0.0 lands base-span/2 (mix 0.0, gate -65), returning the macro to 0.5 reproduces the `Dynamic` base **exactly** again (byte-equal `DspParams` published on `ParamsResolved`).
+- `controller set_macro_pins_and_unpin_restores_macro_control` (D-007 through the command channel): pinned `denoise_mix` 0.25 stays at 0.25 through a purity move (gate reaches the D-021 value -35 dB); `Unpin` hands control back to the macro (mix -> 1.0, SPECS-clamped from the 1.25 span).
+- `model::tests::macros_drive_expected_params` now asserts the D-021 extremes (purity: mix 1.0 / gate -35; body: shelf 6 dB / mud -8; presence: de-esser on, amount max(6, 5.5); leveler: ratio 4.75 / threshold -30).
 
 ### Decisions taken (ambiguities resolved simply, per repo rules)
 1. `Command::ApplyCalibration` takes `tine_protocol::presets::Calibration`, not T11's `CalibrationReport` - the report type does not exist on `main` (T11 unmerged) and the engine only needs the payload; T16's runner hands over `.calibration`. `KeepPins` is a proper enum (`Keep`/`Clear`) rather than a bare `bool`.
 2. Added `Command::SetMonitor(MonitorSettings)` (not in the task contract): the model owns monitor state per the contract, but no listed command could ever mutate it; T17's "Hear Myself" tray toggle needs exactly this. Additive to the enum.
 3. `ResetToArchetype` = macros -> defaults, overrides cleared, calibration cleared, pins cleared (full reset; a selective reset is a UI concern).
-4. **T10 early-start strategy, as authorized:** `model::resolve()` implements a *temporary local* macro mapping derived from `docs/project/04-mic-adaptation.md` (purity: mix 0->1, gate -60..-30 dB around neutral -45 or the calibrated threshold; body: shelf -2..+6 dB and mud 0..-5 dB; presence: 4.2 kHz 0..+5 dB, air 0..+6 dB, de-esser engaged above 0.6 with amount 3..8 dB; leveler: ratio 1.5..5:1, threshold 0..10 dB below calibrated, auto-makeup on). Every macro site is marked `TODO(T10)`; D-007 pin semantics are fully implemented and tested against it. Under the temporary mapping an unpinned macro overrides the calibrated `denoise_mix` (absolute, not offset); the real MacroMapper semantics land with T10.
+4. **T10 early-start strategy, as authorized:** `model::resolve()` initially carried a *temporary local* macro mapping (every site marked `TODO(T10)`). **T10 merged mid-task (41ded90) and the orchestrator authorized the swap before Finish:** `resolve()` now routes through `tine_dsp::presets::builtin` (Layer A base curves) + `tine_dsp::macros::MacroMapper::apply` (layers A-C, the D-007 pin rule and the D-021 centred-span semantics), with Pro-mode overrides and bypass applied afterwards. `MacroMapper::apply`'s `current` argument receives `DspParams::DEFAULT`: every command path keeps pins and overrides in lockstep (`SetParam` sets both, `Unpin`/`UnpinAll` clear both), so a pinned parameter's value always comes from `profile.overrides`; only a hand-edited profile JSON could pin without an override, and such a stale pin falls back to neutral. The old temporary NOTE(T10) denoise_mix caveat is gone — under D-021 the calibrated value is the anchor at `m = 0.5`.
 5. Heartbeat is treated as an epoch-ms timestamp (`now - heartbeat = age`); `heartbeat == 0` (APO mapped but never processed) reports `Stale { u64::MAX }`.
 6. While linked there is deliberately **no** staleness polling (0 % CPU; "poll every 1 s only while not linked"); `ShmClient::state()` computes staleness on demand for callers (T16/T17 can hook device notifications later).
 7. `Controller::spawn` keeps the contract signature even if the OS refuses to spawn the thread: both channels disconnect and every `send` errors (documented on the method).
@@ -108,12 +114,12 @@ Audio capture/monitor/spectrum (T16), tray/CLI (T17), APO install (T14).
 - Creating `Global\` mappings requires `SeCreateGlobalPrivilege`, so all shm tests (and the `ShmTarget::with_name` test hook) use the `Local\` namespace; production still builds `Global\Tine.v1.<id>` via `tine_protocol::shm::shm_name`.
 
 ### Follow-ups
-- T10 merge: swap `model::resolve()`'s temporary tables for `tine_dsp::macros::MacroMapper::map` + the `tine_dsp::presets` archetype base; move the `NOTE(T10)` test expectations (notably `every_command...` denoise_mix) with it.
+- ~~T10 merge: swap `model::resolve()`'s temporary tables for `tine_dsp::macros::MacroMapper`~~ **done** (orchestrator-authorized post-merge, 41ded90): commit `feat(engine): resolve through tine-dsp MacroMapper`.
 - T13: adopt/ack the boot-params JSON format (`persist::{save,load}_boot_params`, `BootParamsFile`).
 - T21: fold this task's local Win32 RAII (known-folder guard, mapping handle/view) into `win/` if worthwhile (pitfall noted in this file).
 
 ## Requests
 
 - **T13 / orchestrator:** the APO boot-params *file format* was not agreed anywhere (T13's `boot.rs` is a one-line stub on `main`). This task defines and persists it and recorded it as **D-022** (renumbered from D-020 after upstream T10 took D-020/D-021): `%ProgramData%\Tine\endpoints\<sanitized-id>.json` = `{"schema":1,"endpoint_id":"<raw id>","params":{<ParamSpec.key>: f32}}` - all 45 params under their stable SPECS keys, booleans as 0.0/1.0, values validated and clamped on load. T13's `LockForProcess` boot loader should consume it via `tine-engine::persist::load_boot_params` or reimplement the same format.
-- **T10:** `model::resolve()` currently carries the authorized temporary macro mapping (early start). When `tine_dsp::macros::MacroMapper` + `tine_dsp::presets` land, replace the `TODO(T10)`-marked section in `crates/tine-engine/src/model.rs` - it is isolated behind `resolve()`, the single narrow function this early-start strategy called for; the `NOTE(T10)` test expectations in `tests/controller.rs` must move with it.
+- **T10 (resolved):** the early-start TODO(T10) temporary mapping was replaced with the merged contract at the orchestrator's request before Finish; `resolve()` uses `MacroMapper::apply` + `PresetDef::builtin` directly (the `tine-dsp` dependency was already declared in `crates/tine-engine/Cargo.toml`). No `tine-dsp`/`tine-protocol` files were modified.
 - No root `Cargo.toml`, CI, or other-crate changes were needed (`windows` memory/file-system/shell features were already enabled by T01).
