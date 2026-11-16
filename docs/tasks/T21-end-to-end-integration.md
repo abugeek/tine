@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (t21-worker, Mistral Vibe) |
 | Lane | Z — Integration |
 | Depends on | T14, T17, T20 |
 | Unblocks | T22 |
