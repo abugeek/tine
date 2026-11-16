@@ -68,6 +68,7 @@ pub fn stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         central.extend_from_slice(name_bytes);
     }
     let central_offset = out.len();
+    let central_size = central.len() as u32;
     out.extend_from_slice(&central);
     // End of central directory.
     out.extend_from_slice(&u32_to_le(0x0605_4b50));
@@ -75,7 +76,7 @@ pub fn stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     out.extend_from_slice(&u16_to_le(0)); // disk with central dir
     out.extend_from_slice(&u16_to_le(u16::try_from(entries.len()).unwrap_or(0)));
     out.extend_from_slice(&u16_to_le(u16::try_from(entries.len()).unwrap_or(0)));
-    out.extend_from_slice(&u32_to_le((out.len() - central_offset) as u32));
+    out.extend_from_slice(&u32_to_le(central_size));
     out.extend_from_slice(&u32_to_le(central_offset as u32));
     out.extend_from_slice(&u16_to_le(0)); // comment len
     out
@@ -109,6 +110,13 @@ mod tests {
         // The central directory starts with a PK\x01\x02 record.
         let cd_offset = u32::from_le_bytes([zip[eocd + 16], zip[eocd + 17], zip[eocd + 18], zip[eocd + 19]]) as usize;
         assert_eq!(&zip[cd_offset..cd_offset + 4], b"PK\x01\x02");
+        // Standard readers jump to the EOCD at `cd_offset + cd_size`; that
+        // must land exactly on the record (regression: the EOCD used to
+        // sit past its stated `cd_size`, making the archive unreadable in
+        // `python.zipfile` and Windows Explorer).
+        let cd_size = u32::from_le_bytes([zip[eocd + 12], zip[eocd + 13], zip[eocd + 14], zip[eocd + 15]]) as usize;
+        assert_eq!(cd_offset + cd_size, eocd, "EOCD must sit at cd_offset+cd_size");
+        assert_eq!(zip.len(), eocd + 22, "EOCD is the 22-byte tail");
     }
 
     #[test]
