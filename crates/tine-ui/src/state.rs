@@ -2,6 +2,8 @@
 
 use std::rc::Rc;
 
+use rune::TextEdit;
+use tine_protocol::params::ParamId;
 use tine_protocol::telemetry::AudioTelemetryFrame;
 
 use crate::intent::{Intent, IntentSink, NoopSink};
@@ -31,6 +33,42 @@ impl Default for LiveFrame {
     }
 }
 
+/// The single Pro Rack numeric field being edited ("one field at a time").
+///
+/// The live text lives here; the wizard of views renders a real `text_input` for the
+/// active parameter only. `commit` (`views/pro_rack.rs`) parses and clamps it, then
+/// pins the parameter and emits `Intent::SetParam`.
+#[derive(Clone, Default, PartialEq)]
+pub struct ProFieldEdit {
+    /// The parameter being edited; `None` when no field is open.
+    pub param: Option<ParamId>,
+    /// The in-progress text.
+    pub edit: TextEdit,
+    /// Inline validation message shown next to the field (e.g. "Clamped to -80…-20").
+    pub message: Option<String>,
+}
+
+impl ProFieldEdit {
+    /// Opens the field for `param`, seeded with its current value as plain
+    /// numeric text (no unit suffixes; `views::pro_rack::parse_numeric` accepts
+    /// them anyway).
+    #[must_use]
+    pub fn open(param: ParamId, current: &crate::model::UiModel) -> Self {
+        let seed = crate::views::pro_rack::numeric_seed(param, current.params.get(param));
+        Self {
+            param: Some(param),
+            edit: TextEdit::new(seed),
+            message: None,
+        }
+    }
+
+    /// Closes the field, discarding any uncommitted text.
+    pub fn close(&mut self) {
+        self.param = None;
+        self.message = None;
+    }
+}
+
 /// Ephemeral UI-only state not persisted or owned by the engine.
 #[derive(Clone)]
 pub struct UiLocal {
@@ -44,6 +82,14 @@ pub struct UiLocal {
     pub settings_open: bool,
     /// Whether the user dismissed the first-run onboarding overlay locally.
     pub onboarding_dismissed: bool,
+    /// First-run onboarding step (`1..=4`: mic → APO install → Auto-Tune → finish).
+    pub onboarding_step: u8,
+    /// Whether an in-flight APO install (from onboarding or the header) is still running.
+    pub apo_installing: bool,
+    /// The Auto-Tune results card's "Keep my Pro pins" checkbox (D-007).
+    pub autotune_keep_pins: bool,
+    /// The active Pro Rack numeric field (one at a time).
+    pub pro_field: ProFieldEdit,
     pub(crate) sink: Rc<dyn IntentSink>,
 }
 
@@ -55,6 +101,10 @@ impl core::fmt::Debug for UiLocal {
             .field("focused_key", &self.focused_key)
             .field("settings_open", &self.settings_open)
             .field("onboarding_dismissed", &self.onboarding_dismissed)
+            .field("onboarding_step", &self.onboarding_step)
+            .field("apo_installing", &self.apo_installing)
+            .field("autotune_keep_pins", &self.autotune_keep_pins)
+            .field("pro_field", &self.pro_field.param.map(|p| format!("{p:?}")))
             .finish_non_exhaustive()
     }
 }
@@ -66,6 +116,10 @@ impl PartialEq for UiLocal {
             && self.focused_key == other.focused_key
             && self.settings_open == other.settings_open
             && self.onboarding_dismissed == other.onboarding_dismissed
+            && self.onboarding_step == other.onboarding_step
+            && self.apo_installing == other.apo_installing
+            && self.autotune_keep_pins == other.autotune_keep_pins
+            && self.pro_field == other.pro_field
     }
 }
 
@@ -77,6 +131,10 @@ impl Default for UiLocal {
             focused_key: None,
             settings_open: false,
             onboarding_dismissed: false,
+            onboarding_step: 1,
+            apo_installing: false,
+            autotune_keep_pins: true,
+            pro_field: ProFieldEdit::default(),
             sink: Rc::new(NoopSink),
         }
     }

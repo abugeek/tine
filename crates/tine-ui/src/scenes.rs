@@ -5,7 +5,8 @@ use tine_protocol::presets::{Archetype, MacroPositions};
 
 use crate::fake::scene_live_frame;
 use crate::model::{
-    ApoBadge, AutoTuneStep, AutoTuneUi, CalibrationParamDiff, CalibrationUi, EndpointRow, Macro, MonitorUi, UiModel,
+    ApoBadge, AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, EndpointRow, Macro,
+    MonitorUi, UiModel,
 };
 use crate::state::AppState;
 
@@ -152,12 +153,12 @@ pub fn make_auto_tune_results() -> AppState {
     s
 }
 
-/// Auto-Tune wizard: Failed step.
+/// Auto-Tune wizard: Failed step (not enough speech, per the T11 `CalFailure` contract).
 #[must_use]
 pub fn make_auto_tune_failed() -> AppState {
     let mut s = make_golden_line();
     s.model.autotune = AutoTuneUi {
-        step: AutoTuneStep::Failed(String::from("No speech detected during the 5-second vocal sample.")),
+        step: AutoTuneStep::Failed(CalFailureUi::NotEnoughSpeech { voiced_ms: 800 }),
         progress: 0.0,
         level_db: -58.0,
         prompt_text: String::new(),
@@ -181,12 +182,56 @@ pub fn make_apo_not_installed() -> AppState {
     s
 }
 
-/// First-run onboarding overlay.
+/// First-run onboarding overlay, step 1 (pick the microphone).
 #[must_use]
 pub fn make_onboarding() -> AppState {
     let mut s = make_golden_line();
     s.model.first_run = true;
     s.model.apo = ApoBadge::NotInstalled;
+    s.ui.onboarding_step = 1;
+    s
+}
+
+/// Onboarding step 2: APO install succeeded.
+#[must_use]
+pub fn make_onboarding_install() -> AppState {
+    let mut s = make_onboarding();
+    s.ui.onboarding_step = 2;
+    s.model.apo = ApoBadge::Active;
+    s
+}
+
+/// Onboarding step 2: APO install failed with a typed error (remedies shown).
+#[must_use]
+pub fn make_onboarding_install_error() -> AppState {
+    let mut s = make_onboarding();
+    s.ui.onboarding_step = 2;
+    s.model.apo = ApoBadge::Error(String::from("denied"));
+    s
+}
+
+/// Onboarding step 2: install in progress (UAC prompt pending).
+#[must_use]
+pub fn make_onboarding_installing() -> AppState {
+    let mut s = make_onboarding();
+    s.ui.onboarding_step = 2;
+    s.ui.apo_installing = true;
+    s
+}
+
+/// Onboarding step 3: Auto-Tune (skippable).
+#[must_use]
+pub fn make_onboarding_autotune() -> AppState {
+    let mut s = make_onboarding();
+    s.ui.onboarding_step = 3;
+    s
+}
+
+/// Onboarding step 4: finish ("open Discord/OBS").
+#[must_use]
+pub fn make_onboarding_finish() -> AppState {
+    let mut s = make_onboarding();
+    s.ui.onboarding_step = 4;
     s
 }
 
@@ -238,6 +283,26 @@ fn apply_onboarding(s: &mut AppState) {
     *s = make_onboarding();
 }
 
+fn apply_onboarding_install(s: &mut AppState) {
+    *s = make_onboarding_install();
+}
+
+fn apply_onboarding_installing(s: &mut AppState) {
+    *s = make_onboarding_installing();
+}
+
+fn apply_onboarding_install_error(s: &mut AppState) {
+    *s = make_onboarding_install_error();
+}
+
+fn apply_onboarding_autotune(s: &mut AppState) {
+    *s = make_onboarding_autotune();
+}
+
+fn apply_onboarding_finish(s: &mut AppState) {
+    *s = make_onboarding_finish();
+}
+
 /// Named scene callback type matching [`rune::AppSpec::scenes`].
 pub type SceneEntry = (&'static str, fn(&mut AppState));
 
@@ -255,4 +320,9 @@ pub const SCENES: &[SceneEntry] = &[
     ("auto_tune_failed", apply_auto_tune_failed),
     ("apo_not_installed", apply_apo_not_installed),
     ("onboarding", apply_onboarding),
+    ("onboarding_install", apply_onboarding_install),
+    ("onboarding_installing", apply_onboarding_installing),
+    ("onboarding_install_error", apply_onboarding_install_error),
+    ("onboarding_autotune", apply_onboarding_autotune),
+    ("onboarding_finish", apply_onboarding_finish),
 ];

@@ -16,7 +16,8 @@ pub mod views;
 
 pub use intent::{Intent, IntentSink, NoopSink};
 pub use model::{
-    ApoBadge, AutoTuneStep, AutoTuneUi, CalibrationParamDiff, CalibrationUi, EndpointRow, Macro, MonitorUi, UiModel,
+    ApoBadge, AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, EndpointRow, Macro,
+    MonitorUi, UiModel,
 };
 pub use state::{AppState, LiveFrame, UiLocal};
 

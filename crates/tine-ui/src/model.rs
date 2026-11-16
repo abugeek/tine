@@ -78,6 +78,62 @@ pub struct CalibrationUi {
     pub changes: Vec<CalibrationParamDiff>,
 }
 
+/// UI-side view-model mirror of the `tine-dsp` `CalFailure` contract (T11,
+/// `docs/tasks/T11-auto-calibrator.md`).
+///
+/// TODO(T11): while `tine-dsp::calibrator` is in flight, this plain-data enum carries the
+/// documented failure variants into the wizard. When T11 merges, the engine runner (`tine-app`,
+/// T21) maps `tine_dsp::calibrator::CalFailure` into this type in **one place** — the narrow
+/// adapter documented next to `views/autotune.rs` — and this mirror keeps only the fields the
+/// wizard's failure card needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CalFailureUi {
+    /// Signal (and room) stayed below every usable threshold.
+    TooQuiet,
+    /// Room speech-to-noise ratio fell under the 10 dB minimum (`snr_db` measured).
+    TooNoisy {
+        /// Measured speech-to-noise ratio in dB.
+        snr_db: f32,
+    },
+    /// More than 0.5 % of captured samples clipped at -0.3 dBFS.
+    Clipping {
+        /// Fraction of clipped samples (0.0..=1.0).
+        pct: f32,
+    },
+    /// Fewer than 1.5 s of voiced audio in the 5 s speech phase.
+    NotEnoughSpeech {
+        /// Total voiced audio in milliseconds.
+        voiced_ms: u32,
+    },
+    /// The gain needed to reach -18 dBFS speech exceeds the +36 dB range.
+    GainOutOfRange {
+        /// Gain the calibration would have needed, in dB.
+        needed_db: f32,
+    },
+}
+
+impl CalFailureUi {
+    /// Short machine-stable summary (`AutoTuneStep::Failed` payload used in logs and tests).
+    #[must_use]
+    pub fn summary(self) -> String {
+        match self {
+            Self::TooQuiet => String::from("Your microphone stayed nearly silent."),
+            Self::TooNoisy { snr_db } => {
+                format!("Your room is too noisy for a clean measurement (SNR {snr_db:.1} dB).")
+            }
+            Self::Clipping { pct } => {
+                format!("Your mic is clipping ({:.1} % of samples clipped).", pct * 100.0)
+            }
+            Self::NotEnoughSpeech { voiced_ms } => {
+                format!("Only {voiced_ms} ms of speech detected in the 5-second sample.")
+            }
+            Self::GainOutOfRange { needed_db } => {
+                format!("Your mic needs about {needed_db:+.0} dB of gain — beyond Tine's range.")
+            }
+        }
+    }
+}
+
 /// Current step of the 8-second Auto-Tune wizard modal.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum AutoTuneStep {
@@ -100,8 +156,9 @@ pub enum AutoTuneStep {
     Analyzing,
     /// Displaying before/after parameter diffs for confirmation.
     Results,
-    /// Calibration failed or was rejected (e.g. clipping or silence).
-    Failed(String),
+    /// Calibration failed or was rejected; the workaround for each variant is
+    /// rendered by the failure card (`views/autotune.rs`).
+    Failed(CalFailureUi),
 }
 
 /// Auto-Tune wizard state mirrored from the engine.
