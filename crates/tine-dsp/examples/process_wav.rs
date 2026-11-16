@@ -4,7 +4,14 @@
 //! pipeline runs at the file's native rate) and writes 32-bit float mono WAV.
 //!
 //! Usage:
-//! `cargo run -p tine-dsp --example process_wav -- in.flac out.wav [--params file.json] [--set comp_ratio=4]`
+//! `cargo run -p tine-dsp --example process_wav -- in.flac out.wav [--preset dynamic] [--macros leveler=0.62,purity=0.7] [--params file.json] [--set comp_ratio=4]`
+//!
+//! `--preset <id>` starts from the built-in archetype base curve (`dynamic`,
+//! `condenser`, `headset`, `laptop`) with its default Golden Line macro
+//! positions; `--macros` (comma-separated `purity=..,body=..,presence=..,leveler=..`,
+//! each `0.0..=1.0`) moves the macro nodes on top of it. Both go through
+//! `tine_dsp::presets::builtin` + `MacroMapper::apply` (no calibration, no pins);
+//! order matters: `--preset`/`--macros` first, then `--params`/`--set` overrides.
 
 #![allow(missing_docs)]
 
@@ -13,9 +20,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
+use tine_dsp::macros::MacroMapper;
 use tine_dsp::primitives::db::lin_to_db;
-use tine_dsp::{DspPipeline, MeterSink, NoTap};
+use tine_dsp::{DspPipeline, MeterSink, NoTap, presets};
 use tine_protocol::params::{DspParams, FilterType, ParamId, SPECS};
+use tine_protocol::presets::{Archetype, MacroPositions, PinSet};
 use tine_protocol::telemetry::{AudioTelemetryFrame, flags};
 
 #[derive(Default)]
@@ -201,21 +210,88 @@ fn compute_peak_rms_db(samples: &[f32]) -> (f32, f32) {
     (lin_to_db(peak), lin_to_db(rms))
 }
 
+/// Resolves a built-in preset by its stable id (`dynamic|condenser|headset|laptop`).
+fn preset_by_id(id: &str) -> Result<&'static presets::PresetDef, String> {
+    let archetype = match id.trim().to_ascii_lowercase().as_str() {
+        "dynamic" => Archetype::Dynamic,
+        "condenser" => Archetype::Condenser,
+        "headset" => Archetype::Headset,
+        "laptop" => Archetype::Laptop,
+        _ => {
+            return Err(format!(
+                "unknown preset id: {id} (expected dynamic|condenser|headset|laptop)"
+            ));
+        }
+    };
+    Ok(presets::builtin(archetype))
+}
+
+/// Parses `--macros` (`purity=0.7,leveler=0.62`) on top of the preset's defaults.
+fn parse_macros(spec: &str, base: MacroPositions) -> Result<MacroPositions, String> {
+    let mut m = base;
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, value) = part
+            .split_once('=')
+            .ok_or_else(|| format!("--macros expects name=value (0.0..=1.0), got: {part}"))?;
+        let v: f32 = value
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid macro position for {name}: {value}"))?;
+        if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+            return Err(format!("macro position for {name} out of range 0.0..=1.0: {v}"));
+        }
+        match name.trim().to_ascii_lowercase().as_str() {
+            "purity" => m.purity = v,
+            "body" => m.body = v,
+            "presence" => m.presence = v,
+            "leveler" => m.leveler = v,
+            _ => {
+                return Err(format!(
+                    "unknown macro name: {name} (expected purity|body|presence|leveler)"
+                ));
+            }
+        }
+    }
+    Ok(m)
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.len() < 2 {
         return Err(
-            "Usage: process_wav <in.flac|in.wav> <out.wav> [--params file.json] [--set key=value]...".to_owned(),
+            "Usage: process_wav <in.flac|in.wav> <out.wav> [--preset dynamic|condenser|headset|laptop] [--macros purity=0.7,leveler=0.62] [--params file.json] [--set key=value]...".to_owned(),
         );
     }
 
     let in_path = PathBuf::from(&args[0]);
     let out_path = PathBuf::from(&args[1]);
     let mut params = DspParams::DEFAULT;
+    let mut preset_used: Option<&'static presets::PresetDef> = None;
+    let mut macros_used: Option<MacroPositions> = None;
 
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--preset" => {
+                let id = args
+                    .get(i + 1)
+                    .ok_or("--preset requires an archetype id (dynamic|condenser|headset|laptop)")?;
+                let preset = preset_by_id(id)?;
+                params = MacroMapper::apply(preset, None, preset.macro_defaults, PinSet::EMPTY, &params);
+                preset_used = Some(preset);
+                macros_used = Some(preset.macro_defaults);
+                i += 2;
+            }
+            "--macros" => {
+                let spec = args
+                    .get(i + 1)
+                    .ok_or("--macros requires name=value pairs, e.g. purity=0.7,leveler=0.62")?;
+                let preset = preset_used.ok_or("--macros requires --preset <id> first")?;
+                let macros = parse_macros(spec, preset.macro_defaults)?;
+                params = MacroMapper::apply(preset, None, macros, PinSet::EMPTY, &params);
+                macros_used = Some(macros);
+                i += 2;
+            }
             "--params" => {
                 let p = args.get(i + 1).ok_or("--params requires a file path")?;
                 apply_json_params(&mut params, &PathBuf::from(p))?;
@@ -259,6 +335,30 @@ fn run() -> Result<(), String> {
         output.len()
     );
     println!("Output:  {}", out_path.display());
+    if let Some(preset) = preset_used {
+        let m = macros_used.unwrap_or(preset.macro_defaults);
+        println!("Preset:  {} ({})", preset.id, preset.name);
+        println!(
+            "Macros:  purity={:.2} body={:.2} presence={:.2} leveler={:.2}",
+            m.purity, m.body, m.presence, m.leveler
+        );
+        println!(
+            "Params:  input_gain_db={:.2} hpf_freq_hz={:.2} denoise_mix={:.2} gate_threshold_db={:.2} eq_gain_db=[{:.2},{:.2},{:.2},{:.2},{:.2}] deesser_enabled={} deesser_amount_db={:.2} comp_thresh_db={:.2} comp_ratio={:.2}",
+            params.input_gain_db,
+            params.hpf_freq_hz,
+            params.denoise_mix,
+            params.gate_threshold_db,
+            params.eq_gain_db[0],
+            params.eq_gain_db[1],
+            params.eq_gain_db[2],
+            params.eq_gain_db[3],
+            params.eq_gain_db[4],
+            params.deesser_enabled,
+            params.deesser_amount_db,
+            params.comp_thresh_db,
+            params.comp_ratio
+        );
+    }
     println!("Latency: {latency_samples} samples ({latency_ms:.2} ms)");
     println!("Meters:");
     println!("  input_peak_db:        {in_peak_db:.2} dBFS");
