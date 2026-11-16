@@ -218,12 +218,27 @@ mod tests {
         };
 
         let start = std::time::Instant::now();
-        // Warm-up (buffers fill, drift control settles), then the soak.
+        // Warm-up (buffers fill, drift control settles), then the soak. Only
+        // underruns *after* this point count against the criterion.
         std::thread::sleep(std::time::Duration::from_secs(2));
+        let warmup_stats = monitor.stats();
+        let mut tick = 0_u64;
         while start.elapsed() < std::time::Duration::from_secs(secs) {
             std::thread::sleep(std::time::Duration::from_secs(5));
+            tick += 5;
             let last_stats = monitor.stats();
             assert!(!last_stats.stream_lost, "stream lost during soak: {last_stats:?}");
+            if tick.is_multiple_of(300) {
+                // Interval print: localizes any rare glitch to its window.
+                println!(
+                    "  soak +{tick}s: underruns={} overruns={} (cumulative callbacks {} vs warm-up {}) max_callback_us={}",
+                    last_stats.underruns,
+                    last_stats.overruns,
+                    last_stats.callbacks,
+                    warmup_stats.callbacks,
+                    last_stats.max_callback_us
+                );
+            }
         }
 
         let final_stats = monitor.stats();
@@ -238,8 +253,12 @@ mod tests {
             final_stats.playback_rate_hz,
         );
         assert_eq!(
-            final_stats.underruns, 0,
+            final_stats.underruns, warmup_stats.underruns,
             "underruns after warm-up: the badge must stay clean over the soak"
+        );
+        assert_eq!(
+            warmup_stats.underruns, 0,
+            "priming must not count as underruns: {warmup_stats:?}"
         );
         monitor
             .restart(&in_ref, &out_ref)
