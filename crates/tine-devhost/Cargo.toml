@@ -1,0 +1,17 @@
+[package]
+name = "tine-devhost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tine-engine.workspace = true
+tine-dsp = { workspace = true, features = ["std"] }
+tine-protocol = { workspace = true, features = ["std"] }
+hound.workspace = true
+lexopt.workspace = true
+
+[lints]
+workspace = true

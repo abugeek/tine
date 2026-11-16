@@ -1,0 +1,1 @@
+//! UI user intent messages.

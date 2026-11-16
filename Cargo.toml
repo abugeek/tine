@@ -1,0 +1,97 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "spikes/*"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/abugeek/tine"
+
+[workspace.dependencies]
+# Workspace crates
+tine-protocol = { path = "crates/tine-protocol", default-features = false }
+tine-dsp      = { path = "crates/tine-dsp", default-features = false }
+tine-apo      = { path = "crates/tine-apo" }
+tine-engine   = { path = "crates/tine-engine" }
+tine-ui       = { path = "crates/tine-ui" }
+
+# Audio
+cpal        = { version = "0.18.2", default-features = false, features = ["realtime"] }
+nnnoiseless = { version = "0.5.2", default-features = false }
+rubato      = { version = "5.1.0", default-features = false }
+realfft     = { version = "3.5.1", default-features = false }
+
+# Windows
+windows = { version = "0.62.2", default-features = false }
+
+# Data & errors
+bytemuck   = { version = "1.25.2", default-features = false, features = ["derive"] }
+serde      = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+thiserror  = { version = "2.0.21", default-features = false }
+
+# App
+tracing            = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+tracing-appender   = { version = "0.2.5", default-features = false }
+lexopt             = { version = "0.3.2", default-features = false }
+
+# UI
+rune = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190", default-features = false, features = ["accessibility", "embedded-fonts"] }
+
+# Dev / test
+proptest        = { version = "1.12.0", default-features = false, features = ["std"] }
+loom            = { version = "0.7.3", default-features = false }
+criterion       = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+hound           = { version = "3.5.1", default-features = false }
+assert_no_alloc = { version = "1.1.2", default-features = false }
+tempfile        = { version = "3.27.0", default-features = false }
+
+[patch.crates-io]
+winit             = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
+wgpu-hal          = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
+parley_engine     = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "631e8a67cb3c40225efa3f6c4f57b80e7b18f190" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "warn"
+
+# Pedantic allow-list for DSP, Win32, and UI ergonomics
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+float_cmp = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+split-debuginfo = "packed"
+
+[profile.perf]
+inherits = "release"
+incremental = false

@@ -1,0 +1,1 @@
+//! Pure UI view model.

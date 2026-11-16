@@ -1,0 +1,1 @@
+//! Attack/release envelope follower.
