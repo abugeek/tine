@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = []
 std = ["serde?/std", "serde_json?/std"]
-serde = ["dep:serde", "dep:serde_json"]
+serde = ["std", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 bytemuck.workspace = true
@@ -17,9 +17,14 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
+assert_no_alloc.workspace = true
 criterion.workspace = true
 loom.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "sync"
+harness = false
 
 [lints]
 workspace = true
