@@ -3088,6 +3088,14 @@ version = "0.1.0"
 source = "git+https://github.com/anomalyco/rune?rev=631e8a67cb3c40225efa3f6c4f57b80e7b18f190#631e8a67cb3c40225efa3f6c4f57b80e7b18f190"
 
 [[package]]
+name = "rune-spike"
+version = "0.1.0"
+dependencies = [
+ "rune",
+ "windows",
+]
+
+[[package]]
 name = "rune-staging"
 version = "0.0.1"
 source = "git+https://github.com/anomalyco/rune?rev=631e8a67cb3c40225efa3f6c4f57b80e7b18f190#631e8a67cb3c40225efa3f6c4f57b80e7b18f190"
