@@ -4,7 +4,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T13-worker) |
 | Lane | B — Virtual Cable Routing (was Windows / APO) |
 | Depends on | T05, T12 |
 | Unblocks | T14, T16, T21 |
