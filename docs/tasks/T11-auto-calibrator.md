@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: tine-worker) |
 | Lane | A — DSP |
 | Depends on | T10 |
 | Unblocks | T16 (Auto-Tune runner), T20 (wizard UI) |
