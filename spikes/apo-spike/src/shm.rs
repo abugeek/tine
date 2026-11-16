@@ -1,15 +1,13 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
+use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW,
-    PAGE_READWRITE, UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW,
+    PAGE_READWRITE, UnmapViewOfFile,
 };
+use windows::core::{PCWSTR, w};
 
 pub const SHM_NAME: PCWSTR = w!("Global\\TineSpike.v1");
 pub const SHM_MAGIC: u32 = 0x5449_4E45; // "TINE"
@@ -44,12 +42,7 @@ impl ShmMapping {
         let sddl = w!("D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GRGW;;;AU)");
         // SAFETY: sddl is a valid null-terminated UTF-16 string; sd is initialized by Windows.
         unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl,
-                SDDL_REVISION_1,
-                &mut sd,
-                None,
-            )?;
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &mut sd, None)?;
         }
 
         let sa = SECURITY_ATTRIBUTES {
@@ -77,15 +70,7 @@ impl ShmMapping {
 
         let handle = handle_res?;
         // SAFETY: handle is a valid file mapping handle.
-        let view = unsafe {
-            MapViewOfFile(
-                handle,
-                FILE_MAP_ALL_ACCESS,
-                0,
-                0,
-                core::mem::size_of::<SpikeShm>(),
-            )
-        };
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, core::mem::size_of::<SpikeShm>()) };
         if view.Value.is_null() {
             let err = windows::core::Error::from_thread();
             // SAFETY: handle is valid.
@@ -113,15 +98,7 @@ impl ShmMapping {
         // SAFETY: SHM_NAME is a valid PCWSTR.
         let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, SHM_NAME)? };
         // SAFETY: handle is a valid file mapping handle.
-        let view = unsafe {
-            MapViewOfFile(
-                handle,
-                FILE_MAP_ALL_ACCESS,
-                0,
-                0,
-                core::mem::size_of::<SpikeShm>(),
-            )
-        };
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, core::mem::size_of::<SpikeShm>()) };
         if view.Value.is_null() {
             let err = windows::core::Error::from_thread();
             // SAFETY: handle is valid.

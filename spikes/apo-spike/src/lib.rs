@@ -11,24 +11,19 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_POINTER,
-    E_UNEXPECTED, HANDLE, HINSTANCE, S_FALSE, S_OK,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_POINTER, E_UNEXPECTED, HANDLE, HINSTANCE,
+    S_FALSE, S_OK,
 };
 use windows::Win32::Media::Audio::Apo::{
-    APO_BUFFER_FLAGS, APO_CONNECTION_DESCRIPTOR, APO_CONNECTION_PROPERTY, APO_FLAG,
-    APO_FLAG_BITSPERSAMPLE_MUST_MATCH, APO_FLAG_FRAMESPERSECOND_MUST_MATCH, APO_FLAG_INPLACE,
-    APO_FLAG_SAMPLESPERFRAME_MUST_MATCH, APO_REG_PROPERTIES, APOERR_ALREADY_INITIALIZED,
-    APOERR_FORMAT_NOT_SUPPORTED, APOERR_NOT_INITIALIZED, AUDIO_SYSTEMEFFECT,
-    AUDIO_SYSTEMEFFECT_STATE, IAudioMediaType, IAudioProcessingObject,
-    IAudioProcessingObject_Impl, IAudioProcessingObjectConfiguration,
-    IAudioProcessingObjectConfiguration_Impl, IAudioProcessingObjectRT,
-    IAudioProcessingObjectRT_Impl, IAudioSystemEffects, IAudioSystemEffects_Impl,
-    IAudioSystemEffects2_Impl, IAudioSystemEffects3, IAudioSystemEffects3_Impl,
-    UNCOMPRESSEDAUDIOFORMAT,
+    APO_BUFFER_FLAGS, APO_CONNECTION_DESCRIPTOR, APO_CONNECTION_PROPERTY, APO_FLAG, APO_FLAG_BITSPERSAMPLE_MUST_MATCH,
+    APO_FLAG_FRAMESPERSECOND_MUST_MATCH, APO_FLAG_INPLACE, APO_FLAG_SAMPLESPERFRAME_MUST_MATCH, APO_REG_PROPERTIES,
+    APOERR_ALREADY_INITIALIZED, APOERR_FORMAT_NOT_SUPPORTED, APOERR_NOT_INITIALIZED, AUDIO_SYSTEMEFFECT,
+    AUDIO_SYSTEMEFFECT_STATE, IAudioMediaType, IAudioProcessingObject, IAudioProcessingObject_Impl,
+    IAudioProcessingObjectConfiguration, IAudioProcessingObjectConfiguration_Impl, IAudioProcessingObjectRT,
+    IAudioProcessingObjectRT_Impl, IAudioSystemEffects, IAudioSystemEffects_Impl, IAudioSystemEffects2_Impl,
+    IAudioSystemEffects3, IAudioSystemEffects3_Impl, UNCOMPRESSEDAUDIOFORMAT,
 };
-use windows::Win32::System::Com::{
-    CoTaskMemAlloc, IClassFactory, IClassFactory_Impl,
-};
+use windows::Win32::System::Com::{CoTaskMemAlloc, IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
@@ -41,8 +36,7 @@ use shm::ShmMapping;
 pub const CLSID_TINE_SPIKE: GUID = GUID::from_u128(0x70355144_de5b_4045_bc60_b8787cdc4077);
 
 /// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: {00000003-0000-0010-8000-00aa00389b71}
-const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
-    GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
 static DLL_OBJECTS: AtomicU32 = AtomicU32::new(0);
 static DLL_LOCKS: AtomicU32 = AtomicU32::new(0);
@@ -96,11 +90,7 @@ fn read_force_panic_flag() -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(
-    _hinst: HINSTANCE,
-    reason: u32,
-    _reserved: *mut c_void,
-) -> BOOL {
+pub extern "system" fn DllMain(_hinst: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         log_non_rt("DllMain: DLL_PROCESS_ATTACH");
     }
@@ -288,10 +278,7 @@ impl IAudioProcessingObject_Impl for TineSpikeApo_Impl {
             if self.initialized.swap(true, Ordering::AcqRel) {
                 return Err(Error::from(APOERR_ALREADY_INITIALIZED));
             }
-            log_non_rt(&format!(
-                "[inst {}] Initialize (cbDataSize={cbdatasize})",
-                self.id
-            ));
+            log_non_rt(&format!("[inst {}] Initialize (cbDataSize={cbdatasize})", self.id));
             match ShmMapping::create_or_open() {
                 Ok(mapping) => {
                     let raw = mapping.data() as *const shm::SpikeShm as *mut shm::SpikeShm;
@@ -302,10 +289,7 @@ impl IAudioProcessingObject_Impl for TineSpikeApo_Impl {
                     log_non_rt(&format!("[inst {}] Global\\TineSpike.v1 created/opened OK", self.id));
                 }
                 Err(e) => {
-                    log_non_rt(&format!(
-                        "[inst {}] Global\\TineSpike.v1 FAILED: {e:?}",
-                        self.id
-                    ));
+                    log_non_rt(&format!("[inst {}] Global\\TineSpike.v1 FAILED: {e:?}", self.id));
                 }
             }
             Ok(())
@@ -319,9 +303,7 @@ impl IAudioProcessingObject_Impl for TineSpikeApo_Impl {
         prequestedinputformat: Ref<IAudioMediaType>,
     ) -> windows::core::Result<IAudioMediaType> {
         let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let req = prequestedinputformat
-                .as_ref()
-                .ok_or_else(|| Error::from(E_POINTER))?;
+            let req = prequestedinputformat.as_ref().ok_or_else(|| Error::from(E_POINTER))?;
             let mut fmt = UNCOMPRESSEDAUDIOFORMAT::default();
             // SAFETY: req is a valid IAudioMediaType.
             unsafe { req.GetUncompressedAudioFormat(&mut fmt)? };
@@ -331,11 +313,7 @@ impl IAudioProcessingObject_Impl for TineSpikeApo_Impl {
             if !is_f32 {
                 log_non_rt(&format!(
                     "[inst {}] IsInputFormatSupported: REJECTED fmt={:?} bits={} rate={} ch={}",
-                    self.id,
-                    fmt.guidFormatType,
-                    fmt.dwValidBitsPerSample,
-                    fmt.fFramesPerSecond,
-                    fmt.dwSamplesPerFrame
+                    self.id, fmt.guidFormatType, fmt.dwValidBitsPerSample, fmt.fFramesPerSecond, fmt.dwSamplesPerFrame
                 ));
                 return Err(Error::from(APOERR_FORMAT_NOT_SUPPORTED));
             }
@@ -603,11 +581,7 @@ impl IAudioSystemEffects3_Impl for TineSpikeApo_Impl {
         Ok(())
     }
 
-    fn SetAudioSystemEffectState(
-        &self,
-        effectid: &GUID,
-        state: AUDIO_SYSTEMEFFECT_STATE,
-    ) -> windows::core::Result<()> {
+    fn SetAudioSystemEffectState(&self, effectid: &GUID, state: AUDIO_SYSTEMEFFECT_STATE) -> windows::core::Result<()> {
         log_non_rt(&format!(
             "[inst {}] IAudioSystemEffects3::SetAudioSystemEffectState id={effectid:?} state={state:?}",
             self.id
@@ -624,6 +598,7 @@ mod tests {
     #[test]
     fn com_object_and_gain_processing_work() {
         let apo: IAudioProcessingObject = TineSpikeApo::new().into();
+        // SAFETY: Test exercises in-process COM interface methods with valid stack buffers.
         unsafe {
             let props = apo.GetRegistrationProperties().expect("GetRegistrationProperties");
             assert_eq!((*props).clsid, CLSID_TINE_SPIKE);

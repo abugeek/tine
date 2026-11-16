@@ -1,5 +1,5 @@
 //! CLI for T02 APO feasibility spike.
-#![allow(missing_docs, clippy::all, clippy::pedantic)]
+#![allow(missing_docs, clippy::all, clippy::pedantic, clippy::undocumented_unsafe_blocks)]
 
 use core::ffi::c_void;
 use core::sync::atomic::Ordering;
@@ -18,22 +18,22 @@ use windows::Win32::Media::Audio::{
     DEVICE_STATE, DEVICE_STATEMASK_ALL, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
 };
 use windows::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, SET_ACCESS, SE_REGISTRY_KEY, SetEntriesInAclW,
-    SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_REGISTRY_KEY, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
+    TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, AllocateAndInitializeSid, DACL_SECURITY_INFORMATION, FreeSid,
-    OWNER_SECURITY_INFORMATION, PSID, PSECURITY_DESCRIPTOR, SECURITY_NT_AUTHORITY,
-    SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, AllocateAndInitializeSid, DACL_SECURITY_INFORMATION, FreeSid, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_PRIVILEGE_ENABLED, SECURITY_NT_AUTHORITY, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
 };
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, STGM_READ,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_SET_VALUE, KEY_WRITE, REG_DWORD,
-    REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW,
-    RegDeleteTreeW, RegDeleteValueW, RegEnumValueW, RegOpenKeyExW, RegSetValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_SET_VALUE, KEY_WRITE, REG_DWORD, REG_MULTI_SZ,
+    REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW,
+    RegEnumValueW, RegOpenKeyExW, RegSetValueExW,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
@@ -80,26 +80,18 @@ fn extract_guid(id: &str) -> String {
 }
 
 fn fx_reg_path(guid: &str) -> String {
-    format!(
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{guid}\FxProperties"
-    )
+    format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{guid}\FxProperties")
 }
 
 fn fx_named_obj(guid: &str) -> String {
-    format!(
-        r"MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{guid}\FxProperties"
-    )
+    format!(r"MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{guid}\FxProperties")
 }
 
 fn enable_privilege(name: PCWSTR) -> Result<(), String> {
     unsafe {
         let mut token = HANDLE::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        )
-        .map_err(|e| format!("OpenProcessToken: {e}"))?;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token)
+            .map_err(|e| format!("OpenProcessToken: {e}"))?;
 
         let mut luid = LUID::default();
         let ok = windows::Win32::Security::LookupPrivilegeValueW(None, name, &mut luid);
@@ -194,9 +186,7 @@ fn ensure_fx_admin_access(guid: &str) -> Result<(), String> {
         }
         let r_acl = SetEntriesInAclW(Some(&[ea]), Some(old_dacl), &mut new_dacl);
         if r_acl.is_err() {
-            let _ = windows::Win32::Foundation::LocalFree(Some(
-                windows::Win32::Foundation::HLOCAL(sd.0),
-            ));
+            let _ = windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(sd.0)));
             FreeSid(admin_sid);
             return Err(format!("SetEntriesInAclW: {r_acl:?}"));
         }
@@ -209,12 +199,9 @@ fn ensure_fx_admin_access(guid: &str) -> Result<(), String> {
             Some(new_dacl),
             None,
         );
-        let _ = windows::Win32::Foundation::LocalFree(Some(
-            windows::Win32::Foundation::HLOCAL(new_dacl as *mut c_void),
-        ));
-        let _ = windows::Win32::Foundation::LocalFree(Some(
-            windows::Win32::Foundation::HLOCAL(sd.0),
-        ));
+        let _ =
+            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(new_dacl as *mut c_void)));
+        let _ = windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(sd.0)));
         FreeSid(admin_sid);
         if r_set.is_err() {
             return Err(format!("SetNamedSecurityInfoW(DACL): {r_set:?}"));
@@ -228,15 +215,9 @@ fn reg_read_all(path: &str) -> Result<BTreeMap<String, RegValueBackup>, String> 
     let wide = to_wide(path);
     let mut hkey = HKEY::default();
     unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(wide.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .ok()
-        .map_err(|e| format!("RegOpenKeyExW({path}): {e}"))?;
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(wide.as_ptr()), Some(0), KEY_READ, &mut hkey)
+            .ok()
+            .map_err(|e| format!("RegOpenKeyExW({path}): {e}"))?;
     }
 
     let mut map = BTreeMap::new();
@@ -333,15 +314,11 @@ fn reg_create_key(path: &str) -> Result<HKEY, String> {
 fn reg_set_sz(hkey: HKEY, name: Option<&str>, val: &str) -> Result<(), String> {
     let name_w = name.map(to_wide);
     let val_w = to_wide(val);
-    let bytes = unsafe {
-        core::slice::from_raw_parts(val_w.as_ptr() as *const u8, val_w.len() * 2)
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(val_w.as_ptr() as *const u8, val_w.len() * 2) };
     unsafe {
         RegSetValueExW(
             hkey,
-            name_w
-                .as_ref()
-                .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+            name_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
             Some(0),
             REG_SZ,
             Some(bytes),
@@ -359,19 +336,11 @@ fn reg_set_multi_sz(hkey: HKEY, name: &str, vals: &[&str]) -> Result<(), String>
         wide.push(0);
     }
     wide.push(0);
-    let bytes = unsafe {
-        core::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
     unsafe {
-        RegSetValueExW(
-            hkey,
-            PCWSTR(name_w.as_ptr()),
-            Some(0),
-            REG_MULTI_SZ,
-            Some(bytes),
-        )
-        .ok()
-        .map_err(|e| format!("RegSetValueExW({name}): {e}"))
+        RegSetValueExW(hkey, PCWSTR(name_w.as_ptr()), Some(0), REG_MULTI_SZ, Some(bytes))
+            .ok()
+            .map_err(|e| format!("RegSetValueExW({name}): {e}"))
     }
 }
 
@@ -379,15 +348,9 @@ fn reg_set_dword(hkey: HKEY, name: &str, val: u32) -> Result<(), String> {
     let name_w = to_wide(name);
     let bytes = val.to_le_bytes();
     unsafe {
-        RegSetValueExW(
-            hkey,
-            PCWSTR(name_w.as_ptr()),
-            Some(0),
-            REG_DWORD,
-            Some(&bytes),
-        )
-        .ok()
-        .map_err(|e| format!("RegSetValueExW({name}): {e}"))
+        RegSetValueExW(hkey, PCWSTR(name_w.as_ptr()), Some(0), REG_DWORD, Some(&bytes))
+            .ok()
+            .map_err(|e| format!("RegSetValueExW({name}): {e}"))
     }
 }
 
@@ -396,9 +359,8 @@ fn cmd_list() -> Result<(), String> {
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
             .map_err(|e| format!("CoInitializeEx: {e}"))?;
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator): {e}"))?;
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator): {e}"))?;
         let collection = enumerator
             .EnumAudioEndpoints(eCapture, DEVICE_STATE(DEVICE_STATEMASK_ALL))
             .map_err(|e| format!("EnumAudioEndpoints: {e}"))?;
@@ -414,9 +376,7 @@ fn cmd_list() -> Result<(), String> {
             let props: IPropertyStore = dev
                 .OpenPropertyStore(STGM_READ)
                 .map_err(|e| format!("OpenPropertyStore: {e}"))?;
-            let pv = props
-                .GetValue(&PKEY_Device_FriendlyName)
-                .unwrap_or_default();
+            let pv = props.GetValue(&PKEY_Device_FriendlyName).unwrap_or_default();
             let name = PropVariantToStringAlloc(&pv)
                 .map(|p| {
                     let s = p.to_string().unwrap_or_default();
@@ -468,17 +428,10 @@ fn cmd_install(endpoint_id: &str, slot: &str) -> Result<(), String> {
     let guid = extract_guid(endpoint_id);
     let dll_src = find_dll_path()?;
     fs::create_dir_all(INSTALL_DIR).map_err(|e| format!("create_dir_all({INSTALL_DIR}): {e}"))?;
-    fs::create_dir_all(PROGRAM_DATA_DIR)
-        .map_err(|e| format!("create_dir_all({PROGRAM_DATA_DIR}): {e}"))?;
+    fs::create_dir_all(PROGRAM_DATA_DIR).map_err(|e| format!("create_dir_all({PROGRAM_DATA_DIR}): {e}"))?;
 
     let dll_dst = Path::new(INSTALL_DIR).join("apo_spike.dll");
-    fs::copy(&dll_src, &dll_dst).map_err(|e| {
-        format!(
-            "copy {} -> {}: {e}",
-            dll_src.display(),
-            dll_dst.display()
-        )
-    })?;
+    fs::copy(&dll_src, &dll_dst).map_err(|e| format!("copy {} -> {}: {e}", dll_src.display(), dll_dst.display()))?;
     println!("Copied DLL to {}", dll_dst.display());
 
     // 1. Register CLSID
@@ -492,8 +445,7 @@ fn cmd_install(endpoint_id: &str, slot: &str) -> Result<(), String> {
     println!("Registered CLSID {CLSID_STR}");
 
     // 2. Register AudioProcessingObjects entry
-    let apo_key_path =
-        format!(r"SOFTWARE\Classes\AudioEngine\AudioProcessingObjects\{CLSID_STR}");
+    let apo_key_path = format!(r"SOFTWARE\Classes\AudioEngine\AudioProcessingObjects\{CLSID_STR}");
     let h_apo = reg_create_key(&apo_key_path)?;
     reg_set_sz(h_apo, Some("FriendlyName"), "Tine APO Spike")?;
     reg_set_sz(h_apo, Some("Copyright"), "Tine Contributors")?;
@@ -525,10 +477,7 @@ fn cmd_install(endpoint_id: &str, slot: &str) -> Result<(), String> {
         fs::write(&backup_path, json).map_err(|e| format!("write backup: {e}"))?;
         println!("Backed up original FxProperties to {}", backup_path.display());
     } else {
-        println!(
-            "Using existing FxProperties backup at {}",
-            backup_path.display()
-        );
+        println!("Using existing FxProperties backup at {}", backup_path.display());
     }
 
     // 4. Ensure admin write/delete access on FxProperties and write slot PKEYs
@@ -547,7 +496,11 @@ fn cmd_install(endpoint_id: &str, slot: &str) -> Result<(), String> {
         .map_err(|e| format!("RegOpenKeyExW(FxProperties): {e}"))?;
     }
 
-    reg_set_sz(h_fx, Some(PKEY_FX_ASSOCIATION), "{00000000-0000-0000-0000-000000000000}")?;
+    reg_set_sz(
+        h_fx,
+        Some(PKEY_FX_ASSOCIATION),
+        "{00000000-0000-0000-0000-000000000000}",
+    )?;
     match slot {
         "sfx" => {
             reg_set_sz(h_fx, Some(PKEY_SFX_CLSID), CLSID_STR)?;
@@ -632,7 +585,10 @@ fn cmd_uninstall(endpoint_id: &str) -> Result<(), String> {
         fs::remove_file(&backup_path).map_err(|e| format!("remove backup: {e}"))?;
         println!("Restored original FxProperties for {guid}");
     } else {
-        println!("No backup found at {}; skipping FxProperties restore", backup_path.display());
+        println!(
+            "No backup found at {}; skipping FxProperties restore",
+            backup_path.display()
+        );
     }
 
     let clsid_key = to_wide(&format!(r"SOFTWARE\Classes\CLSID\{CLSID_STR}"));
@@ -650,13 +606,15 @@ fn cmd_uninstall(endpoint_id: &str) -> Result<(), String> {
 }
 
 fn cmd_heartbeat(count: Option<u32>) -> Result<(), String> {
-    let shm = ShmMapping::open_existing()
-        .map_err(|e| format!("OpenFileMappingW(Global\\TineSpike.v1): {e}"))?;
+    let shm = ShmMapping::open_existing().map_err(|e| format!("OpenFileMappingW(Global\\TineSpike.v1): {e}"))?;
     let data = shm.data();
     let mut prev = data.heartbeat.load(Ordering::Relaxed);
     let mut prev_time = Instant::now();
 
-    println!("Connected to Global\\TineSpike.v1 (magic={:#x}). Press Ctrl+C to stop.", data.magic);
+    println!(
+        "Connected to Global\\TineSpike.v1 (magic={:#x}). Press Ctrl+C to stop.",
+        data.magic
+    );
     let mut i = 0u32;
     loop {
         if let Some(max) = count {
@@ -696,8 +654,7 @@ struct IPolicyConfigVtbl {
     base: windows::core::IUnknown_Vtbl,
     // 10 unused methods before SetEndpointVisibility (index 13 in vtable = 3 IUnknown + 10)
     _pad: [usize; 10],
-    set_endpoint_visibility:
-        unsafe extern "system" fn(*mut c_void, PCWSTR, i32) -> HRESULT,
+    set_endpoint_visibility: unsafe extern "system" fn(*mut c_void, PCWSTR, i32) -> HRESULT,
 }
 
 fn cmd_reload(endpoint_id: &str, use_service: bool) -> Result<(), String> {
@@ -739,17 +696,16 @@ fn cmd_reload(endpoint_id: &str, use_service: bool) -> Result<(), String> {
 
 fn cmd_capture_test(endpoint_id: &str, raw_mode: bool, ms: u64) -> Result<(), String> {
     use windows::Win32::Media::Audio::{
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMOPTIONS_RAW, AudioClientProperties,
-        IAudioCaptureClient, IAudioClient2, WAVEFORMATEXTENSIBLE,
+        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMOPTIONS_RAW, AudioClientProperties, IAudioCaptureClient, IAudioClient2,
+        WAVEFORMATEXTENSIBLE,
     };
 
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
             .map_err(|e| format!("CoInitializeEx: {e}"))?;
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator): {e}"))?;
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator): {e}"))?;
         let wide_id = to_wide(endpoint_id);
         let dev = enumerator
             .GetDevice(PCWSTR(wide_id.as_ptr()))
@@ -770,9 +726,7 @@ fn cmd_capture_test(endpoint_id: &str, raw_mode: bool, ms: u64) -> Result<(), St
                 .map_err(|e| format!("SetClientProperties(RAW): {e}"))?;
         }
 
-        let fmt_ptr = client
-            .GetMixFormat()
-            .map_err(|e| format!("GetMixFormat: {e}"))?;
+        let fmt_ptr = client.GetMixFormat().map_err(|e| format!("GetMixFormat: {e}"))?;
         let fmt = &*fmt_ptr;
         let rate = fmt.nSamplesPerSec;
         let ch = fmt.nChannels as usize;
@@ -780,8 +734,7 @@ fn cmd_capture_test(endpoint_id: &str, raw_mode: bool, ms: u64) -> Result<(), St
         let tag = fmt.wFormatTag;
         let is_float = tag == 3
             || (tag == 0xFFFE
-                && core::ptr::addr_of!((*(fmt_ptr as *const WAVEFORMATEXTENSIBLE)).SubFormat)
-                    .read_unaligned()
+                && core::ptr::addr_of!((*(fmt_ptr as *const WAVEFORMATEXTENSIBLE)).SubFormat).read_unaligned()
                     == GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71));
 
         client
@@ -823,10 +776,7 @@ fn cmd_capture_test(endpoint_id: &str, raw_mode: bool, ms: u64) -> Result<(), St
                     break;
                 }
                 if frames > 0 && !data_ptr.is_null() && (flags & 2) == 0 && is_float {
-                    let samples = core::slice::from_raw_parts(
-                        data_ptr as *const f32,
-                        frames as usize * ch,
-                    );
+                    let samples = core::slice::from_raw_parts(data_ptr as *const f32, frames as usize * ch);
                     for &s in samples {
                         let a = s.abs();
                         if a > peak {
@@ -843,11 +793,7 @@ fn cmd_capture_test(endpoint_id: &str, raw_mode: bool, ms: u64) -> Result<(), St
 
         let n = (total_frames as f64) * (ch as f64);
         let rms = if n > 0.0 { (sum_sq / n).sqrt() } else { 0.0 };
-        let rms_db = if rms > 1e-12 {
-            20.0 * rms.log10()
-        } else {
-            -120.0
-        };
+        let rms_db = if rms > 1e-12 { 20.0 * rms.log10() } else { -120.0 };
         let peak_db = if peak > 1e-12 {
             20.0 * (peak as f64).log10()
         } else {
@@ -863,7 +809,9 @@ fn cmd_capture_test(endpoint_id: &str, raw_mode: bool, ms: u64) -> Result<(), St
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("Usage: apo-spike <list | install <id> [--slot sfx|mfx|efx] | uninstall <id> | heartbeat | reload <id> [--service]>");
+        eprintln!(
+            "Usage: apo-spike <list | install <id> [--slot sfx|mfx|efx] | uninstall <id> | heartbeat | reload <id> [--service]>"
+        );
         std::process::exit(2);
     }
 
