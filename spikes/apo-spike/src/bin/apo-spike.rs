@@ -43,6 +43,7 @@ const CLSID_STR: &str = "{70355144-DE5B-4045-BC60-B8787CDC4077}";
 const I_AUDIO_SYSTEM_EFFECTS_STR: &str = "{FD7F2B29-24D0-4B5C-B177-592C39F9CA10}";
 const MODE_DEFAULT_STR: &str = "{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}";
 
+const PKEY_FX_ASSOCIATION: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},0";
 const PKEY_SFX_CLSID: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5";
 const PKEY_MFX_CLSID: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},6";
 const PKEY_EFX_CLSID: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},7";
@@ -545,6 +546,7 @@ fn cmd_install(endpoint_id: &str, slot: &str) -> Result<(), String> {
         .map_err(|e| format!("RegOpenKeyExW(FxProperties): {e}"))?;
     }
 
+    reg_set_sz(h_fx, Some(PKEY_FX_ASSOCIATION), "{00000000-0000-0000-0000-000000000000}")?;
     match slot {
         "sfx" => {
             reg_set_sz(h_fx, Some(PKEY_SFX_CLSID), CLSID_STR)?;

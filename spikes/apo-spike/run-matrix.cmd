@@ -16,7 +16,20 @@ set "LOGDIR=C:\ProgramData\TineSpike"
 set "LOG=%LOGDIR%\matrix-results.log"
 
 mkdir "%LOGDIR%" 2>nul
-del /q "%LOGDIR%\spike.log" "%LOGDIR%\format.log" "%LOG%" 2>nul
+
+REM Clean up any leftover state from a previous interrupted run
+if exist "%LOGDIR%\backup_%FIFINE_GUID%.json" (
+    echo Cleaning up leftover fifine install...
+    "%EXE%" uninstall "%FIFINE%" >nul 2>&1
+    "%EXE%" reload "%FIFINE%" >nul 2>&1
+)
+if exist "%LOGDIR%\backup_%AB13X_GUID%.json" (
+    echo Cleaning up leftover AB13X install...
+    "%EXE%" uninstall "%AB13X%" >nul 2>&1
+    "%EXE%" reload "%AB13X%" >nul 2>&1
+)
+
+del /q "%LOGDIR%\spike.log" "%LOGDIR%\format.log" "%LOG%" "%LOGDIR%\cap.tmp" 2>nul
 
 echo === T02 Hardware Matrix Run === > "%LOG%"
 echo. >> "%LOG%"
@@ -29,10 +42,23 @@ reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Captu
 "%EXE%" reload "%FIFINE%" >> "%LOG%" 2>&1
 timeout /t 1 /nobreak >nul
 
-start /b "" cmd /c ""%EXE%" capture-test "%FIFINE%" --ms 3000 >> "%LOG%" 2>&1"
+del /q "%LOGDIR%\cap.tmp" 2>nul
+start /b "" cmd /c ""%EXE%" capture-test "%FIFINE%" --ms 3000 > "%LOGDIR%\cap.tmp" 2>&1"
 timeout /t 1 /nobreak >nul
 "%EXE%" heartbeat --count 3 >> "%LOG%" 2>&1
-timeout /t 2 /nobreak >nul
+if errorlevel 1 (
+    echo [IPolicyConfig reload did not activate SHM; trying audiosrv restart...] >> "%LOG%"
+    timeout /t 3 /nobreak >nul
+    type "%LOGDIR%\cap.tmp" >> "%LOG%" 2>&1
+    "%EXE%" reload "%FIFINE%" --service >> "%LOG%" 2>&1
+    timeout /t 2 /nobreak >nul
+    del /q "%LOGDIR%\cap.tmp" 2>nul
+    start /b "" cmd /c ""%EXE%" capture-test "%FIFINE%" --ms 3000 > "%LOGDIR%\cap.tmp" 2>&1"
+    timeout /t 1 /nobreak >nul
+    "%EXE%" heartbeat --count 3 >> "%LOG%" 2>&1
+)
+timeout /t 3 /nobreak >nul
+if exist "%LOGDIR%\cap.tmp" type "%LOGDIR%\cap.tmp" >> "%LOG%" 2>&1
 
 echo [RAW MODE TEST] >> "%LOG%"
 "%EXE%" capture-test "%FIFINE%" --raw --ms 1000 >> "%LOG%" 2>&1
@@ -41,10 +67,12 @@ echo [FORCE PANIC TEST] >> "%LOG%"
 reg add "HKLM\SOFTWARE\TineSpike" /v ForcePanic /t REG_DWORD /d 1 /f >nul
 "%EXE%" reload "%FIFINE%" >> "%LOG%" 2>&1
 timeout /t 1 /nobreak >nul
-start /b "" cmd /c ""%EXE%" capture-test "%FIFINE%" --ms 3000 >> "%LOG%" 2>&1"
+del /q "%LOGDIR%\cap.tmp" 2>nul
+start /b "" cmd /c ""%EXE%" capture-test "%FIFINE%" --ms 3000 > "%LOGDIR%\cap.tmp" 2>&1"
 timeout /t 1 /nobreak >nul
 "%EXE%" heartbeat --count 2 >> "%LOG%" 2>&1
-timeout /t 2 /nobreak >nul
+timeout /t 3 /nobreak >nul
+if exist "%LOGDIR%\cap.tmp" type "%LOGDIR%\cap.tmp" >> "%LOG%" 2>&1
 reg delete "HKLM\SOFTWARE\TineSpike" /v ForcePanic /f >nul 2>&1
 
 "%EXE%" uninstall "%FIFINE%" >> "%LOG%" 2>&1
@@ -63,10 +91,23 @@ reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Captu
 "%EXE%" reload "%AB13X%" >> "%LOG%" 2>&1
 timeout /t 1 /nobreak >nul
 
-start /b "" cmd /c ""%EXE%" capture-test "%AB13X%" --ms 3000 >> "%LOG%" 2>&1"
+del /q "%LOGDIR%\cap.tmp" 2>nul
+start /b "" cmd /c ""%EXE%" capture-test "%AB13X%" --ms 3000 > "%LOGDIR%\cap.tmp" 2>&1"
 timeout /t 1 /nobreak >nul
 "%EXE%" heartbeat --count 3 >> "%LOG%" 2>&1
-timeout /t 2 /nobreak >nul
+if errorlevel 1 (
+    echo [IPolicyConfig reload did not activate SHM; trying audiosrv restart...] >> "%LOG%"
+    timeout /t 3 /nobreak >nul
+    type "%LOGDIR%\cap.tmp" >> "%LOG%" 2>&1
+    "%EXE%" reload "%AB13X%" --service >> "%LOG%" 2>&1
+    timeout /t 2 /nobreak >nul
+    del /q "%LOGDIR%\cap.tmp" 2>nul
+    start /b "" cmd /c ""%EXE%" capture-test "%AB13X%" --ms 3000 > "%LOGDIR%\cap.tmp" 2>&1"
+    timeout /t 1 /nobreak >nul
+    "%EXE%" heartbeat --count 3 >> "%LOG%" 2>&1
+)
+timeout /t 3 /nobreak >nul
+if exist "%LOGDIR%\cap.tmp" type "%LOGDIR%\cap.tmp" >> "%LOG%" 2>&1
 
 "%EXE%" uninstall "%AB13X%" >> "%LOG%" 2>&1
 "%EXE%" reload "%AB13X%" >> "%LOG%" 2>&1
@@ -75,6 +116,7 @@ reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Captu
 fc "%LOGDIR%\ab13x-before.reg" "%LOGDIR%\ab13x-after.reg" >> "%LOG%" 2>&1
 "%EXE%" capture-test "%AB13X%" --ms 1000 >> "%LOG%" 2>&1
 
+del /q "%LOGDIR%\cap.tmp" 2>nul
 echo === DONE === >> "%LOG%"
 echo Done! Results saved to %LOG%
 endlocal
