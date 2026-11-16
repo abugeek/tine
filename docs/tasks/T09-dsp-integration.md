@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T09-worker) |
 | Lane | A — DSP |
 | Depends on | T06, T07, T08 |
 | Unblocks | T10, and gives T12/T13 real DSP for free |
