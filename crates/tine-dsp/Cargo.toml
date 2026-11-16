@@ -17,7 +17,7 @@ rubato.workspace = true
 
 [dev-dependencies]
 assert_no_alloc.workspace = true
-claxon = { version = "0.4.3", default-features = false }
+claxon.workspace = true
 criterion.workspace = true
 hound.workspace = true
 proptest.workspace = true

@@ -72,7 +72,7 @@ Reviewers (human or agent) check against this file.
 | `tine.exe` window open, 60 Hz | < 3 % CPU, frame build+encode < 4 ms | T19 |
 | Cold start to tray | < 150 ms | T17 |
 | Window open (closed → first frame) | < 250 ms | T03 |
-| Added latency | ≤ 11.5 ms at 48 kHz | T09 |
+| Added latency | ≤ 21.6 ms at 48 kHz (1036 samples, per D-019) | T09 |
 | `tine_apo.dll` size ✓ | < 2 MB | CI artifact check |
 | `tine.exe` size | < 20 MB (release, no `tooling`) | CI artifact check |
 

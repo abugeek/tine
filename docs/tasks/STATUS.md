@@ -10,7 +10,7 @@
 | T06 | Stage 1–2: gain/DC/HPF, RNNoise + expander | A — DSP | done | `task/T06-dsp-cleanup` | #8 | T06-worker |
 | T07 | Stage 3–4: 5-band EQ, split-band de-esser | A — DSP | done | `task/T07-dsp-tone` | #10 | T07-worker |
 | T08 | Stage 5–6: compressor, lookahead limiter | A — DSP | done | `task/T08-dsp-dynamics` | #11 | T08-worker |
-| T09 | Wire stages, fixtures, golden regression, perf gate | A — DSP | in-progress | `task/T09-dsp-integration` | — | T09-worker |
+| T09 | Wire stages, fixtures, golden regression, perf gate | A — DSP | done | `task/T09-dsp-integration` | #15 | t09 (GLM) |
 | T10 | Archetype presets + `MacroMapper` | A — DSP | todo | — | — | — |
 | T11 | `AutoCalibrator` | A — DSP | todo | — | — | — |
 | T12 | cpal audio I/O module + `tine-devhost` | C — Engine / App | done | `task/T12-audio-io` | #9 | T12-worker |

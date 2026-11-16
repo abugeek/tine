@@ -168,7 +168,7 @@ Every audio buffer passes through this deterministic chain in order. Parameter t
 [Input f32, mono (downmixed), endpoint rate — 48 kHz native]
    │
    ├─► Stage 1: Input Gain & DC Blocker + Butterworth HPF (2nd Order Biquad)
-   ├─► Stage 2: Hybrid AI Denoiser (`nnnoiseless` 480-sample FIFO, fixed 10 ms latency) + Soft-Knee Hysteresis Expander
+   ├─► Stage 2: Hybrid AI Denoiser (`nnnoiseless` 480-sample FIFO + 480-sample OLA synthesis delay; 20 ms total per D-019) + Soft-Knee Hysteresis Expander
    ├─► Stage 3: 5-Band Parametric EQ (Cascaded in-house TDF-II Biquads)
    │     Band 1: Low-Shelf (Warmth)      | Band 2: Peaking (Mud Cut ~320Hz)
    │     Band 3: Peaking (Nasal/Mid)     | Band 4: Peaking (Presence ~4.2kHz)
