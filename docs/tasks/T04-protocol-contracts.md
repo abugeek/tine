@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T04-worker) |
 | Lane | 0 — Foundation |
 | Depends on | T01 |
 | Unblocks | T05, T13, T15, T18 (every lane codes against this) |
