@@ -5,8 +5,8 @@
 | T01 | Workspace, toolchain, CI, dependency baseline | 0 — Foundation | done | `task/T01-workspace` | #1 | T01-worker |
 | T02 | Spike (go/no-go): Rust APO on a capture endpoint | B — Windows / APO | done (NO-GO → D-018) | `task/T02-apo-spike` | #4 | T02-worker |
 | T03 | Spike: Rune windowless app, tray, GPU release, memory | C — Engine / App | done | `task/T03-rune-spike` | #3 | T03-worker |
-| T04 | `tine-protocol`: params, lock-free primitives, shm layout | 0 — Foundation | in-progress | `task/T04-protocol` | — | T04-worker |
-| T05 | DSP primitives, test/bench harness, `DspPipeline` skeleton | 0 — Foundation | todo | — | — | — |
+| T04 | `tine-protocol`: params, lock-free primitives, shm layout | 0 — Foundation | done | `task/T04-protocol` | #5 | T04-worker |
+| T05 | DSP primitives, test/bench harness, `DspPipeline` skeleton | 0 — Foundation | in-progress | `task/T05-dsp-foundation` | — | T05-worker |
 | T06 | Stage 1–2: gain/DC/HPF, RNNoise + expander | A — DSP | todo | — | — | — |
 | T07 | Stage 3–4: 5-band EQ, split-band de-esser | A — DSP | todo | — | — | — |
 | T08 | Stage 5–6: compressor, lookahead limiter | A — DSP | todo | — | — | — |
@@ -19,7 +19,7 @@
 | T15 | Engine core: shm client, controller, persistence, devices | C — Engine / App | todo | — | — | — |
 | T16 | Engine audio services: spectrum, Auto-Tune runner, Hear Myself | C — Engine / App | todo | — | — | — |
 | T17 | `tine.exe` shell: Rune App, tray, single instance, CLI, logging | C — Engine / App | todo | — | — | — |
-| T18 | UI foundation: view model, theme, headless harness | D — UI | todo | — | — | — |
+| T18 | UI foundation: view model, theme, headless harness | D — UI | in-progress | `task/T18-ui-foundation` | — | T18-worker |
 | T19 | Header + Golden Line canvas | D — UI | todo | — | — | — |
 | T20 | Pro rack, Auto-Tune overlay, onboarding | D — UI | todo | — | — | — |
 | T21 | End-to-end integration in `tine.exe` | Z — Integration & ship | todo | — | — | — |
