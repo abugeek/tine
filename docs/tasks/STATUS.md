@@ -19,7 +19,7 @@
 | T15 | Engine core: shm client, controller, persistence, devices | C — Engine / App | todo | — | — | — |
 | T16 | Engine audio services: spectrum, Auto-Tune runner, Hear Myself | C — Engine / App | todo | — | — | — |
 | T17 | `tine.exe` shell: Rune App, tray, single instance, CLI, logging | C — Engine / App | todo | — | — | — |
-| T18 | UI foundation: view model, theme, headless harness | D — UI | in-progress | `task/T18-ui-foundation` | — | T18-worker |
+| T18 | UI foundation: view model, theme, headless harness | D — UI | done | `task/T18-ui-foundation` | #6 | T18-worker |
 | T19 | Header + Golden Line canvas | D — UI | todo | — | — | — |
 | T20 | Pro rack, Auto-Tune overlay, onboarding | D — UI | todo | — | — | — |
 | T21 | End-to-end integration in `tine.exe` | Z — Integration & ship | todo | — | — | — |
