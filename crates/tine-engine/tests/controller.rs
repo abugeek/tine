@@ -20,12 +20,15 @@ use tine_protocol::shm::{ShmLayout, init_layout_in_place};
 use tine_protocol::sync::ParamBlock;
 use tine_protocol::telemetry::AudioTelemetryFrame;
 use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-use windows::Win32::System::Memory::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+};
 
 fn temp_paths(tag: &str) -> EnginePaths {
-    let base = tempfile::tempdir()
-        .ok()
-        .map_or_else(|| std::env::temp_dir().join(format!("tine-ctl-{tag}")), tempfile::TempDir::keep);
+    let base = tempfile::tempdir().ok().map_or_else(
+        || std::env::temp_dir().join(format!("tine-ctl-{tag}")),
+        tempfile::TempDir::keep,
+    );
     let root = base.join(tag);
     EnginePaths::from_roots(root.join("app"), root.join("prog"), root.join("local"))
 }
@@ -65,10 +68,14 @@ fn wait_event(rx: &Receiver<Event>, pred: impl Fn(&Event) -> bool, budget: Durat
 
 /// Waits for a `ModelChanged` snapshot whose model satisfies `pred`.
 fn wait_model(rx: &Receiver<Event>, pred: impl Fn(&AppModel) -> bool, what: &str) -> Option<Arc<AppModel>> {
-    let outcome = wait_event(rx, |e| match e {
-        Event::ModelChanged(m) => pred(m),
-        _ => false,
-    }, BUDGET);
+    let outcome = wait_event(
+        rx,
+        |e| match e {
+            Event::ModelChanged(m) => pred(m),
+            _ => false,
+        },
+        BUDGET,
+    );
     match outcome {
         Some(Event::ModelChanged(m)) => Some(m),
         Some(_) => None,
@@ -121,7 +128,10 @@ fn every_command_reaches_the_model_and_the_param_target() {
         Command::SetBypass(true),
         Command::SetBypass(false),
         Command::UnpinAll,
-        Command::SetMonitor(MonitorSettings { output_device: Some("hp-1".to_owned()), enabled: true }),
+        Command::SetMonitor(MonitorSettings {
+            output_device: Some("hp-1".to_owned()),
+            enabled: true,
+        }),
         Command::ApplyCalibration(calibration_fixture(), KeepPins::Clear),
     ];
     let mut last_params = DspParams::DEFAULT;
@@ -277,7 +287,10 @@ fn reset_to_archetype_clears_everything() {
         },
         "reset state",
     );
-    assert!(reset.is_some(), "ResetToArchetype clears macros, calibration, pins, and overrides");
+    assert!(
+        reset.is_some(),
+        "ResetToArchetype clears macros, calibration, pins, and overrides"
+    );
 
     drop(handle);
     drop(rx);
@@ -351,7 +364,11 @@ fn boot_params_survive_controller_exit_for_the_apo() {
     assert!(sent.is_ok());
     let sent = handle.send(Command::SetParam(ParamId::InputGainDb, 3.5));
     assert!(sent.is_ok());
-    wait_params(&rx, |p| (p.denoise_mix - 0.7).abs() < 1e-6 && (p.input_gain_db - 3.5).abs() < 1e-6, "state");
+    wait_params(
+        &rx,
+        |p| (p.denoise_mix - 0.7).abs() < 1e-6 && (p.input_gain_db - 3.5).abs() < 1e-6,
+        "state",
+    );
 
     // "tine.exe dies" — the APO later reads the boot params at LockForProcess.
     drop(handle);
@@ -382,9 +399,11 @@ fn select_endpoint_loads_or_creates_the_profile_and_retargets() {
 
     let sent = handle.send(Command::SelectEndpoint(EndpointId::new("mic-second")));
     assert!(sent.is_ok());
-    let model = wait_model(&rx, |m| {
-        m.endpoint.as_ref().is_some_and(|e| e.as_str() == "mic-second")
-    }, "selected endpoint");
+    let model = wait_model(
+        &rx,
+        |m| m.endpoint.as_ref().is_some_and(|e| e.as_str() == "mic-second"),
+        "selected endpoint",
+    );
     assert!(model.is_some(), "endpoint switch emits");
     let Some(model) = model else {
         panic!("expected ModelChanged");
@@ -467,7 +486,9 @@ impl FakeApo {
 
     fn beat_and_publish(&self, seq: u64) {
         let layout = self.layout();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         layout.header.heartbeat.store(now, Ordering::Relaxed);
         let frame = AudioTelemetryFrame {
             sequence: seq,
@@ -528,7 +549,10 @@ fn controller_links_reconnects_and_serves_telemetry_over_shm() {
         |e| matches!(e, Event::ApoLink(tine_engine::shm_client::LinkState::Linked { .. })),
         BUDGET,
     );
-    assert!(linked.is_some(), "controller must link once the APO creates the mapping");
+    assert!(
+        linked.is_some(),
+        "controller must link once the APO creates the mapping"
+    );
     let _ = beater.join();
 
     // A SetMacro command must be published into the mapping — audible in
@@ -577,7 +601,10 @@ fn controller_links_reconnects_and_serves_telemetry_over_shm() {
     assert_eq!(got, 2, "tap samples drain through the handle");
     assert!((drained[0] - 0.5).abs() < f32::EPSILON);
 
-    assert!(handle.shm_client().is_some(), "handle exposes the live client for the visualizer");
+    assert!(
+        handle.shm_client().is_some(),
+        "handle exposes the live client for the visualizer"
+    );
 
     drop(handle);
     drop(rx);

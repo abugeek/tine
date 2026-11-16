@@ -19,7 +19,7 @@ use tine_protocol::params::DspParams;
 use tine_protocol::shm::{ShmError, ShmLayout, layout_from_ptr, shm_name};
 use tine_protocol::sync::ParamBlock;
 use tine_protocol::telemetry::AudioTelemetryFrame;
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE, CloseHandle};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE};
 use windows::Win32::System::Memory::{FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile};
 use windows::core::PCWSTR;
 
@@ -186,7 +186,7 @@ impl ShmClient {
                         context: "OpenFileMappingW",
                         source,
                     },
-                })
+                });
             }
         };
 
@@ -293,7 +293,11 @@ impl ShmClient {
     /// has never published one).
     #[must_use]
     pub fn heartbeat_age_ms(&self) -> Option<u64> {
-        let hb = self.layout().header.heartbeat.load(std::sync::atomic::Ordering::Relaxed);
+        let hb = self
+            .layout()
+            .header
+            .heartbeat
+            .load(std::sync::atomic::Ordering::Relaxed);
         if hb == 0 {
             None
         } else {
@@ -541,9 +545,10 @@ impl ShmTarget {
             _ => {}
         }
         if let Some(next) = self.next_attempt
-            && Instant::now() < next {
-                return None;
-            }
+            && Instant::now() < next
+        {
+            return None;
+        }
         self.next_attempt = Some(Instant::now() + poll_period());
 
         let Some(endpoint) = self.endpoint.clone() else {
@@ -591,7 +596,6 @@ impl ShmTarget {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -602,13 +606,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tine_protocol::params::DspParams;
-    use tine_protocol::shm::{ShmError, ShmLayout, SHM_LAYOUT_VERSION, init_layout_in_place, layout_from_ptr};
+    use tine_protocol::shm::{SHM_LAYOUT_VERSION, ShmError, ShmLayout, init_layout_in_place, layout_from_ptr};
     use tine_protocol::sync::ParamBlock;
     use tine_protocol::telemetry::AudioTelemetryFrame;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::System::Memory::{
-        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS,
-        PAGE_READWRITE,
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+        UnmapViewOfFile,
     };
 
     /// APO-side stand-in for one test: creates a local (session) mapping,
@@ -697,7 +701,9 @@ mod tests {
         }
 
         fn publish_heartbeat(&self, age_ms: u64) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
             self.layout()
                 .header
                 .heartbeat
@@ -782,10 +788,7 @@ mod tests {
 
         let result = ShmClient::open_name(&name);
         assert!(
-            matches!(
-                result,
-                Err(ShmOpenError::Invalid(ShmError::VersionMismatch { .. }))
-            ),
+            matches!(result, Err(ShmOpenError::Invalid(ShmError::VersionMismatch { .. }))),
             "expected VersionMismatch, got {result:?}"
         );
 
@@ -832,10 +835,11 @@ mod tests {
         for _ in 0..50 {
             let transition = target.poll();
             if let Some((state, _)) = transition
-                && matches!(state, LinkState::Linked { .. }) {
-                    linked = true;
-                    break;
-                }
+                && matches!(state, LinkState::Linked { .. })
+            {
+                linked = true;
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(linked, "target must link once the mapping exists");
@@ -849,11 +853,12 @@ mod tests {
         let mut linked2 = false;
         for _ in 0..50 {
             if let Some((state, client)) = target.poll()
-                && matches!(state, LinkState::Linked { .. }) {
-                    assert!(client.is_some());
-                    linked2 = true;
-                    break;
-                }
+                && matches!(state, LinkState::Linked { .. })
+            {
+                assert!(client.is_some());
+                linked2 = true;
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(linked2, "target must relink on the new endpoint mapping");

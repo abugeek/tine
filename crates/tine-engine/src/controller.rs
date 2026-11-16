@@ -13,8 +13,8 @@
 //! linked**).
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender, channel};
 use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,9 @@ use tine_protocol::settings::AppSettings;
 use tine_protocol::sync::ParamBlock;
 use tine_protocol::telemetry::AudioTelemetryFrame;
 
-use crate::model::{AppModel, EndpointId, KeepPins, Macro, MonitorSettings, EngineError, apply_override, clear_override, resolve};
+use crate::model::{
+    AppModel, EndpointId, EngineError, KeepPins, Macro, MonitorSettings, apply_override, clear_override, resolve,
+};
 use crate::paths::EnginePaths;
 use crate::persist;
 use crate::shm_client::{LinkState, ShmClient, Target};
@@ -302,10 +304,11 @@ fn run(cfg: EngineConfig, rx: Receiver<Command>, tx: Sender<Event>, slot: Shared
             }
             Ok(None) => {
                 if let Some(deadline) = state.persist_at
-                    && deadline <= Instant::now() {
-                        state.persist_at = None;
-                        flush_persistence(&mut state, &tx, &paths);
-                    }
+                    && deadline <= Instant::now()
+                {
+                    state.persist_at = None;
+                    flush_persistence(&mut state, &tx, &paths);
+                }
                 state.poll_next = poll_and_update(&mut state, &tx, &slot);
             }
             Err(()) => {
@@ -449,7 +452,7 @@ fn flush_persistence(state: &mut Loop, tx: &Sender<Event>, paths: &EnginePaths) 
 #[cfg(test)]
 mod tests {
     use super::{Command, Controller, EngineConfig, Event, PERSIST_DEBOUNCE};
-    use crate::model::{EndpointId, Macro, MonitorSettings, KeepPins};
+    use crate::model::{EndpointId, KeepPins, Macro, MonitorSettings};
     use crate::paths::EnginePaths;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -536,11 +539,7 @@ mod tests {
     fn every_command_round_trips_through_the_model() {
         let paths = temp_paths("commands");
         let block = Arc::new(ParamBlock::new());
-        let (handle, rx) = Controller::spawn(EngineConfig::block(
-            EndpointId::new("mic-b"),
-            Arc::clone(&block),
-            paths,
-        ));
+        let (handle, rx) = Controller::spawn(EngineConfig::block(EndpointId::new("mic-b"), Arc::clone(&block), paths));
         let rt = Duration::from_secs(5);
         wait_event(&rx, |e| matches!(e, Event::ModelChanged(_)), rt);
 
@@ -549,7 +548,10 @@ mod tests {
             Command::SetMacro(Macro::Body, 0.2),
             Command::SetParam(tine_protocol::params::ParamId::HpfFreqHz, 95.0),
             Command::SetBypass(true),
-            Command::SetMonitor(MonitorSettings { output_device: Some("out-1".into()), enabled: true }),
+            Command::SetMonitor(MonitorSettings {
+                output_device: Some("out-1".into()),
+                enabled: true,
+            }),
             Command::Unpin(tine_protocol::params::ParamId::HpfFreqHz),
             Command::UnpinAll,
             Command::ApplyCalibration(test_calibration(), KeepPins::Clear),
@@ -606,7 +608,11 @@ mod tests {
         println!("controller idle: {delta} ms process CPU time over 1_000 ms (budget < 100)");
         assert!(delta < 100, "controller idle burned {delta} ms CPU in 1 s (busy loop?)");
         let frame = handle.telemetry();
-        assert_eq!(frame, AudioTelemetryFrame::default(), "no shm client -> default telemetry");
+        assert_eq!(
+            frame,
+            AudioTelemetryFrame::default(),
+            "no shm client -> default telemetry"
+        );
         drop(handle);
         drop(rx);
     }

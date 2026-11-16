@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use tine_protocol::ids::SanitizedId;
-use windows::core::PWSTR;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
 };
+use windows::core::PWSTR;
 
 /// Errors returned when resolving known folders or composing Tine's paths.
 #[derive(Debug, Error)]
@@ -111,7 +111,11 @@ impl EnginePaths {
 
     /// Builds explicit roots (tests, `devhost`, diagnostics).
     #[must_use]
-    pub fn from_roots(app_data: impl Into<PathBuf>, program_data: impl Into<PathBuf>, local_data: impl Into<PathBuf>) -> Self {
+    pub fn from_roots(
+        app_data: impl Into<PathBuf>,
+        program_data: impl Into<PathBuf>,
+        local_data: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             app_data: app_data.into(),
             program_data: program_data.into(),
@@ -128,7 +132,8 @@ impl EnginePaths {
     /// `$app_data\Tine\profiles\<sanitized endpoint>.json`.
     #[must_use]
     pub fn profile_file(&self, endpoint_id: &str) -> PathBuf {
-        self.profiles_dir().join(format!("{}.json", SanitizedId::from_raw(endpoint_id)))
+        self.profiles_dir()
+            .join(format!("{}.json", SanitizedId::from_raw(endpoint_id)))
     }
 
     /// `$app_data\Tine\profiles`.
@@ -140,7 +145,8 @@ impl EnginePaths {
     /// `$program_data\Tine\endpoints\<sanitized endpoint>.json` (APO boot params).
     #[must_use]
     pub fn boot_params_file(&self, endpoint_id: &str) -> PathBuf {
-        self.boot_params_dir().join(format!("{}.json", SanitizedId::from_raw(endpoint_id)))
+        self.boot_params_dir()
+            .join(format!("{}.json", SanitizedId::from_raw(endpoint_id)))
     }
 
     /// `$program_data\Tine\endpoints`.

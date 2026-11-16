@@ -5,15 +5,18 @@ use std::path::Path;
 use std::time::Duration;
 
 use tine_engine::paths::EnginePaths;
-use tine_engine::persist::{Loaded, atomic_write, load_boot_params, load_profile, load_settings, save_boot_params, save_profile, save_settings};
+use tine_engine::persist::{
+    Loaded, atomic_write, load_boot_params, load_profile, load_settings, save_boot_params, save_profile, save_settings,
+};
 use tine_protocol::params::{DspParams, ParamId};
 use tine_protocol::presets::{Archetype, Calibration, CalibrationOverrides, EndpointProfile, MacroPositions, PinSet};
 use tine_protocol::settings::AppSettings;
 
 fn temp_paths(tag: &str) -> EnginePaths {
-    let base = tempfile::tempdir()
-        .ok()
-        .map_or_else(|| std::env::temp_dir().join(format!("tine-persist-{tag}")), tempfile::TempDir::keep);
+    let base = tempfile::tempdir().ok().map_or_else(
+        || std::env::temp_dir().join(format!("tine-persist-{tag}")),
+        tempfile::TempDir::keep,
+    );
     paths_under(&base.join(tag))
 }
 

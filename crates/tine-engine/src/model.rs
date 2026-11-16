@@ -239,7 +239,12 @@ pub fn resolve(model: &AppModel) -> DspParams {
         // within the documented −60 .. −30 dB envelope around its midpoint.
         p.set(
             ParamId::GateThresholdDb,
-            cal_gate + lerp(NEUTRAL_GATE_THRESHOLD_DB - 15.0, NEUTRAL_GATE_THRESHOLD_DB + 15.0, macros.purity)
+            cal_gate
+                + lerp(
+                    NEUTRAL_GATE_THRESHOLD_DB - 15.0,
+                    NEUTRAL_GATE_THRESHOLD_DB + 15.0,
+                    macros.purity,
+                )
                 - NEUTRAL_GATE_THRESHOLD_DB,
         );
     }
@@ -399,7 +404,9 @@ pub fn clear_override(overrides: &mut PresetParams, id: ParamId) {
 mod tests {
     use super::{AppModel, KeepPins, Macro, apply_override, clamp_param, clear_override, resolve};
     use tine_protocol::params::{Band, DspParams, ParamId};
-    use tine_protocol::presets::{Archetype, Calibration, CalibrationOverrides, EndpointProfile, MacroPositions, PinSet};
+    use tine_protocol::presets::{
+        Archetype, Calibration, CalibrationOverrides, EndpointProfile, MacroPositions, PinSet,
+    };
 
     fn model() -> AppModel {
         AppModel::new(super::EndpointId::new("0.0.1.00000000.{test}"))
@@ -463,18 +470,23 @@ mod tests {
         let p = resolve(&m);
         assert!(p.deesser_enabled, "presence > 0.6 engages the de-esser");
         assert!((p.deesser_amount_db - 5.5).abs() < 0.01);
-        assert!(!resolve(&{
-            let mut m = model();
-            Macro::set(Macro::Presence, &mut m.profile.macros, 0.5);
-            m
-        })
-        .deesser_enabled);
+        assert!(
+            !resolve(&{
+                let mut m = model();
+                Macro::set(Macro::Presence, &mut m.profile.macros, 0.5);
+                m
+            })
+            .deesser_enabled
+        );
 
         let mut m = model();
         Macro::set(Macro::Leveler, &mut m.profile.macros, 1.0);
         let p = resolve(&m);
         assert!((p.comp_ratio - 5.0).abs() < f32::EPSILON);
-        assert!((p.comp_thresh_db - (-30.0)).abs() < 1e-3, "leveler 1.0 lowers threshold by 10 dB");
+        assert!(
+            (p.comp_thresh_db - (-30.0)).abs() < 1e-3,
+            "leveler 1.0 lowers threshold by 10 dB"
+        );
     }
 
     #[test]
@@ -482,14 +494,13 @@ mod tests {
         let mut m = model();
         m.profile.pins.pin(ParamId::DenoiseMix);
         // Pinned parameters keep their calibrated/overridden value.
-        apply_override(
-            &mut m.profile.overrides,
-            ParamId::DenoiseMix,
-            0.25,
-        );
+        apply_override(&mut m.profile.overrides, ParamId::DenoiseMix, 0.25);
         Macro::set(Macro::Purity, &mut m.profile.macros, 0.9);
         let p = resolve(&m);
-        assert!((p.denoise_mix - 0.25).abs() < f32::EPSILON, "pinned param not driven by macro");
+        assert!(
+            (p.denoise_mix - 0.25).abs() < f32::EPSILON,
+            "pinned param not driven by macro"
+        );
 
         // Unpinning returns control to macros.
         m.profile.pins.unpin(ParamId::DenoiseMix);
@@ -531,7 +542,10 @@ mod tests {
         m.profile.macros.presence = 7.0; // out of range; clamped to 1.0
         let p = resolve(&m);
         assert!((p.denoise_mix - 0.5).abs() < f32::EPSILON, "NaN macro -> neutral");
-        assert!((p.eq_gain_db[Band::B3.index()] - 5.0).abs() < f32::EPSILON, "clamped to 1.0");
+        assert!(
+            (p.eq_gain_db[Band::B3.index()] - 5.0).abs() < f32::EPSILON,
+            "clamped to 1.0"
+        );
     }
 
     #[test]
@@ -581,7 +595,11 @@ mod tests {
         assert_eq!(clamp_param(ParamId::HpfFreqHz, 500.0), 200.0);
         assert_eq!(clamp_param(ParamId::HpfFreqHz, 10.0), 20.0);
         assert_eq!(clamp_param(ParamId::HpfFreqHz, f32::NAN), 80.0);
-        assert_eq!(clamp_param(ParamId::CompRatio, f32::INFINITY), 3.0, "non-finite -> default");
+        assert_eq!(
+            clamp_param(ParamId::CompRatio, f32::INFINITY),
+            3.0,
+            "non-finite -> default"
+        );
     }
 
     #[test]

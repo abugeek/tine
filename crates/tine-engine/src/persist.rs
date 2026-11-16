@@ -27,9 +27,9 @@ use tine_protocol::presets::{EndpointProfile, ValidationError};
 use tine_protocol::settings::AppSettings;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, MoveFileExW, ReplaceFileW, WriteFile, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-    FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, MOVEFILE_REPLACE_EXISTING,
-    REPLACE_FILE_FLAGS,
+    CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_SHARE_MODE, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MoveFileExW, REPLACE_FILE_FLAGS, ReplaceFileW,
+    WriteFile,
 };
 use windows::core::PCWSTR;
 
@@ -134,7 +134,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
 
     let temp = path.with_file_name(format!(
         "{}.tmp-{}",
-        path.file_name().map_or_else(|| "tine".to_owned(), |n| n.to_string_lossy().into_owned()),
+        path.file_name()
+            .map_or_else(|| "tine".to_owned(), |n| n.to_string_lossy().into_owned()),
         std::process::id()
     ));
 
@@ -270,12 +271,11 @@ pub fn migrate_value(path: &Path, value: &mut Value) -> Result<(), PersistError>
 /// Failure to move the file is ignored: defaults are used either way, and the
 /// backup is a best-effort diagnostic aid.
 fn backup_corrupt(path: &Path) {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let backup = path.with_extension(format!(
         "{}-corrupt-{ts}",
-        path.extension().map_or_else(String::new, |e| e.to_string_lossy().into_owned())
+        path.extension()
+            .map_or_else(String::new, |e| e.to_string_lossy().into_owned())
     ));
     let _ = std::fs::rename(path, backup);
 }
@@ -395,7 +395,10 @@ fn boot_params_file(endpoint_id: &str, params: &DspParams) -> BootParamsFile {
 
 /// Persists the APO boot params for `endpoint_id`.
 pub fn save_boot_params(endpoint_id: &str, params: &DspParams, paths: &EnginePaths) -> Result<(), PersistError> {
-    atomic_write_json(&paths.boot_params_file(endpoint_id), &boot_params_file(endpoint_id, params))
+    atomic_write_json(
+        &paths.boot_params_file(endpoint_id),
+        &boot_params_file(endpoint_id, params),
+    )
 }
 
 /// Loads the APO boot params for `endpoint_id` ([`DspParams::DEFAULT`] when
@@ -441,10 +444,11 @@ fn boot_params_into(file: &BootParamsFile) -> DspParams {
     let mut params = DspParams::DEFAULT;
     for i in 0..PARAM_COUNT {
         if let Some(id) = tine_protocol::params::ParamId::from_index(i)
-            && let Some(v) = file.params.get(id.spec().key) {
-                let raw = *v;
-                params.set(id, raw);
-            }
+            && let Some(v) = file.params.get(id.spec().key)
+        {
+            let raw = *v;
+            params.set(id, raw);
+        }
     }
     params
 }
