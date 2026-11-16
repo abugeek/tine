@@ -45,15 +45,16 @@ Spectral tilt optionally nudges `Body` (too much low energy → lower Body) — 
 ## Layer C — Macros ("Golden Line") and Pro mode
 
 Four normalized nodes `0.0 … 1.0`. Each mapping is a pure function in `tine-dsp::macros`, tested for monotonicity and range.
+Positions are **centred on the effective base** (preset Layer A value, or the calibrated value when one exists), so `0.5` always reproduces the archetype exactly — EQ-gain offsets are *added* to the preset base (D-021). `a`/`b` below denote that effective base value; `u(m) = max(0, 2m − 1)` (upper half).
 
 | Macro | Drives |
 | :--- | :--- |
-| **Purity** | `denoise_mix` 0 → 1; `gate_threshold_db` −60 → −30 (offset from calibrated threshold when calibration exists) |
-| **Body** | Band 1 low-shelf @110 Hz −2 → +6 dB; Band 2 mud @320 Hz 0 → −5 dB (cut deepens as Body rises) |
-| **Presence** | Band 4 peak @4.2 kHz 0 → +5 dB; Band 5 shelf @8.5 kHz 0 → +6 dB; de-esser enabled above 0.6, amount scales 0.6→1.0 ⇒ 3→8 dB |
-| **Leveler** | `comp_ratio` 1.5 → 5; `comp_thresh_db` = calibrated threshold − 0 … 10 dB; auto-makeup on |
+| **Purity** | `denoise_mix` = a ± 0.5; `gate_threshold_db` = a ± 15 dB (both rise: more purity ⇒ more AI wet, less gating) |
+| **Body** | Band 1 (eq.0) low-shelf @110 Hz gain = b ± 4 dB; Band 2 (eq.1) mud @320 Hz gain = b − 5 dB · u(m) (cut deepens only above centre) |
+| **Presence** | Band 4 (eq.3) peak @4.2 kHz gain = b + 5 dB · u(m); Band 5 (eq.4) shelf @8.5 kHz gain = b + 6 dB · u(m); de-esser enabled = base_enabled ∨ m > 0.6; amount = max(b, 3 + 5·clamp((m − 0.6)/0.4)) dB (3 → 8 dB over 0.6 → 1.0) |
+| **Leveler** | `comp_ratio` = b ± 1.75; `comp_thresh_db` = a − 10 dB · u(m) ("calibrated threshold − 0…10 dB"); auto-makeup on |
 
-Archetype base values are **added** to macro offsets for EQ gains (macro 0.5 ≈ archetype as-is).
+A calibration replaces the preset's `input_gain_db`, `gate_threshold_db`, `denoise_mix`, `comp_thresh_db` and `comp_makeup_db` (its verified manual makeup disables auto-makeup); Purity/Leveler then move relative to those anchors. Pinned parameters are not driven at all (D-007). All outputs clamp through the `tine-protocol` `SPECS` ranges.
 
 ### Pro mode interaction rule (D-007)
 

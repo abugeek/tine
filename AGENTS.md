@@ -148,11 +148,11 @@ Because every microphone capsule and room environment is different, Tine never h
 
 Both modes mutate the exact same underlying `DspParams` struct:
 
-- **Golden Line Mode (Default)**: 4 Macro Nodes (`0.0` to `1.0`):
-  - **Purity (Noise & Gate)**: RNNoise wet mix (`0.0 -> 1.0`) and Expander threshold (`-60 dB -> -30 dB`).
-  - **Body (Warmth & Mud Control)**: Low-Shelf (`110 Hz`, `-2 dB -> +6 dB`) while cutting the Mud Filter (`320 Hz`, `0 dB -> -5 dB`).
-  - **Presence (Clarity & De-Ess)**: Presence Peak (`4.2 kHz`, `0 dB -> +5 dB`), Air Shelf (`8.5 kHz`, `0 dB -> +6 dB`), dynamic De-Essing above `0.6`.
-  - **Leveler (Compression & Voice Focus)**: Compressor Ratio (`1.5:1 -> 5.0:1`), lowers Threshold, auto-makeup gain.
+- **Golden Line Mode (Default)**: 4 Macro Nodes (`0.0` to `1.0`), centred on the effective base at `0.5` (a = preset value, or the calibrated value when one exists; D-021 — exact equations in [`docs/project/04-mic-adaptation.md`](docs/project/04-mic-adaptation.md) Layer C):
+  - **Purity (Noise & Gate)**: RNNoise wet mix (`a ± 0.5`) and Expander threshold (`a ± 15 dB`; more purity trusts the denoiser and gates less).
+  - **Body (Warmth & Mud Control)**: Low-Shelf (`110 Hz`, `b ± 4 dB`) while cutting the Mud Filter (`320 Hz`, down to `−5 dB` above centre — never boosts the mud).
+  - **Presence (Clarity & De-Ess)**: Presence Peak (`4.2 kHz`, up to `+5 dB` above centre), Air Shelf (`8.5 kHz`, up to `+6 dB` above centre), de-esser on above `0.6` (or when the archetype base enables it), amount `3 → 8 dB` over `0.6 → 1.0`.
+  - **Leveler (Compression & Voice Focus)**: Compressor Ratio (`b ± 1.75`), Threshold lowered by up to `10 dB` from the effective threshold, auto-makeup gain (a calibration supplies its verified manual makeup instead).
 - **Pro Mode (Expanded Drawer)**: Exact HPF cutoff (`20 Hz – 200 Hz`), Gate Ratio/Hysteresis/Attack/Release, 5-Band Fully Parametric EQ (Freq, Gain, Q, FilterType), De-Esser Frequency/Threshold/Amount, Compressor (Threshold, Ratio, Attack, Release, Knee, Makeup), and Limiter Ceiling (optional true-peak).
 - **Pinning rule (D-007)**: Editing a parameter in Pro mode pins it; macros stop driving pinned parameters until unpinned.
 

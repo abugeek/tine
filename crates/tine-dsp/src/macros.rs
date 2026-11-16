@@ -165,10 +165,11 @@ impl ExplainBuf {
     /// (fixed capacity, so this branch is fully predictable on the RT path).
     fn push(&mut self, row: ExplainRow) {
         if self.len < MAX_EXPLAIN_ROWS
-            && let Some(slot) = self.rows.get_mut(self.len) {
-                *slot = row;
-                self.len += 1;
-            }
+            && let Some(slot) = self.rows.get_mut(self.len)
+        {
+            *slot = row;
+            self.len += 1;
+        }
     }
 }
 
@@ -193,11 +194,7 @@ const PRESENCE_DRIVES: [ParamId; 4] = [
 ];
 
 /// Parameters driven by **Leveler** (threshold falls, ratio rises, auto-makeup on).
-const LEVELER_DRIVES: [ParamId; 3] = [
-    ParamId::CompThreshDb,
-    ParamId::CompRatio,
-    ParamId::CompAutoMakeup,
-];
+const LEVELER_DRIVES: [ParamId; 3] = [ParamId::CompThreshDb, ParamId::CompRatio, ParamId::CompAutoMakeup];
 
 /// All parameters the calibration layer replaces (used for the pin checks).
 const CALIBRATION_DRIVES: [ParamId; 5] = [
@@ -269,9 +266,7 @@ impl MacroMapper {
             *gain += upper(m.presence) * PRESENCE_AIR_BOOST_DB;
         }
         out.deesser_enabled = out.deesser_enabled || m.presence > PRESENCE_DEESSER_POS;
-        out.deesser_amount_db = out
-            .deesser_amount_db
-            .max(deesser_amount(m.presence));
+        out.deesser_amount_db = out.deesser_amount_db.max(deesser_amount(m.presence));
 
         // Leveler: ratio opens up, threshold eases down, auto-makeup on.
         let leveler = centered(m.leveler);
@@ -361,7 +356,7 @@ fn deesser_amount(presence: f32) -> f32 {
 // Unit tests for the curve primitives.
 #[cfg(test)]
 mod tests {
-    use super::{centered, deesser_amount, upper, PRESENCE_DEESSER_MAX_DB, PRESENCE_DEESSER_MIN_DB};
+    use super::{PRESENCE_DEESSER_MAX_DB, PRESENCE_DEESSER_MIN_DB, centered, deesser_amount, upper};
 
     #[test]
     fn centered_is_zero_at_half() {

@@ -8,9 +8,9 @@
 use std::time::Instant;
 
 use proptest::prelude::*;
-use tine_dsp::macros::{ExplainBuf, Macro, MacroMapper, MAX_EXPLAIN_ROWS};
-use tine_dsp::presets::{builtin, PresetDef, CONDENSER, DYNAMIC, HEADSET, LAPTOP};
-use tine_protocol::params::{Band, DspParams, EQ_BAND_COUNT, FilterType, ParamId, PARAM_COUNT};
+use tine_dsp::macros::{ExplainBuf, MAX_EXPLAIN_ROWS, Macro, MacroMapper};
+use tine_dsp::presets::{CONDENSER, DYNAMIC, HEADSET, LAPTOP, PresetDef, builtin};
+use tine_protocol::params::{Band, DspParams, EQ_BAND_COUNT, FilterType, PARAM_COUNT, ParamId};
 use tine_protocol::presets::{Archetype, Calibration, CalibrationOverrides, MacroPositions, PinSet};
 
 const ARCHETYPES: [Archetype; 4] = [
@@ -77,7 +77,11 @@ fn all_params_in_spec(out: &DspParams) {
 }
 
 fn preset_json_path(a: Archetype) -> String {
-    format!("{}\\..\\..\\assets\\presets\\{}.json", env!("CARGO_MANIFEST_DIR"), a.id())
+    format!(
+        "{}\\..\\..\\assets\\presets\\{}.json",
+        env!("CARGO_MANIFEST_DIR"),
+        a.id()
+    )
 }
 
 // ---------------------------------------------------------------- JSON parity
@@ -86,10 +90,9 @@ fn preset_json_path(a: Archetype) -> String {
 fn json_matches_const_table() {
     for a in ARCHETYPES {
         let path = preset_json_path(a);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let json: tine_protocol::presets::Preset = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("parse {path}: {e}"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let json: tine_protocol::presets::Preset =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
         json.validate().unwrap_or_else(|e| panic!("validate {path}: {e}"));
 
         let def = builtin(a);
@@ -123,7 +126,13 @@ fn builtin_matches_archetype_identity() {
 fn golden_archetypes_at_macro_defaults() {
     // Dynamic: purity 0.4 shifts mix 0.5 → 0.4 and gate −50 → −53 dBFS;
     // the archetype table values must come out exactly.
-    let out = MacroMapper::apply(&DYNAMIC, None, DYNAMIC.macro_defaults, PinSet::EMPTY, &DspParams::DEFAULT);
+    let out = MacroMapper::apply(
+        &DYNAMIC,
+        None,
+        DYNAMIC.macro_defaults,
+        PinSet::EMPTY,
+        &DspParams::DEFAULT,
+    );
     assert_eq!(out.hpf_freq_hz, 80.0);
     assert_eq!(out.eq_type[0], FilterType::LowShelf);
     assert_eq!(out.eq_freq_hz[0], 110.0);
@@ -140,7 +149,13 @@ fn golden_archetypes_at_macro_defaults() {
 
     // Condenser: de-esser stays active at default (0.5) presence because the
     // archetype base enables it.
-    let out = MacroMapper::apply(&CONDENSER, None, CONDENSER.macro_defaults, PinSet::EMPTY, &DspParams::DEFAULT);
+    let out = MacroMapper::apply(
+        &CONDENSER,
+        None,
+        CONDENSER.macro_defaults,
+        PinSet::EMPTY,
+        &DspParams::DEFAULT,
+    );
     assert_eq!(out, CONDENSER.base);
     assert_eq!(out.hpf_freq_hz, 95.0);
     assert!(out.deesser_enabled, "condenser de-esser must be active");
@@ -153,7 +168,13 @@ fn golden_archetypes_at_macro_defaults() {
     assert_eq!(out.eq_gain_db[4], 1.0);
 
     // Headset: out == base at centre macros.
-    let out = MacroMapper::apply(&HEADSET, None, HEADSET.macro_defaults, PinSet::EMPTY, &DspParams::DEFAULT);
+    let out = MacroMapper::apply(
+        &HEADSET,
+        None,
+        HEADSET.macro_defaults,
+        PinSet::EMPTY,
+        &DspParams::DEFAULT,
+    );
     assert_eq!(out, HEADSET.base);
     assert_eq!(out.hpf_freq_hz, 100.0);
     assert_eq!(out.eq_freq_hz[0], 130.0);
@@ -189,16 +210,16 @@ fn half_position_reproduces_preset_base() {
 
 fn cal_strategy() -> impl Strategy<Value = Calibration> {
     (
-        -80.0f32..-20.0,   // noise_rms_db
-        -80.0f32..0.0,     // noise_peak_db
-        -60.0f32..-6.0,    // speech_rms_db
-        1.0f32..20.0,      // crest_db
-        -20.0f32..20.0,    // tilt_db
-        -24.0f32..24.0,    // derived input gain
-        -80.0f32..-20.0,   // derived gate threshold
-        0.0f32..=1.0,      // derived denoise mix
-        -50.0f32..-6.0,    // derived comp threshold
-        0.0f32..24.0,      // derived comp makeup
+        -80.0f32..-20.0, // noise_rms_db
+        -80.0f32..0.0,   // noise_peak_db
+        -60.0f32..-6.0,  // speech_rms_db
+        1.0f32..20.0,    // crest_db
+        -20.0f32..20.0,  // tilt_db
+        -24.0f32..24.0,  // derived input gain
+        -80.0f32..-20.0, // derived gate threshold
+        0.0f32..=1.0,    // derived denoise mix
+        -50.0f32..-6.0,  // derived comp threshold
+        0.0f32..24.0,    // derived comp makeup
     )
         .prop_map(
             |(nrms, npeak, srms, crest, tilt, gain, gate, mix, cthresh, makeup)| Calibration {
@@ -223,13 +244,14 @@ fn arch_strategy() -> impl Strategy<Value = Archetype> {
 }
 
 fn macros_strategy() -> impl Strategy<Value = MacroPositions> {
-    (0.0f32..=1.0, 0.0f32..=1.0, 0.0f32..=1.0, 0.0f32..=1.0)
-        .prop_map(|(purity, body, presence, leveler)| MacroPositions {
+    (0.0f32..=1.0, 0.0f32..=1.0, 0.0f32..=1.0, 0.0f32..=1.0).prop_map(|(purity, body, presence, leveler)| {
+        MacroPositions {
             purity,
             body,
             presence,
             leveler,
-        })
+        }
+    })
 }
 
 proptest! {
@@ -347,37 +369,75 @@ proptest! {
 
 #[test]
 fn boundaries_zero_and_one() {
-    let zero = MacroPositions { purity: 0.0, body: 0.0, presence: 0.0, leveler: 0.0 };
-    let one = MacroPositions { purity: 1.0, body: 1.0, presence: 1.0, leveler: 1.0 };
+    let zero = MacroPositions {
+        purity: 0.0,
+        body: 0.0,
+        presence: 0.0,
+        leveler: 0.0,
+    };
+    let one = MacroPositions {
+        purity: 1.0,
+        body: 1.0,
+        presence: 1.0,
+        leveler: 1.0,
+    };
 
     for a in ARCHETYPES {
         let def = builtin(a);
         let out = MacroMapper::apply(def, None, zero, PinSet::EMPTY, &DspParams::DEFAULT);
         all_params_in_spec(&out);
         // Full symmetry for the shelf; nothing cut into the mud, no presence boost.
-        assert!((out.eq_gain_db[0] - (def.base.eq_gain_db[0] - 4.0)).abs() < 1e-5, "{a:?} shelf min");
-        assert_eq!(out.eq_gain_db[1], def.base.eq_gain_db[1], "{a:?} mud stays at base at body=0");
+        assert!(
+            (out.eq_gain_db[0] - (def.base.eq_gain_db[0] - 4.0)).abs() < 1e-5,
+            "{a:?} shelf min"
+        );
+        assert_eq!(
+            out.eq_gain_db[1], def.base.eq_gain_db[1],
+            "{a:?} mud stays at base at body=0"
+        );
 
         let out = MacroMapper::apply(def, None, one, PinSet::EMPTY, &DspParams::DEFAULT);
         all_params_in_spec(&out);
-        assert!((out.eq_gain_db[0] - (def.base.eq_gain_db[0] + 4.0)).abs() < 1e-5, "{a:?} shelf max");
-        assert!((out.eq_gain_db[1] - (def.base.eq_gain_db[1] - 5.0)).abs() < 1e-5, "{a:?} mud max");
-        assert!((out.eq_gain_db[3] - (def.base.eq_gain_db[3] + 5.0)).abs() < 1e-5, "{a:?} peak max");
-        assert!((out.eq_gain_db[4] - (def.base.eq_gain_db[4] + 6.0)).abs() < 1e-5, "{a:?} air max");
+        assert!(
+            (out.eq_gain_db[0] - (def.base.eq_gain_db[0] + 4.0)).abs() < 1e-5,
+            "{a:?} shelf max"
+        );
+        assert!(
+            (out.eq_gain_db[1] - (def.base.eq_gain_db[1] - 5.0)).abs() < 1e-5,
+            "{a:?} mud max"
+        );
+        assert!(
+            (out.eq_gain_db[3] - (def.base.eq_gain_db[3] + 5.0)).abs() < 1e-5,
+            "{a:?} peak max"
+        );
+        assert!(
+            (out.eq_gain_db[4] - (def.base.eq_gain_db[4] + 6.0)).abs() < 1e-5,
+            "{a:?} air max"
+        );
         assert!(out.deesser_enabled, "{a:?} de-esser on at presence=1");
-        assert!((out.denoise_mix - (def.base.denoise_mix + 0.5).min(1.0)).abs() < 1e-5, "{a:?} mix max");
-        assert!((out.gate_threshold_db - (def.base.gate_threshold_db + 15.0)).abs() < 1e-5, "{a:?} gate max");
-        assert!((out.comp_ratio - (def.base.comp_ratio + 1.75)).abs() < 1e-5, "{a:?} ratio max");
-        assert!((out.comp_thresh_db - (def.base.comp_thresh_db - 10.0)).abs() < 1e-5, "{a:?} thresh min");
+        assert!(
+            (out.denoise_mix - (def.base.denoise_mix + 0.5).min(1.0)).abs() < 1e-5,
+            "{a:?} mix max"
+        );
+        assert!(
+            (out.gate_threshold_db - (def.base.gate_threshold_db + 15.0)).abs() < 1e-5,
+            "{a:?} gate max"
+        );
+        assert!(
+            (out.comp_ratio - (def.base.comp_ratio + 1.75)).abs() < 1e-5,
+            "{a:?} ratio max"
+        );
+        assert!(
+            (out.comp_thresh_db - (def.base.comp_thresh_db - 10.0)).abs() < 1e-5,
+            "{a:?} thresh min"
+        );
     }
 }
 
 #[test]
 fn deesser_curves_match_docs() {
     // Condenser base amount 3 dB: pure curve 3 → 8 dB over presence 0.6 → 1.0.
-    let pr = |p: f32| {
-        MacroPositions { presence: p, ..NEUTRAL }
-    };
+    let pr = |p: f32| MacroPositions { presence: p, ..NEUTRAL };
     let out = MacroMapper::apply(&CONDENSER, None, pr(0.6), PinSet::EMPTY, &DspParams::DEFAULT);
     assert!(out.deesser_enabled);
     assert!((out.deesser_amount_db - 3.0).abs() < 1e-5);
@@ -421,12 +481,26 @@ fn calibration_replaces_preset_values() {
     assert!(!out.comp_auto_makeup, "calibration supplies a verified manual makeup");
 
     // Purity/Leveler move relative to the calibrated anchors.
-    let m = MacroPositions { purity: 0.75, leveler: 0.75, ..NEUTRAL };
+    let m = MacroPositions {
+        purity: 0.75,
+        leveler: 0.75,
+        ..NEUTRAL
+    };
     let out = MacroMapper::apply(&DYNAMIC, Some(&cal), m, PinSet::EMPTY, &DspParams::DEFAULT);
-    assert!((out.gate_threshold_db - (-46.0 + 0.5 * 15.0)).abs() < 1e-4, "gate anchored on calibration");
-    assert!((out.comp_thresh_db - (-28.0 - 10.0 * 0.5)).abs() < 1e-4, "thresh anchored on calibration");
+    assert!(
+        (out.gate_threshold_db - (-46.0 + 0.5 * 15.0)).abs() < 1e-4,
+        "gate anchored on calibration"
+    );
+    assert!(
+        (out.comp_thresh_db - (-28.0 - 10.0 * 0.5)).abs() < 1e-4,
+        "thresh anchored on calibration"
+    );
     // 0.85 + 0.25 exceeds the SPECS max of 1.0 — clamped through SPECS.
-    assert!(out.denoise_mix >= 0.999999, "mix clamped at SPECS max: {}", out.denoise_mix);
+    assert!(
+        out.denoise_mix >= 0.999999,
+        "mix clamped at SPECS max: {}",
+        out.denoise_mix
+    );
 
     // Without calibration the same macros anchor on the preset base.
     let out = MacroMapper::apply(&DYNAMIC, None, m, PinSet::EMPTY, &DspParams::DEFAULT);
@@ -439,7 +513,12 @@ fn calibration_replaces_preset_values() {
 #[test]
 fn explain_rows_match_apply_and_pins() {
     let def = builtin(Archetype::Condenser);
-    let macros = MacroPositions { purity: 0.3, body: 0.7, presence: 0.65, leveler: 0.8 };
+    let macros = MacroPositions {
+        purity: 0.3,
+        body: 0.7,
+        presence: 0.65,
+        leveler: 0.8,
+    };
     let mut pins = PinSet::EMPTY;
     pins.pin(ParamId::EqGainDb(Band::B3));
 
@@ -451,8 +530,14 @@ fn explain_rows_match_apply_and_pins() {
     let mapped = MacroMapper::apply(def, None, macros, PinSet::EMPTY, &DspParams::DEFAULT);
     let base = def.base;
     for row in buf.rows() {
-        assert!((row.after - mapped.get(row.id)).abs() < f32::EPSILON, "after must equal the mapped value");
-        assert!((row.before - base.get(row.id)).abs() < f32::EPSILON, "before must equal the effective base");
+        assert!(
+            (row.after - mapped.get(row.id)).abs() < f32::EPSILON,
+            "after must equal the mapped value"
+        );
+        assert!(
+            (row.before - base.get(row.id)).abs() < f32::EPSILON,
+            "before must equal the effective base"
+        );
         assert_eq!(row.pinned, pins.is_pinned(row.id));
     }
     // Band-3 peak is pinned and reported as such.
@@ -488,7 +573,12 @@ fn apply_is_allocation_free() {
 #[test]
 fn apply_meets_time_budget() {
     let cal = cal_fixture();
-    let worst = MacroPositions { purity: 0.37, body: 0.68, presence: 0.91, leveler: 0.44 };
+    let worst = MacroPositions {
+        purity: 0.37,
+        body: 0.68,
+        presence: 0.91,
+        leveler: 0.44,
+    };
     // Warm up caches.
     for _ in 0..100 {
         let _ = MacroMapper::apply(&CONDENSER, Some(&cal), worst, PinSet::EMPTY, &DspParams::DEFAULT);
