@@ -617,8 +617,9 @@ fn nonexistent_device_fails_with_capture_error_and_clears_lease() {
 #[test]
 #[ignore = "opens the real default microphone for ~9 s"]
 fn real_mic_run_completes_in_about_9s() {
-    // A lease-honouring fake APO so bypass confirms immediately.
-    let (ctx, mut cfg) = spawn_ctx("realmic", true, None);
+    // A lease-honouring fake APO so bypass confirms immediately; the fake-APO
+    // thread and mapping live in `ctx` for the whole run.
+    let (_ctx, mut cfg) = spawn_ctx("realmic", true, None);
     // Real capture: `TINE_HW_IN` (or the system default input) at 48 kHz.
     let device = std::env::var("TINE_HW_IN").map_or_else(
         |_| tine_engine::audio_io::DeviceRef::Default,
