@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T06-worker) |
 | Lane | A — DSP (parallel with T07, T08) |
 | Depends on | T05 |
 | Unblocks | T09 |
