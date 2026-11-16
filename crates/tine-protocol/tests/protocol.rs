@@ -20,10 +20,10 @@ static ALLOC: AllocDisabler = AllocDisabler;
 
 #[test]
 fn param_id_index_round_trip() {
-    for i in 0..PARAM_COUNT {
+    for (i, spec) in SPECS.iter().enumerate() {
         let id = ParamId::from_index(i).expect("valid index");
         assert_eq!(id.index(), i);
-        assert_eq!(SPECS[i].id, id);
+        assert_eq!(spec.id, id);
     }
     assert_eq!(ParamId::from_index(PARAM_COUNT), None);
     assert_eq!(ParamId::from_index(usize::MAX), None);
@@ -36,7 +36,7 @@ fn dsp_params_get_set_round_trip() {
         let mid = match spec.id {
             ParamId::EqType(_) => 3.0, // Notch
             _ if spec.max - spec.min <= 1.0 && spec.step == 1.0 => 1.0,
-            _ => (spec.min + spec.max) * 0.5,
+            _ => f32::midpoint(spec.min, spec.max),
         };
         p.set(spec.id, mid);
         let got = p.get(spec.id);
@@ -70,7 +70,7 @@ fn dsp_params_clamped_handles_nan_inf_and_oob() {
 proptest! {
     #[test]
     fn proptest_set_always_stays_in_range(idx in 0usize..PARAM_COUNT, val in proptest::num::f32::ANY) {
-        let id = ParamId::from_index(idx).unwrap();
+        let id = ParamId::from_index(idx).expect("valid param index");
         let spec = id.spec();
         let mut p = DspParams::DEFAULT;
         p.set(id, val);
@@ -134,25 +134,32 @@ fn shm_name_sanitizes_and_nul_terminates() {
 struct AlignedShmBuf([u8; size_of::<ShmLayout>()]);
 
 #[test]
+#[allow(clippy::large_stack_arrays, clippy::cast_ptr_alignment)]
 fn shm_layout_validation_rejects_invalid_and_accepts_valid() {
-    let mut buf = Box::new(AlignedShmBuf([0u8; size_of::<ShmLayout>()]));
-    let ptr = buf.0.as_mut_ptr();
-    let len = buf.0.len();
+    let mut buf = vec![0u8; size_of::<ShmLayout>() + 64];
+    let raw_ptr = buf.as_mut_ptr();
+    let align_offset = raw_ptr.align_offset(align_of::<AlignedShmBuf>());
+    // SAFETY: `buf` has 64 bytes of slack, so `raw_ptr.add(align_offset)` is within bounds and 64-byte aligned.
+    let ptr = unsafe { raw_ptr.add(align_offset) };
+    let len = size_of::<ShmLayout>();
 
     // Null pointer
     assert_eq!(
+        // SAFETY: testing null pointer rejection in `layout_from_ptr`.
         unsafe { layout_from_ptr(std::ptr::null_mut(), len) }.err(),
         Some(ShmError::NullPointer)
     );
 
     // Unaligned pointer
     assert_eq!(
+        // SAFETY: testing unaligned pointer rejection in `layout_from_ptr`.
         unsafe { layout_from_ptr(ptr.add(1), len - 1) }.err(),
         Some(ShmError::Unaligned)
     );
 
     // Too small
     assert_eq!(
+        // SAFETY: testing undersized buffer rejection in `layout_from_ptr`.
         unsafe { layout_from_ptr(ptr, len - 64) }.err(),
         Some(ShmError::TooSmall {
             actual: len - 64,
@@ -161,11 +168,13 @@ fn shm_layout_validation_rejects_invalid_and_accepts_valid() {
     );
 
     // Bad magic (zeroed buffer)
+    // SAFETY: `ptr` is valid and aligned for `ShmLayout` over `len` bytes.
     assert_eq!(unsafe { layout_from_ptr(ptr, len) }.err(), Some(ShmError::BadMagic(0)));
 
     // Initialize properly
     let mut init_params = DspParams::DEFAULT;
     init_params.hpf_freq_hz = 110.0;
+    // SAFETY: `ptr` is valid, 64-byte aligned, and spans `len` bytes.
     let layout =
         unsafe { init_layout_in_place(ptr, len, *b"tine-test-0.1.0\0", 48_000, 2, &init_params).expect("valid init") };
     assert_eq!(layout.header.magic, SHM_MAGIC);
@@ -173,6 +182,7 @@ fn shm_layout_validation_rejects_invalid_and_accepts_valid() {
     assert_eq!(layout.header.sample_rate.load(Ordering::Relaxed), 48_000);
     assert_eq!(layout.header.channels.load(Ordering::Relaxed), 2);
 
+    // SAFETY: `ptr` was just initialized by `init_layout_in_place`.
     let validated = unsafe { layout_from_ptr(ptr, len) }.expect("valid layout");
     let mut last_gen = 0;
     let mut read_params = DspParams::DEFAULT;
@@ -180,12 +190,13 @@ fn shm_layout_validation_rejects_invalid_and_accepts_valid() {
     assert_eq!(read_params.hpf_freq_hz, 110.0);
 
     // Wrong version
-    // SAFETY: `ptr` is aligned and valid; we overwrite `layout_version` at offset 8 for negative test.
+    // SAFETY: `ptr` is 64-byte aligned and valid; we overwrite `layout_version` at offset 8 for negative test.
     unsafe {
         let ver_ptr = ptr.add(8).cast::<u32>();
         *ver_ptr = 999;
     }
     assert_eq!(
+        // SAFETY: `ptr` is valid and aligned for `ShmLayout` over `len` bytes.
         unsafe { layout_from_ptr(ptr, len) }.err(),
         Some(ShmError::VersionMismatch {
             actual: 999,

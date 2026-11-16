@@ -6,14 +6,14 @@
 | T02 | Spike (go/no-go): Rust APO on a capture endpoint | B — Windows / APO | done (NO-GO → D-018) | `task/T02-apo-spike` | #4 | T02-worker |
 | T03 | Spike: Rune windowless app, tray, GPU release, memory | C — Engine / App | done | `task/T03-rune-spike` | #3 | T03-worker |
 | T04 | `tine-protocol`: params, lock-free primitives, shm layout | 0 — Foundation | done | `task/T04-protocol` | #5 | T04-worker |
-| T05 | DSP primitives, test/bench harness, `DspPipeline` skeleton | 0 — Foundation | in-progress | `task/T05-dsp-foundation` | — | T05-worker |
-| T06 | Stage 1–2: gain/DC/HPF, RNNoise + expander | A — DSP | todo | — | — | — |
-| T07 | Stage 3–4: 5-band EQ, split-band de-esser | A — DSP | todo | — | — | — |
-| T08 | Stage 5–6: compressor, lookahead limiter | A — DSP | todo | — | — | — |
+| T05 | DSP primitives, test/bench harness, `DspPipeline` skeleton | 0 — Foundation | done | `task/T05-dsp-foundation` | #7 | T05-worker |
+| T06 | Stage 1–2: gain/DC/HPF, RNNoise + expander | A — DSP | in-progress | `task/T06-dsp-cleanup` | — | T06-worker |
+| T07 | Stage 3–4: 5-band EQ, split-band de-esser | A — DSP | in-progress | `task/T07-dsp-tone` | — | T07-worker |
+| T08 | Stage 5–6: compressor, lookahead limiter | A — DSP | in-progress | `task/T08-dsp-dynamics` | — | T08-worker |
 | T09 | Wire stages, fixtures, golden regression, perf gate | A — DSP | todo | — | — | — |
 | T10 | Archetype presets + `MacroMapper` | A — DSP | todo | — | — | — |
 | T11 | `AutoCalibrator` | A — DSP | todo | — | — | — |
-| T12 | cpal audio I/O module + `tine-devhost` | C — Engine / App | todo | — | — | — |
+| T12 | cpal audio I/O module + `tine-devhost` | C — Engine / App | in-progress | `task/T12-audio-io` | — | T12-worker |
 | T13 | `tine_apo.dll` production APO | B — Windows / APO | todo | — | — | — |
 | T14 | APO install / health / repair / uninstall | B — Windows / APO | todo | — | — | — |
 | T15 | Engine core: shm client, controller, persistence, devices | C — Engine / App | todo | — | — | — |
