@@ -48,7 +48,7 @@ if /I "%~1"=="--dry-run" (
 
 echo === Tine APO Spike Recovery ===
 echo Stopping Windows Audio service...
-sc stop audiosrv >nul 2>&1
+net stop audiosrv /y >nul 2>&1
 timeout /t 2 /nobreak >nul
 
 echo Removing spike CLSID registration...
@@ -71,6 +71,6 @@ if exist "%BACKUP%" (
 )
 
 echo Starting Windows Audio service...
-sc start audiosrv >nul 2>&1
+net start audiosrv >nul 2>&1
 echo === Recovery complete ===
 endlocal

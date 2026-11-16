@@ -49,6 +49,7 @@ const PKEY_MFX_CLSID: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},6";
 const PKEY_EFX_CLSID: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},7";
 const PKEY_SFX_MODES: &str = "{d3993a3f-99c2-4402-b5ec-a92a0367664b},5";
 const PKEY_MFX_MODES: &str = "{d3993a3f-99c2-4402-b5ec-a92a0367664b},6";
+const PKEY_EFX_MODES: &str = "{d3993a3f-99c2-4402-b5ec-a92a0367664b},7";
 const PKEY_DISABLE_SYSFX: &str = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},5";
 
 const INSTALL_DIR: &str = r"C:\Program Files\TineSpike";
@@ -558,6 +559,7 @@ fn cmd_install(endpoint_id: &str, slot: &str) -> Result<(), String> {
         }
         "efx" => {
             reg_set_sz(h_fx, Some(PKEY_EFX_CLSID), CLSID_STR)?;
+            reg_set_multi_sz(h_fx, PKEY_EFX_MODES, &[MODE_DEFAULT_STR])?;
         }
         other => {
             unsafe {
@@ -700,14 +702,12 @@ struct IPolicyConfigVtbl {
 
 fn cmd_reload(endpoint_id: &str, use_service: bool) -> Result<(), String> {
     if use_service {
-        println!("Restarting audiosrv...");
-        let _ = Command::new("sc").args(["stop", "audiosrv"]).status();
-        thread::sleep(Duration::from_secs(2));
-        let status = Command::new("sc")
-            .args(["start", "audiosrv"])
+        println!("Restarting audiosrv (Restart-Service audiosrv -Force)...");
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Restart-Service audiosrv -Force"])
             .status()
-            .map_err(|e| format!("sc start audiosrv: {e}"))?;
-        println!("sc start audiosrv exited with {status}");
+            .map_err(|e| format!("Restart-Service audiosrv: {e}"))?;
+        println!("Restart-Service audiosrv exited with {status}");
         return Ok(());
     }
 
