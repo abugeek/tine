@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T08-worker) |
 | Lane | A — DSP (parallel with T06, T07) |
 | Depends on | T05 |
 | Unblocks | T09, T11 (calibrator uses the static curve) |
