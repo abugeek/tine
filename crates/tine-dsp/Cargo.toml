@@ -23,6 +23,9 @@ hound.workspace = true
 proptest.workspace = true
 realfft.workspace = true
 serde_json.workspace = true
+# Test-only: JSON schema types (Preset/EndpointProfile) + serde derives on Calibration.
+# Never enabled for the library target, so tine-dsp itself still has zero serde dependency.
+tine-protocol = { workspace = true, features = ["serde"] }
 
 [[bench]]
 name = "pipeline"
