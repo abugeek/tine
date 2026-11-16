@@ -297,6 +297,14 @@ impl Shell {
         match std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| {
             std::process::Command::new(exe)
                 .arg("--ui")
+                // The window child is a GUI app: it must not inherit the
+                // parent's stdio. The parent may carry exotic pipe handles
+                // (service-like launch contexts), which make `spawn` fail
+                // with `ERROR_NOT_SUPPORTED`; the child logs to the shared
+                // file sink, so null stdio is both safe and more robust.
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .map_err(|e| e.to_string())
         }) {
