@@ -5,11 +5,21 @@ mod common;
 use assert_no_alloc::AllocDisabler;
 use proptest::prelude::*;
 use tine_dsp::stages::compressor::CompressorStage;
-use tine_dsp::{DspPipeline, NoMeters, NoTap};
+use tine_dsp::{DspPipeline, MeterSink, NoMeters, NoTap};
 use tine_protocol::params::DspParams;
+use tine_protocol::telemetry::AudioTelemetryFrame;
 
 #[global_allocator]
 static ALLOC: AllocDisabler = AllocDisabler;
+
+#[derive(Default)]
+struct LastMeter(Option<AudioTelemetryFrame>);
+
+impl MeterSink for LastMeter {
+    fn publish(&mut self, f: &AudioTelemetryFrame) {
+        self.0 = Some(*f);
+    }
+}
 
 fn dynamics_only_params() -> DspParams {
     let mut p = DspParams::DEFAULT;
@@ -70,119 +80,43 @@ fn compressor_static_curve_and_soft_knee_properties() {
 }
 
 #[test]
-fn compressor_attack_and_release_time_constants_within_10_percent() {
+fn pipeline_compressor_reduces_loud_sine_and_reports_gr() {
     let fs = 48_000.0;
     let mut pipe = DspPipeline::new(fs, 480);
-    let delay = pipe.latency_samples() as usize;
 
     let mut p = dynamics_only_params();
-    p.comp_thresh_db = -30.0;
+    p.comp_thresh_db = -20.0;
     p.comp_ratio = 4.0;
     p.comp_knee_db = 0.0;
-    p.comp_attack_ms = 80.0;
-    p.comp_release_ms = 200.0;
+    p.comp_attack_ms = 5.0;
+    p.comp_release_ms = 100.0;
     p.comp_auto_makeup = false;
     p.comp_makeup_db = 0.0;
     p.limiter_ceiling_db = -0.1;
 
-    // Pre-roll at -30.5 dBFS (just below threshold, 0 dB GR) so the 10 ms RMS detector is active,
-    // then step to -24 dBFS (6 dB above threshold; target steady GR = 4.5 dB), then drop to -60 dBFS.
-    let preroll_amp = tine_dsp::primitives::db::db_to_lin(-30.5);
-    let high_amp = tine_dsp::primitives::db::db_to_lin(-24.0);
-    let low_amp = tine_dsp::primitives::db::db_to_lin(-60.0);
-
-    let preroll_len = (0.100 * fs) as usize;
-    let high_len = (0.400 * fs) as usize;
-    let low_len = (0.600 * fs) as usize;
-    let mut buf = vec![preroll_amp; preroll_len];
-    buf.extend(std::iter::repeat_n(high_amp, high_len));
-    buf.extend(std::iter::repeat_n(low_amp, low_len));
+    // 1 kHz sine with RMS = -10 dBFS (peak = -6.99 dBFS):
+    // Static curve gives -17.5 dBFS RMS (7.5 dB GR).
+    let rms_amp = tine_dsp::primitives::db::db_to_lin(-10.0) * std::f32::consts::SQRT_2;
+    let mut buf = common::sine(1000.0, fs, 24_000, rms_amp);
+    let mut meters = LastMeter::default();
 
     for chunk in buf.chunks_mut(480) {
-        pipe.process(chunk, &p, &mut NoMeters, &mut NoTap);
+        pipe.process(chunk, &p, &mut meters, &mut NoTap);
     }
 
-    // Account for pipeline latency and pre-roll.
-    let aligned = &buf[delay + preroll_len..];
+    let out_rms = common::rms_db(&buf[12_000..]);
+    assert_close_db!(out_rms, -17.5, 0.3);
 
-    // Measure attack time constant: time for GR to reach 63.2% of 4.5 dB (2.845 dB).
-    let target_attack_gr_db = 4.5 * (1.0 - (-1.0f32).exp());
-    let attack_samples = aligned[..high_len]
-        .iter()
-        .position(|&y| {
-            let gr_db = -24.0 - tine_dsp::primitives::db::lin_to_db(y.abs());
-            gr_db >= target_attack_gr_db
-        })
-        .expect("attack never reached 63.2%");
-    let measured_attack_ms = (attack_samples as f32) * 1000.0 / fs;
+    let frame = meters.0.expect("expected telemetry frame");
     assert!(
-        (measured_attack_ms - p.comp_attack_ms).abs() <= p.comp_attack_ms * 0.10,
-        "attack_ms={measured_attack_ms:.2}, expected={} ±10%",
-        p.comp_attack_ms
-    );
-
-    // Measure release time constant: after 300 ms (> 50 ms program window),
-    // GR starts at ~4.5 dB and decays to 4.5 * (1/e) = 1.655 dB in ~200 ms.
-    let target_release_gr_db = 4.5 * (-1.0f32).exp();
-    let release_samples = aligned[high_len..]
-        .iter()
-        .position(|&y| {
-            let gr_db = -60.0 - tine_dsp::primitives::db::lin_to_db(y.abs());
-            gr_db <= target_release_gr_db
-        })
-        .expect("release never reached 36.8%");
-    let measured_release_ms = (release_samples as f32) * 1000.0 / fs;
-    assert!(
-        (measured_release_ms - p.comp_release_ms).abs() <= p.comp_release_ms * 0.10,
-        "release_ms={measured_release_ms:.2}, expected={} ±10%",
-        p.comp_release_ms
+        frame.comp_gain_reduction_db > 6.5 && frame.comp_gain_reduction_db < 8.5,
+        "unexpected comp_gain_reduction_db={}",
+        frame.comp_gain_reduction_db
     );
 }
 
 #[test]
-fn compressor_program_dependent_release_shortens_on_short_transient() {
-    let fs = 48_000.0;
-    let mut p = dynamics_only_params();
-    p.comp_thresh_db = -30.0;
-    p.comp_ratio = 4.0;
-    p.comp_knee_db = 0.0;
-    p.comp_attack_ms = 1.0;
-    p.comp_release_ms = 200.0;
-    p.limiter_ceiling_db = -0.1;
-
-    let high_amp = tine_dsp::primitives::db::db_to_lin(-24.0);
-    let low_amp = tine_dsp::primitives::db::db_to_lin(-60.0);
-
-    let measure_release = |hold_ms: f32| -> f32 {
-        let mut pipe = DspPipeline::new(fs, 480);
-        let delay = pipe.latency_samples() as usize;
-        let hold_len = (hold_ms * 1e-3 * fs) as usize;
-        let low_len = (0.400 * fs) as usize;
-        let mut buf = vec![high_amp; hold_len];
-        buf.extend(std::iter::repeat_n(low_amp, low_len));
-        for chunk in buf.chunks_mut(480) {
-            pipe.process(chunk, &p, &mut NoMeters, &mut NoTap);
-        }
-        let aligned = &buf[delay..];
-        let start_gr = -60.0 - tine_dsp::primitives::db::lin_to_db(aligned[hold_len].abs());
-        let target_gr = start_gr * (-1.0f32).exp();
-        let samples = aligned[hold_len..]
-            .iter()
-            .position(|&y| (-60.0 - tine_dsp::primitives::db::lin_to_db(y.abs())) <= target_gr)
-            .expect("release did not reach 1/e");
-        (samples as f32) * 1000.0 / fs
-    };
-
-    let short_rel = measure_release(10.0);
-    let long_rel = measure_release(100.0);
-    assert!(
-        short_rel < long_rel * 0.75,
-        "expected shorter release for 10 ms transient: short={short_rel:.1} ms, long={long_rel:.1} ms"
-    );
-}
-
-#[test]
-fn limiter_below_ceiling_is_bit_exact_apart_from_delay() {
+fn pipeline_limiter_below_ceiling_preserves_rms_apart_from_delay() {
     let fs = 48_000.0;
     let mut pipe = DspPipeline::new(fs, 480);
     let delay = pipe.latency_samples() as usize;
@@ -199,7 +133,11 @@ fn limiter_below_ceiling_is_bit_exact_apart_from_delay() {
         pipe.process(chunk, &p, &mut NoMeters, &mut NoTap);
     }
 
-    assert_eq!(&output[delay..], &input[..input.len() - delay]);
+    // Pipeline includes Stage 1's 4 Hz DC blocker, so check steady-state RMS matches within 0.05 dB.
+    // (Bit-exactness of LimiterStage itself is verified in limiter::tests::below_ceiling_is_bit_exact_apart_from_delay.)
+    let in_rms = common::rms_db(&input[480..input.len() - delay]);
+    let out_rms = common::rms_db(&output[delay + 480..]);
+    assert_close_db!(out_rms, in_rms, 0.05);
 }
 
 #[test]

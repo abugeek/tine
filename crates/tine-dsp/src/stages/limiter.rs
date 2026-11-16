@@ -313,4 +313,26 @@ mod tests {
         #[cfg(debug_assertions)]
         assert_eq!(limiter.safety_clamp_count(), 0, "safety clamp engaged!");
     }
+
+    #[test]
+    fn below_ceiling_is_bit_exact_apart_from_delay() {
+        let fs = 48_000.0;
+        let mut limiter = LimiterStage::new();
+        limiter.prepare(fs, 480);
+        let delay = limiter.latency() as usize;
+        assert!(delay >= 72);
+
+        let mut p = DspParams::DEFAULT;
+        p.limiter_ceiling_db = -1.0;
+        p.limiter_true_peak = false;
+        let mut meters = StageMeters::default();
+
+        let w = 2.0 * core::f32::consts::PI * 440.0 / fs;
+        let input: alloc::vec::Vec<f32> = (0..4800).map(|n| 0.5 * (w * (n as f32)).sin()).collect();
+        let mut output = input.clone();
+        for chunk in output.chunks_mut(480) {
+            limiter.process(chunk, &p, &mut meters);
+        }
+        assert_eq!(&output[delay..], &input[..input.len() - delay]);
+    }
 }

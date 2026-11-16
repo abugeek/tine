@@ -339,4 +339,107 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn attack_and_release_time_constants_within_10_percent() {
+        let fs = 48_000.0;
+        let mut comp = CompressorStage::new();
+        comp.prepare(fs, 480);
+
+        let mut p = DspParams::DEFAULT;
+        p.comp_enabled = true;
+        p.comp_thresh_db = -30.0;
+        p.comp_ratio = 4.0;
+        p.comp_knee_db = 0.0;
+        p.comp_attack_ms = 80.0;
+        p.comp_release_ms = 200.0;
+        p.comp_auto_makeup = false;
+        p.comp_makeup_db = 0.0;
+
+        let preroll_amp = db_to_lin(-30.5);
+        let high_amp = db_to_lin(-24.0); // 6 dB above -30 -> steady GR = 4.5 dB
+        let low_amp = db_to_lin(-60.0);
+
+        let preroll_len = (0.100 * fs) as usize;
+        let high_len = (0.400 * fs) as usize;
+        let low_len = (0.600 * fs) as usize;
+        let mut buf = alloc::vec![preroll_amp; preroll_len];
+        buf.extend(core::iter::repeat_n(high_amp, high_len));
+        buf.extend(core::iter::repeat_n(low_amp, low_len));
+
+        let mut meters = StageMeters::default();
+        for chunk in buf.chunks_mut(480) {
+            comp.process(chunk, &p, &mut meters);
+        }
+
+        let high_slice = &buf[preroll_len..preroll_len + high_len];
+        let target_attack_gr = 4.5 * (1.0 - (-1.0f32).exp());
+        let attack_samples = high_slice
+            .iter()
+            .position(|&y| (-24.0 - lin_to_db(y.abs())) >= target_attack_gr)
+            .expect("attack never reached 63.2%");
+        let measured_attack_ms = (attack_samples as f32) * 1000.0 / fs;
+        assert!(
+            (measured_attack_ms - p.comp_attack_ms).abs() <= p.comp_attack_ms * 0.10,
+            "attack_ms={measured_attack_ms:.2}, expected={} ±10%",
+            p.comp_attack_ms
+        );
+
+        let low_slice = &buf[preroll_len + high_len..];
+        let target_release_gr = 4.5 * (-1.0f32).exp();
+        let release_samples = low_slice
+            .iter()
+            .position(|&y| (-60.0 - lin_to_db(y.abs())) <= target_release_gr)
+            .expect("release never reached 36.8%");
+        let measured_release_ms = (release_samples as f32) * 1000.0 / fs;
+        assert!(
+            (measured_release_ms - p.comp_release_ms).abs() <= p.comp_release_ms * 0.10,
+            "release_ms={measured_release_ms:.2}, expected={} ±10%",
+            p.comp_release_ms
+        );
+    }
+
+    #[test]
+    fn program_dependent_release_shortens_on_short_transient() {
+        let fs = 48_000.0;
+        let mut p = DspParams::DEFAULT;
+        p.comp_enabled = true;
+        p.comp_thresh_db = -30.0;
+        p.comp_ratio = 4.0;
+        p.comp_knee_db = 0.0;
+        p.comp_attack_ms = 1.0;
+        p.comp_release_ms = 200.0;
+        p.comp_auto_makeup = false;
+        p.comp_makeup_db = 0.0;
+
+        let high_amp = db_to_lin(-24.0);
+        let low_amp = db_to_lin(-60.0);
+
+        let measure_release = |hold_ms: f32| -> f32 {
+            let mut comp = CompressorStage::new();
+            comp.prepare(fs, 480);
+            let hold_len = (hold_ms * 1e-3 * fs) as usize;
+            let low_len = (0.400 * fs) as usize;
+            let mut buf = alloc::vec![high_amp; hold_len];
+            buf.extend(core::iter::repeat_n(low_amp, low_len));
+            let mut meters = StageMeters::default();
+            for chunk in buf.chunks_mut(480) {
+                comp.process(chunk, &p, &mut meters);
+            }
+            let start_gr = -60.0 - lin_to_db(buf[hold_len].abs());
+            let target_gr = start_gr * (-1.0f32).exp();
+            let samples = buf[hold_len..]
+                .iter()
+                .position(|&y| (-60.0 - lin_to_db(y.abs())) <= target_gr)
+                .expect("release did not reach 1/e");
+            (samples as f32) * 1000.0 / fs
+        };
+
+        let short_rel = measure_release(10.0);
+        let long_rel = measure_release(100.0);
+        assert!(
+            short_rel < long_rel * 0.75,
+            "expected shorter release for 10 ms transient: short={short_rel:.1} ms, long={long_rel:.1} ms"
+        );
+    }
 }
