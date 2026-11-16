@@ -220,10 +220,9 @@ mod tests {
         let start = std::time::Instant::now();
         // Warm-up (buffers fill, drift control settles), then the soak.
         std::thread::sleep(std::time::Duration::from_secs(2));
-        let mut last_stats = monitor.stats();
         while start.elapsed() < std::time::Duration::from_secs(secs) {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            last_stats = monitor.stats();
+            let last_stats = monitor.stats();
             assert!(!last_stats.stream_lost, "stream lost during soak: {last_stats:?}");
         }
 
