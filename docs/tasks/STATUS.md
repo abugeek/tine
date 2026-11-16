@@ -13,9 +13,9 @@
 | T09 | Wire stages, fixtures, golden regression, perf gate | A — DSP | todo | — | — | — |
 | T10 | Archetype presets + `MacroMapper` | A — DSP | todo | — | — | — |
 | T11 | `AutoCalibrator` | A — DSP | todo | — | — | — |
-| T12 | cpal audio I/O module + `tine-devhost` | C — Engine / App | in-progress | `task/T12-audio-io` | — | T12-worker |
-| T13 | `tine_apo.dll` production APO | B — Windows / APO | todo | — | — | — |
-| T14 | APO install / health / repair / uninstall | B — Windows / APO | todo | — | — | — |
+| T12 | cpal audio I/O module + `tine-devhost` | C — Engine / App | done | `task/T12-audio-io` | #9 | T12-worker |
+| T13 | Virtual-cable DSP routing loop (`D-018`) | B — Virtual Cable | in-progress | `task/T13-virtual-cable` | — | T13-worker |
+| T14 | Virtual cable discovery, DeviceWatcher & endpoint admin (`D-018`) | B — Virtual Cable | in-progress | `task/T14-endpoint-admin` | — | T14-worker |
 | T15 | Engine core: shm client, controller, persistence, devices | C — Engine / App | todo | — | — | — |
 | T16 | Engine audio services: spectrum, Auto-Tune runner, Hear Myself | C — Engine / App | todo | — | — | — |
 | T17 | `tine.exe` shell: Rune App, tray, single instance, CLI, logging | C — Engine / App | todo | — | — | — |
