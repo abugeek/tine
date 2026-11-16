@@ -4,7 +4,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | done |
 | Lane | B — Virtual Cable Routing (was Windows / APO) |
 | Depends on | T12 |
 | Unblocks | T15, T21, T23 |
@@ -29,9 +29,9 @@ pub struct DeviceWatcher; // IMMNotificationClient -> channel of DeviceEvent { A
 ```
 
 ## Steps
-- [ ] `win.rs`: RAII wrappers (`ComInit`, `CoTaskMem`, `PropVariant`, `HANDLE`), `IMMDeviceEnumerator` helpers, `PKEY_AudioEndpoint_FormFactor` -> `Archetype` suggestion (Headset/Headphones -> Headset; Microphone built-in -> Laptop; USB mic -> Dynamic/Condenser).
-- [ ] `apo_admin.rs`: implement `list_capture_endpoints()`, `find_virtual_cable_sink()` (scanning WASAPI render endpoints for `CABLE Input` / `VB-Audio` / `Virtual Audio`), `health()`, and `DeviceWatcher`.
-- [ ] Ensure non-elevated execution (no HKLM writes, no UAC prompts).
+- [x] `win.rs`: RAII wrappers (`ComInit`, `CoTaskMem`, `PropVariant`, `HANDLE`), `IMMDeviceEnumerator` helpers, `PKEY_AudioEndpoint_FormFactor` -> `Archetype` suggestion (Headset/Headphones -> Headset; Microphone built-in -> Laptop; USB mic -> Dynamic/Condenser).
+- [x] `apo_admin.rs`: implement `list_capture_endpoints()`, `find_virtual_cable_sink()` (scanning WASAPI render endpoints for `CABLE Input` / `VB-Audio` / `Virtual Audio`), `health()`, and `DeviceWatcher`.
+- [x] Ensure non-elevated execution (no HKLM writes, no UAC prompts).
 
 ## Acceptance criteria
 - Enumerates live capture endpoints with accurate form-factor -> `Archetype` suggestions.
@@ -42,3 +42,14 @@ pub struct DeviceWatcher; // IMMNotificationClient -> channel of DeviceEvent { A
 ```bash
 cargo test -p tine-engine apo_admin
 ```
+
+## Result
+- Implemented `crates/tine-engine/src/win.rs` with RAII Win32/COM wrappers (`ComInit`, `CoTaskMemPwstr`, `PropVariant`, `Handle`), `IMMDeviceEnumerator` endpoint enumeration (`enumerate_endpoints`), `FormFactor` + `suggest_archetype` mapping, and `ComDeviceWatcher` (`IMMNotificationClient` on a dedicated MTA thread with clean `Drop` unregistration).
+- Implemented `crates/tine-engine/src/apo_admin.rs` (100% safe Rust, zero `unsafe`) with `list_capture_endpoints()`, `find_virtual_cable_sink()`, `health()`, `DeviceWatcher`, `ApoState`, `ApoError`, `CaptureEndpoint`, and `VirtualSinkInfo`.
+- All operations run non-elevated with zero UAC prompts and zero HKLM writes.
+- Verification results:
+  - `cargo fmt --all --check`: pass
+  - `cargo clippy --workspace --all-targets -- -D warnings`: pass
+  - `cargo test -p tine-engine` / `cargo test -p tine-engine apo_admin`: 6/6 unit tests pass in 0.01s (including live Windows endpoint enumeration, `health()`, and `DeviceWatcher` start/drop); `audio_io_rt` 3/3 integration tests pass in 2.29s.
+  - `cargo deny check`: pass (`advisories ok, bans ok, licenses ok, sources ok`).
+  - Note: `cargo test --workspace` showed 3 pre-existing failures in `tine-dsp --test pipeline` (`nan_injection_latches_passthrough_and_reset_clears`, `skeleton_is_bit_exact_passthrough`, `bypass_toggle_has_no_step_above_minus_60_dbfs`) on `main`, unrelated to T14.
