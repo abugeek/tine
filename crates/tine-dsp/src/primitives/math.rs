@@ -203,7 +203,7 @@ mod tests {
             assert!(err10 < 1e-13, "log10_f64({x}) err={err10}");
         }
         for i in -200..=200 {
-            let x = (i as f64) * 0.05;
+            let x = f64::from(i) * 0.05;
             let (s, c) = sin_cos_f64(x);
             assert!((s - x.sin()).abs() < 1e-13, "sin({x})");
             assert!((c - x.cos()).abs() < 1e-13, "cos({x})");

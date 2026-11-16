@@ -156,7 +156,7 @@ fn harness_measurements_and_wav_roundtrip() {
     assert!(common::thd_db(&s, 1000.0, fs) < -70.0);
 
     let fft = common::fft_magnitude_db(&s);
-    assert!(!fft.is_empty());
+    assert_eq!(fft.len(), s.len() / 2 + 1);
 
     let tmp = std::env::temp_dir().join("tine_dsp_harness_test.wav");
     common::write_wav_mono(&tmp, &s, 48_000);
