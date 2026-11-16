@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: tine-worker) |
 | Lane | A — DSP |
 | Depends on | T09 |
 | Unblocks | T11, T15, T19 |
