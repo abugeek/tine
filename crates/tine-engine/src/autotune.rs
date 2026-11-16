@@ -17,14 +17,13 @@
 //!                                                                    the Controller
 //! ```
 //!
-//! # T11 adapter
-//! `tine_dsp::calibrator` is not on `main` yet (task T11 in flight). Until it
-//! merges, this module hosts a **mirror** of the documented T11 data surface
-//! ([`CalPhase`], [`CalProgress`], [`CalFailure`], [`CalibrationReport`]) and
-//! the narrow [`Calibrator`] trait, marked `TODO(T11)`. When T11 lands, the
-//! mirror re-exports the real types and a `Calibrator for AutoCalibrator`
-//! impl replaces the factory; the runner logic is unaffected (the flip plan
-//! lives in the task file's `## Result` and in `tests/autotune.rs`).
+//! # Calibrator wiring
+//! The runner drives the real [`tine_dsp::calibrator::AutoCalibrator`] (T11,
+//! merged as 08c4914) through the thin [`Calibrator`] /
+//! [`CalibratorFactory`] seam — the seam exists so offline tests can script
+//! capture outcomes without a microphone. [`AutoCalibratorFactory`] is the
+//! production factory, and the T11 data types are re-exported here for
+//! T17/T20 (their shape is frozen by the T11 contract).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,11 +32,14 @@ use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
+use tine_dsp::calibrator::{AutoCalibrator, CHANGED_PARAM_COUNT};
 use tine_dsp::presets::PresetDef;
-use tine_protocol::params::{DspParams, ParamId};
-use tine_protocol::presets::{Calibration, MacroPositions, PinSet};
+use tine_protocol::params::DspParams;
+use tine_protocol::presets::{MacroPositions, PinSet};
 use tine_protocol::sync::SpscRing;
 use tine_protocol::telemetry::flags;
+
+pub use tine_dsp::calibrator::{CalFailure, CalPhase, CalProgress, CalibrationReport};
 
 use crate::audio_io::{AudioIoError, DeviceRef, open_capture};
 use crate::controller::{Command, ControllerHandle};
@@ -63,99 +65,18 @@ pub const BYPASS_CONFIRM_TIMEOUT_MS: u64 = 2_000;
 /// thread (consumer): 16,384 samples ≈ 341 ms at 48 kHz.
 pub const CAPTURE_RING: usize = 16_384;
 
-/// Number of calibration-driven parameter changes in a [`CalibrationReport`].
-pub const CAL_CHANGES: usize = 5;
+/// Number of calibration-driven parameter changes in a [`CalibrationReport`]
+/// (tracks T11's [`CHANGED_PARAM_COUNT`] — the five derived parameters).
+pub const CAL_CHANGES: usize = CHANGED_PARAM_COUNT;
 
-// ---------------------------------------------------------------------------
-// T11 mirror (TODO(T11): replace with `pub use tine_dsp::calibrator::*`)
-// ---------------------------------------------------------------------------
+const _: () = assert!(CAL_CHANGES == 5);
 
-/// Calibration wizard phase.
+/// The two operations the runner needs from the calibration state machine:
+/// `push` (streaming audio in, live state out) and `finish` (analysis
+/// inputs, report or failure out) — exactly the frozen T11 surface.
 ///
-/// TODO(T11): re-export `tine_dsp::calibrator::CalPhase` when it merges.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CalPhase {
-    /// Initial grace second (audio discarded).
-    Countdown,
-    /// Room-noise capture (3 s).
-    Noise,
-    /// Voice capture (5 s).
-    Voice,
-    /// Capture complete; results being verified.
-    Analyzing,
-    /// Report ready (terminal).
-    Done,
-    /// Calibration failed (terminal).
-    Failed,
-}
-
-/// Live state of the calibrator, throttled to 30 Hz by the runner.
-///
-/// TODO(T11): re-export `tine_dsp::calibrator::CalProgress` when it merges.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CalProgress {
-    /// Current phase.
-    pub phase: CalPhase,
-    /// Progress within the current phase (`0..=1`).
-    pub phase_progress: f32,
-    /// Live input level in dBFS (wizard meter).
-    pub live_level_db: f32,
-    /// Accumulated voiced milliseconds (wizard feedback).
-    pub voiced_ms: u32,
-}
-
-/// Why a calibration could not complete.
-///
-/// TODO(T11): re-export `tine_dsp::calibrator::CalFailure` when it merges.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CalFailure {
-    /// The input never rose above the minimum level.
-    TooQuiet,
-    /// The room was too loud relative to the voice (SNR below 10 dB).
-    TooNoisy {
-        /// Measured signal-to-noise ratio in dB.
-        snr_db: f32,
-    },
-    /// The input clipped.
-    Clipping {
-        /// Percentage of samples at or above −0.3 dBFS.
-        pct: f32,
-    },
-    /// Not enough voiced audio was captured (< 1.5 s).
-    NotEnoughSpeech {
-        /// Accumulated voiced milliseconds.
-        voiced_ms: u32,
-    },
-    /// The required input gain lies outside the ±36 dB range.
-    GainOutOfRange {
-        /// Gain the pipeline would need in dB.
-        needed_db: f32,
-    },
-}
-
-/// A completed calibration: new base values plus simulated verification.
-///
-/// TODO(T11): re-export `tine_dsp::calibrator::CalibrationReport`; the array
-/// length then comes from T11's definition (expected: the five derived
-/// parameters).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CalibrationReport {
-    /// The persisted calibration base values.
-    pub calibration: Calibration,
-    /// Calibrated parameter changes as `(ParamId, old, new)` tuples.
-    pub changes: [(ParamId, f32, f32); CAL_CHANGES],
-    /// Simulated output peak (dBFS) with the new parameters.
-    pub simulated_peak_db: f32,
-    /// Simulated output RMS (dBFS) with the new parameters.
-    pub simulated_rms_db: f32,
-}
-
-/// Narrow adapter over the documented T11 `AutoCalibrator` API surface.
-///
-/// The runner only needs `push` (streaming audio in, live state out) and
-/// `finish` (analysis inputs, report or failure out) — the two operations the
-/// T11 contract freezes. TODO(T11): `impl Calibrator for
-/// tine_dsp::calibrator::AutoCalibrator` once T11 merges.
+/// Implemented by [`AutoCalibrator`] (production) and by scripted fakes in
+/// the integration tests.
 pub trait Calibrator: Send {
     /// Streams `samples` into the state machine; allocation-free by contract.
     fn push(&mut self, samples: &[f32]) -> CalProgress;
@@ -172,14 +93,36 @@ pub trait Calibrator: Send {
 
 /// Constructs a [`Calibrator`] once the capture's actual sample rate is known
 /// (after bypass confirmation, inside the runner thread).
-///
-/// TODO(T11): provide `AutoCalibratorFactory` building the real
-/// `tine_dsp::calibrator::AutoCalibrator::new(fs)`; until then callers inject
-/// their own (tests inject scripted fakes; T17 wires the real one when T11
-/// merges).
 pub trait CalibratorFactory: Send + Sync {
     /// Builds a calibrator for a capture running at `fs` Hz.
     fn make(&self, fs: f32) -> Box<dyn Calibrator>;
+}
+
+/// The production factory: builds the real
+/// [`tine_dsp::calibrator::AutoCalibrator`] for the negotiated capture rate.
+#[derive(Debug, Default)]
+pub struct AutoCalibratorFactory;
+
+impl CalibratorFactory for AutoCalibratorFactory {
+    fn make(&self, fs: f32) -> Box<dyn Calibrator> {
+        Box::new(AutoCalibrator::new(fs))
+    }
+}
+
+impl Calibrator for AutoCalibrator {
+    fn push(&mut self, samples: &[f32]) -> CalProgress {
+        AutoCalibrator::push(self, samples)
+    }
+
+    fn finish(
+        &mut self,
+        preset: &PresetDef,
+        macros: MacroPositions,
+        pins: PinSet,
+        current: &DspParams,
+    ) -> Result<CalibrationReport, CalFailure> {
+        AutoCalibrator::finish(self, preset, macros, pins, current)
+    }
 }
 
 // ---------------------------------------------------------------------------

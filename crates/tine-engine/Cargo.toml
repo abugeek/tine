@@ -44,6 +44,7 @@ windows = { workspace = true, features = [
 [dev-dependencies]
 realfft.workspace = true
 assert_no_alloc.workspace = true
+claxon.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

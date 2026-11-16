@@ -1,11 +1,10 @@
 //! Auto-Tune runner integration tests: the full state machine against a
 //! session-local mapping standing in for the APO, a lease-tracking fake-APO
-//! thread, an offline fixture capture, and a scripted calibrator.
-//!
-//! TODO(T11) flip plan: when `tine_dsp::calibrator` merges, `ScriptedCalibrator`
-//! is replaced by `AutoCalibrator::new(fs)` via `Calibrator` /
-//! `CalibratorFactory`, and the fixture audio becomes `tine-dsp`'s
-//! calibration fixtures; the assertions below do not change.
+//! thread, and offline fixture captures — driven either through the scripted
+//! calibrator (phase/lease/dispatch semantics without DSP math) or through
+//! the real `tine_dsp::calibrator::AutoCalibrator` with the shared
+//! `noisy_quiet` fixture (T11 acceptance semantics, end to end through the
+//! Controller).
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -13,10 +12,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::path::PathBuf;
+
+use tine_dsp::calibrator::{PEAK_TARGET_HIGH_DB, PEAK_TARGET_LOW_DB, TARGET_SPEECH_RMS_DB};
 use tine_dsp::presets::{PresetDef, builtin};
 use tine_engine::autotune::{
-    AutoTuneConfig, AutoTuneError, AutoTuneEvent, AutoTuneOutcome, AutoTuneRunner, CAL_CHANGES, CalFailure, CalPhase,
-    Calibrator, CalibratorFactory, CaptureSpec, LEASE_MS, SampleSource, clear_lease, lease_until_ms, renew_lease,
+    AutoCalibratorFactory, AutoTuneConfig, AutoTuneError, AutoTuneEvent, AutoTuneOutcome, AutoTuneRunner, CAL_CHANGES,
+    CalFailure, CalPhase, Calibrator, CalibratorFactory, CaptureSpec, LEASE_MS, SampleSource, clear_lease,
+    lease_until_ms, renew_lease,
 };
 use tine_engine::controller::{Controller, ControllerHandle, EngineConfig, Event};
 use tine_engine::model::{EndpointId, KeepPins};
@@ -201,7 +204,8 @@ fn fixture_audio() -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Scripted calibrator (T11 stand-in)
+// Scripted calibrator (offline seam; the real AutoCalibrator is exercised by
+// the fixture-FLAC and real-mic tests below)
 // ---------------------------------------------------------------------------
 
 const FS: usize = 48_000;
@@ -319,9 +323,31 @@ impl Drop for Ctx {
 }
 
 /// Spawns the fake APO (bypass-aware, honours the header lease) plus a client
-/// handle to it. `bypassing: false` keeps the state flag at 0 the whole time
-/// (an APO that never confirms bypass).
+/// handle to it and a full config for the scripted calibrator. `bypassing:
+/// false` keeps the state flag at 0 the whole time (an APO that never
+/// confirms bypass).
 fn spawn_ctx(tag: &str, bypassing: bool, fail: Option<CalFailure>) -> (Ctx, AutoTuneConfig) {
+    spawn_ctx_with(
+        tag,
+        bypassing,
+        CaptureSpec::Source(Box::new(FixtureSource {
+            samples: fixture_audio(),
+            pos: 0,
+            start: Instant::now(),
+            speed: 10.0,
+        })),
+        Arc::new(ScriptedFactory { fail }),
+    )
+}
+
+/// [`spawn_ctx`] with caller-supplied capture source and calibrator factory
+/// (the fixture-FLAC tests inject [`AutoCalibratorFactory`]).
+fn spawn_ctx_with(
+    tag: &str,
+    bypassing: bool,
+    capture: CaptureSpec,
+    factory: Arc<dyn CalibratorFactory>,
+) -> (Ctx, AutoTuneConfig) {
     let name = unique_name(tag);
     let apo = Arc::new(FakeApo::new(&name));
     let apo_state = Arc::clone(&apo);
@@ -343,13 +369,8 @@ fn spawn_ctx(tag: &str, bypassing: bool, fail: Option<CalFailure>) -> (Ctx, Auto
     let cfg = AutoTuneConfig {
         client: Arc::clone(&client),
         controller: None,
-        capture: CaptureSpec::Source(Box::new(FixtureSource {
-            samples: fixture_audio(),
-            pos: 0,
-            start: Instant::now(),
-            speed: 10.0,
-        })),
-        factory: Arc::new(ScriptedFactory { fail }),
+        capture,
+        factory,
         preset: *builtin(Archetype::Dynamic),
         macros: MacroPositions::default(),
         pins: PinSet::EMPTY,
@@ -493,6 +514,158 @@ fn runner_completes_applies_through_the_controller_and_clears_the_lease() {
     }
 }
 
+// --------------------------------------------------- real calibrator via capture source
+
+/// Reads the shared `noisy_quiet` fixture (mono f32 in -1.0..=1.0) — the same
+/// audio T11's acceptance tests use, decoded the same way as `tine-dsp`'s
+/// test harness.
+fn read_flac_mono(path: &PathBuf) -> (Vec<f32>, u32) {
+    let mut reader = claxon::FlacReader::open(path).unwrap_or_else(|e| panic!("open flac {}: {e}", path.display()));
+    let spec = reader.streaminfo();
+    let ch = spec.channels as usize;
+    let depth = f64::from(spec.bits_per_sample);
+    let raw: Vec<f32> = reader
+        .samples()
+        .map(|s| (f64::from(s.unwrap_or_else(|e| panic!("flac sample: {e}"))) / 2.0f64.powf(depth - 1.0)) as f32)
+        .collect();
+    let mono = if ch <= 1 {
+        raw
+    } else {
+        let block = raw.len() / ch;
+        (0..block)
+            .map(|i| {
+                raw.get(i * ch..(i + 1) * ch)
+                    .map_or(0.0, |c| c.iter().sum::<f32>() / ch as f32)
+            })
+            .collect()
+    };
+    (mono, spec.sample_rate)
+}
+
+/// Builds the 9 s Auto-Tune capture from the fixture, exactly like T11's
+/// acceptance stream: 1 s discarded countdown, 3 s room noise, 5 s quiet
+/// speech (fixture speech tail plus a 2 s head repeat).
+fn noisy_quiet_capture() -> Vec<f32> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("tine-dsp")
+        .join("tests")
+        .join("fixtures")
+        .join("noisy_quiet.flac");
+    let (file, fs) = read_flac_mono(&path);
+    assert_eq!(fs as usize, FS, "fixture must be 48 kHz (path {})", path.display());
+    assert!(file.len() >= 6 * FS, "fixture too short: {} samples", file.len());
+    let speech_at = 3 * FS;
+    let mut stream = file.get(..4 * FS).unwrap_or_else(|| panic!("countdown+noise")).to_vec();
+    let speech = file.get(speech_at..).unwrap_or_else(|| panic!("speech tail"));
+    stream.extend_from_slice(speech);
+    let repeat = file
+        .get(speech_at..speech_at + 2 * FS)
+        .unwrap_or_else(|| panic!("speech head"));
+    stream.extend_from_slice(repeat);
+    assert_eq!(stream.len(), 9 * FS);
+    stream
+}
+
+/// The runner drives the real `AutoCalibrator` (T11, merged as 08c4914) from a
+/// fixture capture source through the full phase fan-out, `finish`, and
+/// `ApplyCalibration` dispatch via the Controller — the T11 acceptance
+/// semantics (noisy room gate, aggressive denoise mix, verified peak window)
+/// reproduced end to end.
+#[test]
+fn real_calibrator_fixture_run_applies_through_the_controller() {
+    let (ctx, mut cfg) = spawn_ctx_with(
+        "realcal",
+        true,
+        CaptureSpec::Source(Box::new(FixtureSource {
+            samples: noisy_quiet_capture(),
+            pos: 0,
+            start: Instant::now(),
+            speed: 10.0,
+        })),
+        Arc::new(AutoCalibratorFactory),
+    );
+    let (ctl, rx) = spawn_controller("realcal");
+    assert_pin_workaround(&ctl);
+    cfg.controller = Some(ctl);
+
+    let mut run = AutoTuneRunner::start(cfg);
+    let t0 = Instant::now();
+    let deadline = t0 + Duration::from_secs(12);
+    let mut phases: Vec<CalPhase> = Vec::new();
+    let outcome = loop {
+        assert!(
+            Instant::now() < deadline,
+            "runner produced no terminal event within the 12 s budget"
+        );
+        match run.events().recv_timeout(Duration::from_millis(50)) {
+            Ok(AutoTuneEvent::Progress(p)) => {
+                if phases.last() != Some(&p.phase) {
+                    phases.push(p.phase);
+                }
+            }
+            Ok(AutoTuneEvent::Started { rate_hz }) => assert_eq!(rate_hz, 48_000),
+            Ok(AutoTuneEvent::Done(o)) => break o,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => panic!("runner channel closed without a Done event"),
+        }
+    };
+
+    // The real state machine walks the same wizard phases to the UI.
+    assert!(
+        phases.contains(&CalPhase::Countdown)
+            && phases.contains(&CalPhase::Noise)
+            && phases.contains(&CalPhase::Voice)
+            && phases.contains(&CalPhase::Analyzing),
+        "all wizard phases must reach the UI, saw {phases:?}"
+    );
+
+    let report = match outcome {
+        AutoTuneOutcome::Applied(r) => r,
+        other => panic!("real calibrator must accept the noisy_quiet fixture, got {other:?}"),
+    };
+    assert_eq!(report.changes.len(), CAL_CHANGES);
+    // T11 noisy-room acceptance semantics, end to end:
+    assert_eq!(
+        report.calibration.derived.denoise_mix, 0.85,
+        "noisy room (noise > -48 dBFS) selects the aggressive denoise mix"
+    );
+    assert_eq!(
+        report.calibration.speech_rms_db + report.calibration.derived.input_gain_db,
+        TARGET_SPEECH_RMS_DB,
+        "input gain must place voiced RMS at the target"
+    );
+    assert!(
+        report.simulated_peak_db >= PEAK_TARGET_LOW_DB && report.simulated_peak_db <= PEAK_TARGET_HIGH_DB,
+        "simulated peak {} dB outside the verified window",
+        report.simulated_peak_db
+    );
+    // Lease cleared after the report.
+    assert_eq!(lease_until_ms(&ctx.client), 0, "lease cleared after Done");
+    // ApplyCalibration reached the controller model with KeepPins::Clear.
+    let applied = wait_event(
+        &rx,
+        |e| matches!(e, Event::ModelChanged(m) if m.profile.calibration.is_some()),
+    );
+    assert!(applied.is_some(), "ApplyCalibration must reach the controller model");
+    if let Some(Event::ModelChanged(m)) = applied {
+        assert_eq!(
+            m.profile.calibration.map(|c| c.derived.gate_threshold_db),
+            Some(report.calibration.derived.gate_threshold_db)
+        );
+        assert!(
+            !m.profile.pins.is_pinned(ParamId::CompThreshDb),
+            "KeepPins::Clear must drop pins"
+        );
+    }
+    println!(
+        "real-calibrator run: 9 s noisy_quiet fixture @10x in {:.2} s wall, phases {phases:?}, denoise {:.2}, peak {:.2} dBFS",
+        t0.elapsed().as_secs_f32(),
+        report.calibration.derived.denoise_mix,
+        report.simulated_peak_db
+    );
+}
+
 /// Pins `CompThreshDb` so the `ApplyCalibration` test can observe unpinning
 /// (`SetParam` also pins, per D-007).
 fn assert_pin_workaround(ctl: &ControllerHandle) {
@@ -609,26 +782,34 @@ fn nonexistent_device_fails_with_capture_error_and_clears_lease() {
     assert_eq!(lease_until_ms(&ctx.client), 0);
 }
 
-/// Real-mic end-to-end run (acceptance criterion: "Auto-Tune on a real mic
-/// completes in ~9 s and returns a report"): default input device, scripted
-/// calibrator (T11 flip: the real one), lease-typical fake APO not required —
-/// uses a plain Local\ mapping that reports bypass. Run with:
+/// Real-mic end-to-end run through the real `AutoCalibrator` (acceptance
+/// criterion: "Auto-Tune on a real mic completes in ~9 s and returns a
+/// report"): default input device, real calibrator, lease-honouring fake APO.
+/// Success is `Applied` (report through `ApplyCalibration`) or a *typed*
+/// environmental `Failed(CalFailure)` — a muted mic fails `TooQuiet`, which
+/// is correct behavior, not an infra error. Run with:
 /// `cargo nextest run -p tine-engine --test autotune --run-ignored only real_mic_run --no-capture`
 #[test]
 #[ignore = "opens the real default microphone for ~9 s"]
 fn real_mic_run_completes_in_about_9s() {
     // A lease-honouring fake APO so bypass confirms immediately; the fake-APO
     // thread and mapping live in `ctx` for the whole run.
-    let (_ctx, mut cfg) = spawn_ctx("realmic", true, None);
-    // Real capture: `TINE_HW_IN` (or the system default input) at 48 kHz.
-    let device = std::env::var("TINE_HW_IN").map_or_else(
-        |_| tine_engine::audio_io::DeviceRef::Default,
-        |arg| tine_engine::audio_io::DeviceRef::parse(&arg),
+    let (ctx, mut cfg) = spawn_ctx_with(
+        "realmic",
+        true,
+        CaptureSpec::Device {
+            device: tine_engine::audio_io::DeviceRef::Default,
+            want_rate: Some(48_000),
+        },
+        Arc::new(AutoCalibratorFactory),
     );
-    cfg.capture = CaptureSpec::Device {
-        device,
-        want_rate: Some(48_000),
-    };
+    // Real capture: `TINE_HW_IN` overrides the default input device.
+    if let Ok(arg) = std::env::var("TINE_HW_IN") {
+        cfg.capture = CaptureSpec::Device {
+            device: tine_engine::audio_io::DeviceRef::parse(&arg),
+            want_rate: Some(48_000),
+        };
+    }
 
     let start = Instant::now();
     let run = AutoTuneRunner::start(cfg);
@@ -637,10 +818,23 @@ fn real_mic_run_completes_in_about_9s() {
         .unwrap_or_else(|| panic!("no outcome"));
     let elapsed = start.elapsed();
     println!("real-mic run: {elapsed:.2?} -> {outcome:?}");
-    assert!(
-        matches!(outcome, AutoTuneOutcome::Applied(_)),
-        "real-mic run must produce a report (got {outcome:?})"
-    );
+    match &outcome {
+        AutoTuneOutcome::Applied(report) => {
+            assert_eq!(lease_until_ms(&ctx.client), 0, "lease cleared after Done");
+            assert_eq!(report.changes.len(), CAL_CHANGES);
+            println!(
+                "real-mic report: gate {:.2} dB, input gain {:.2} dB, denoise {:.2}, peak {:.2} dBFS",
+                report.calibration.derived.gate_threshold_db,
+                report.calibration.derived.input_gain_db,
+                report.calibration.derived.denoise_mix,
+                report.simulated_peak_db
+            );
+        }
+        AutoTuneOutcome::Failed(reason) => {
+            println!("real-mic run measured a bad environment (typed failure): {reason:?}");
+        }
+        other @ AutoTuneOutcome::Error(_) => panic!("real-mic run must Apply or fail typed (got {other:?})"),
+    }
     // ~9 s of phases at 30 Hz capture cadence plus analysis.
     assert!(elapsed.as_secs_f32() >= 8.0, "finished too fast: {elapsed:?}");
     assert!(elapsed.as_secs_f32() <= 15.0, "finished too slowly: {elapsed:?}");
