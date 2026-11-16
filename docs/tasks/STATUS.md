@@ -8,7 +8,7 @@
 | T04 | `tine-protocol`: params, lock-free primitives, shm layout | 0 — Foundation | done | `task/T04-protocol` | #5 | T04-worker |
 | T05 | DSP primitives, test/bench harness, `DspPipeline` skeleton | 0 — Foundation | done | `task/T05-dsp-foundation` | #7 | T05-worker |
 | T06 | Stage 1–2: gain/DC/HPF, RNNoise + expander | A — DSP | done | `task/T06-dsp-cleanup` | #8 | T06-worker |
-| T07 | Stage 3–4: 5-band EQ, split-band de-esser | A — DSP | in-progress | `task/T07-dsp-tone` | — | T07-worker |
+| T07 | Stage 3–4: 5-band EQ, split-band de-esser | A — DSP | done | `task/T07-dsp-tone` | #10 | T07-worker |
 | T08 | Stage 5–6: compressor, lookahead limiter | A — DSP | in-progress | `task/T08-dsp-dynamics` | — | T08-worker |
 | T09 | Wire stages, fixtures, golden regression, perf gate | A — DSP | todo | — | — | — |
 | T10 | Archetype presets + `MacroMapper` | A — DSP | todo | — | — | — |
