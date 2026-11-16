@@ -23,7 +23,11 @@ Reviewers (human or agent) check against this file.
 - Every new dependency needs: a reason in the PR, a license on the allow-list (`deny.toml`), no duplicate major versions (`cargo deny check bans`), and no RT-path usage unless it is proven allocation-free under test.
 - Prefer **writing small, hot, well-understood code ourselves** (biquads, lock-free triple buffer/ring, smoothers) over pulling a crate: we need `repr(C)` shared-memory versions anyway, we control allocation and inlining, and there is one tested implementation (D-009, D-010).
 - Dependabot (or Renovate) weekly for Cargo + GitHub Actions; `cargo deny check advisories` in CI.
-- Rune is pinned by `rev`; bumping it is its own PR that re-runs headless snapshots and T03's memory checks.
+- Rune is pinned by `rev`; bumping it is its own PR that re-runs headless snapshots and T03's memory checks:
+  1. Update `rev` on `rune` in `[workspace.dependencies]` and on every entry in `[patch.crates-io]` in root `Cargo.toml` (and `AGENTS.md` §2).
+  2. Inspect Rune's `Cargo.toml` and `rust-toolchain.toml` at the new `rev` for any changed `[patch.crates-io]` entries or toolchain version.
+  3. Run `cargo update -p rune` and verify `cargo tree -i winit` resolves to the new `rev`.
+  4. Run `cargo deny check`, headless UI snapshots (`tine-ui`), and T03's memory/lifecycle checks.
 
 ## 3. Real-time code rules (DSP, APO, audio callbacks)
 

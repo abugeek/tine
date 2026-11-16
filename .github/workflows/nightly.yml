@@ -1,0 +1,59 @@
+name: Nightly / Heavy Checks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  miri:
+    name: Miri (tine-protocol)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Miri on tine-protocol
+        run: cargo +nightly miri test -p tine-protocol
+
+  loom:
+    name: Loom (tine-protocol)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Loom tests
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = "--cfg loom"
+          cargo test -p tine-protocol --lib
+
+  bench:
+    name: DSP Benchmarks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - name: Build & run DSP benches (perf profile)
+        run: cargo bench -p tine-dsp --profile perf
+
+  headless-ui:
+    name: Headless UI Verification
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tine-ui headless scene tests
+        run: cargo test -p tine-ui

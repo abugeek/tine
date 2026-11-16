@@ -1,0 +1,19 @@
+[package]
+name = "tine-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+tooling = ["rune/tooling"]
+
+[dependencies]
+tine-protocol = { workspace = true, features = ["std"] }
+tine-dsp = { workspace = true, features = ["std"] }
+rune.workspace = true
+
+[lints]
+workspace = true

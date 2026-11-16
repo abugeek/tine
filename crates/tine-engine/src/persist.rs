@@ -1,0 +1,1 @@
+//! Atomic versioned JSON persistence.

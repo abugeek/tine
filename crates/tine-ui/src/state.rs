@@ -1,0 +1,1 @@
+//! UI ephemeral interaction state.
