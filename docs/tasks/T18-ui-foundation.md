@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T18-worker) |
 | Lane | D — UI |
 | Depends on | T03 (recipe), T04 |
 | Unblocks | T19, T20 |
