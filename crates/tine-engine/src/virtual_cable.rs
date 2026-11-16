@@ -228,15 +228,14 @@ mod tests {
         let telemetry = Arc::new(Triple::new(AudioTelemetryFrame::default()));
         let tap = Arc::new(SpscRing::<1024>::new());
 
-        let err = match VirtualCableRouter::start(
+        let Err(err) = VirtualCableRouter::start(
             &DeviceRef::Name("__nonexistent_tine_input_device_12345__".to_owned()),
             &DeviceRef::Default,
             params,
             telemetry,
             tap,
-        ) {
-            Ok(_) => panic!("expected DeviceNotFound error"),
-            Err(e) => e,
+        ) else {
+            panic!("expected DeviceNotFound error")
         };
         assert!(matches!(err, AudioIoError::DeviceNotFound(_)));
     }
