@@ -603,6 +603,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1_000));
         let after = cpu_ms();
         let delta = after.saturating_sub(before);
+        println!("controller idle: {delta} ms process CPU time over 1_000 ms (budget < 100)");
         assert!(delta < 100, "controller idle burned {delta} ms CPU in 1 s (busy loop?)");
         let frame = handle.telemetry();
         assert_eq!(frame, AudioTelemetryFrame::default(), "no shm client -> default telemetry");
