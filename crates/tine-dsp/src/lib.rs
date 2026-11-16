@@ -21,3 +21,6 @@ pub mod primitives;
 pub mod resample;
 pub mod rt;
 pub mod stages;
+
+pub use meter::{MeterSink, NoMeters, NoTap, TapSink};
+pub use pipeline::DspPipeline;
