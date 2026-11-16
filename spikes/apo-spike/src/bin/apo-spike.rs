@@ -645,7 +645,7 @@ fn cmd_uninstall(endpoint_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_heartbeat() -> Result<(), String> {
+fn cmd_heartbeat(count: Option<u32>) -> Result<(), String> {
     let shm = ShmMapping::open_existing()
         .map_err(|e| format!("OpenFileMappingW(Global\\TineSpike.v1): {e}"))?;
     let data = shm.data();
@@ -653,7 +653,14 @@ fn cmd_heartbeat() -> Result<(), String> {
     let mut prev_time = Instant::now();
 
     println!("Connected to Global\\TineSpike.v1 (magic={:#x}). Press Ctrl+C to stop.", data.magic);
+    let mut i = 0u32;
     loop {
+        if let Some(max) = count {
+            if i >= max {
+                return Ok(());
+            }
+        }
+        i += 1;
         thread::sleep(Duration::from_millis(500));
         let now = Instant::now();
         let cur = data.heartbeat.load(Ordering::Relaxed);
@@ -728,6 +735,129 @@ fn cmd_reload(endpoint_id: &str, use_service: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_capture_test(endpoint_id: &str, raw_mode: bool, ms: u64) -> Result<(), String> {
+    use windows::Win32::Media::Audio::{
+        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMOPTIONS_RAW, AudioClientProperties,
+        IAudioCaptureClient, IAudioClient2, WAVEFORMATEXTENSIBLE,
+    };
+
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED)
+            .ok()
+            .map_err(|e| format!("CoInitializeEx: {e}"))?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator): {e}"))?;
+        let wide_id = to_wide(endpoint_id);
+        let dev = enumerator
+            .GetDevice(PCWSTR(wide_id.as_ptr()))
+            .map_err(|e| format!("GetDevice: {e}"))?;
+        let client: IAudioClient2 = dev
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| format!("Activate(IAudioClient2): {e}"))?;
+
+        if raw_mode {
+            let props = AudioClientProperties {
+                cbSize: core::mem::size_of::<AudioClientProperties>() as u32,
+                bIsOffload: false.into(),
+                eCategory: windows::Win32::Media::Audio::AudioCategory_Communications,
+                Options: AUDCLNT_STREAMOPTIONS_RAW,
+            };
+            client
+                .SetClientProperties(&props)
+                .map_err(|e| format!("SetClientProperties(RAW): {e}"))?;
+        }
+
+        let fmt_ptr = client
+            .GetMixFormat()
+            .map_err(|e| format!("GetMixFormat: {e}"))?;
+        let fmt = &*fmt_ptr;
+        let rate = fmt.nSamplesPerSec;
+        let ch = fmt.nChannels as usize;
+        let bits = fmt.wBitsPerSample;
+        let tag = fmt.wFormatTag;
+        let is_float = tag == 3
+            || (tag == 0xFFFE
+                && core::ptr::addr_of!((*(fmt_ptr as *const WAVEFORMATEXTENSIBLE)).SubFormat)
+                    .read_unaligned()
+                    == GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71));
+
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                0,
+                1_000_000, // 100 ms buffer
+                0,
+                fmt_ptr,
+                None,
+            )
+            .map_err(|e| format!("Initialize: {e}"))?;
+        CoTaskMemFree(Some(fmt_ptr as *const c_void));
+
+        let cap: IAudioCaptureClient = client
+            .GetService()
+            .map_err(|e| format!("GetService(IAudioCaptureClient): {e}"))?;
+        client.Start().map_err(|e| format!("Start: {e}"))?;
+
+        let start = Instant::now();
+        let mut total_frames: u64 = 0;
+        let mut sum_sq: f64 = 0.0;
+        let mut peak: f32 = 0.0;
+
+        while start.elapsed() < Duration::from_millis(ms) {
+            thread::sleep(Duration::from_millis(10));
+            loop {
+                let pkt = cap.GetNextPacketSize().unwrap_or(0);
+                if pkt == 0 {
+                    break;
+                }
+                let mut data_ptr = core::ptr::null_mut();
+                let mut frames = 0u32;
+                let mut flags = 0u32;
+                if cap
+                    .GetBuffer(&mut data_ptr, &mut frames, &mut flags, None, None)
+                    .is_err()
+                {
+                    break;
+                }
+                if frames > 0 && !data_ptr.is_null() && (flags & 2) == 0 && is_float {
+                    let samples = core::slice::from_raw_parts(
+                        data_ptr as *const f32,
+                        frames as usize * ch,
+                    );
+                    for &s in samples {
+                        let a = s.abs();
+                        if a > peak {
+                            peak = a;
+                        }
+                        sum_sq += (s as f64) * (s as f64);
+                    }
+                }
+                total_frames += frames as u64;
+                let _ = cap.ReleaseBuffer(frames);
+            }
+        }
+        let _ = client.Stop();
+
+        let n = (total_frames as f64) * (ch as f64);
+        let rms = if n > 0.0 { (sum_sq / n).sqrt() } else { 0.0 };
+        let rms_db = if rms > 1e-12 {
+            20.0 * rms.log10()
+        } else {
+            -120.0
+        };
+        let peak_db = if peak > 1e-12 {
+            20.0 * (peak as f64).log10()
+        } else {
+            -120.0
+        };
+        println!(
+            "capture-test (raw={raw_mode}): rate={rate}Hz ch={ch} bits={bits} float={is_float} frames={total_frames} rms={rms_db:.2} dBFS peak={peak_db:.2} dBFS"
+        );
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -751,12 +881,32 @@ fn main() {
             .get(1)
             .ok_or_else(|| "missing <id>".to_string())
             .and_then(|id| cmd_uninstall(id)),
-        "heartbeat" => cmd_heartbeat(),
+        "heartbeat" => {
+            let mut count = None;
+            if let Some(pos) = args.iter().position(|a| a == "--count") {
+                if let Some(v) = args.get(pos + 1).and_then(|s| s.parse::<u32>().ok()) {
+                    count = Some(v);
+                }
+            }
+            cmd_heartbeat(count)
+        }
         "reload" => {
             let use_service = args.iter().any(|a| a == "--service");
             args.get(1)
                 .ok_or_else(|| "missing <id>".to_string())
                 .and_then(|id| cmd_reload(id, use_service))
+        }
+        "capture-test" => {
+            let raw_mode = args.iter().any(|a| a == "--raw");
+            let mut ms = 1500u64;
+            if let Some(pos) = args.iter().position(|a| a == "--ms") {
+                if let Some(v) = args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()) {
+                    ms = v;
+                }
+            }
+            args.get(1)
+                .ok_or_else(|| "missing <id>".to_string())
+                .and_then(|id| cmd_capture_test(id, raw_mode, ms))
         }
         other => Err(format!("unknown command '{other}'")),
     };
