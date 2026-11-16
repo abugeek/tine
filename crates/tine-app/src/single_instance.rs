@@ -13,13 +13,15 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::mpsc::Sender;
 
+use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HLOCAL,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
+    WriteFile,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -221,9 +223,16 @@ pub fn send_request(pipe_name: &str, req: &PipeRequest) -> Result<PipeResponse, 
                 handle = Some(h);
                 break;
             }
-            Err(_) => {
-                // SAFETY: bounded wait for the server to post a free instance.
-                let _ = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 100) };
+            Err(err) => {
+                if err.code() == ERROR_FILE_NOT_FOUND.to_hresult() {
+                    // The pipe does not exist yet (tine.exe may just be
+                    // starting): pace the retries instead of spinning.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                } else {
+                    // SAFETY: bounded wait for the server to post a free
+                    // instance.
+                    let _ = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 100) };
+                }
             }
         }
     }
@@ -256,7 +265,9 @@ fn request_on_handle(handle: HANDLE, req: &PipeRequest) -> Result<PipeResponse, 
             break;
         }
         buf.extend_from_slice(&chunk[..read as usize]);
-        if buf.contains(&b'\n') || buf.len() > 4096 {
+        // Newline terminates the message; the cap only guards against a
+        // runaway peer, so it is far above any reply we produce.
+        if buf.contains(&b'\n') || buf.len() > 512 * 1024 {
             break;
         }
     }
@@ -343,7 +354,9 @@ fn serve_connection(pipe: HANDLE, jobs: &Sender<PipeJob>) {
             break;
         }
         buf.extend_from_slice(&chunk[..read as usize]);
-        if buf.contains(&b'\n') || buf.len() > 4096 {
+        // Newline terminates the message; the cap only guards against a
+        // runaway peer, so it is far above any request we produce.
+        if buf.contains(&b'\n') || buf.len() > 512 * 1024 {
             break;
         }
     }
@@ -387,16 +400,63 @@ fn write_reply(pipe: HANDLE, response: &PipeResponse) {
     payload.push(b'\n');
     let mut written = 0u32;
     // SAFETY: `pipe` is connected; `payload` is a valid slice.
-    let _ = unsafe { WriteFile(pipe, Some(&payload), Some(&raw mut written), None) };
+    if unsafe { WriteFile(pipe, Some(&payload), Some(&raw mut written), None) }.is_ok() {
+        // `DisconnectNamedPipe` discards bytes the client has not read yet.
+        // The client reads the reply in slices; blocking until it has
+        // drained everything keeps replies larger than one slice from
+        // being truncated. Our clients always read through the trailing
+        // newline, so this cannot block indefinitely against them; a
+        // crashed client releases its handle and unblocks the flush too.
+        // SAFETY: flushing a blocking pipe handle waits for the peer to
+        // consume all written bytes.
+        let _ = unsafe { FlushFileBuffers(pipe) };
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pipe_name_for_user;
+    use super::{PipeRequest, PipeResponse, pipe_name_for_user, send_request, spawn_server};
+    use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn pipe_name_carries_user_or_fallback() {
         let name = pipe_name_for_user();
         assert!(name.starts_with(r"\\.\pipe\tine-"), "{name}");
+    }
+
+    /// Regression: a reply larger than the client's 512-byte read slice used
+    /// to lose its tail — `DisconnectNamedPipe` discards bytes the client
+    /// has not read, and the server disconnected right after writing.
+    /// `write_reply` now drains (`FlushFileBuffers`) before the disconnect.
+    #[test]
+    fn large_reply_round_trips_intact() {
+        let name = format!(r"\\.\pipe\tine-test-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_server(name.clone(), tx);
+
+        // Echo a ~8 KiB payload back: `payload` mirrors it in the response.
+        let filler = "x".repeat(8 * 1024);
+        let request = PipeRequest::Status;
+        std::thread::spawn(move || {
+            while let Ok(job) = rx.recv_timeout(Duration::from_secs(30)) {
+                let _ = job.reply.send(PipeResponse::ok(json!({
+                    "payload": filler.clone(),
+                })));
+            }
+        });
+
+        // Give the server thread a moment to create its first instance, then
+        // ask (send_request retries for a while, so no strict timing needed).
+        let resp = send_request(&name, &request).expect("server should answer");
+        let err = resp.error.clone().unwrap_or_default();
+        assert!(resp.ok, "expected ok, got {err}");
+        let payload = resp.data.expect("payload present");
+        let text = payload
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .expect("payload is a string");
+        assert_eq!(text.len(), 8 * 1024, "payload must arrive untruncated");
+        assert!(text.chars().all(|c| c == 'x'));
     }
 }

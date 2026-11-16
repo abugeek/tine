@@ -442,7 +442,13 @@ fn cmd_status() -> i32 {
             println!("error: {}", resp.error.unwrap_or_default());
             resp.code
         }
-        Err(_) => {
+        Err(e) => {
+            if std::env::var("TINE_DEBUG_STATUS").is_ok() {
+                // Debug aid for support: `status` silently falls back to an
+                // offline snapshot when the instance is unreachable; make
+                // the transport error visible on demand.
+                eprintln!("status send_request error: {e}");
+            }
             // No instance: static snapshot.
             println!("tine {} — not running", crate::version::tine_version());
             println!("windows: {}", crate::version::windows_edition());
