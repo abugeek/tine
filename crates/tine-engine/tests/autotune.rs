@@ -608,3 +608,39 @@ fn nonexistent_device_fails_with_capture_error_and_clears_lease() {
     );
     assert_eq!(lease_until_ms(&ctx.client), 0);
 }
+
+/// Real-mic end-to-end run (acceptance criterion: "Auto-Tune on a real mic
+/// completes in ~9 s and returns a report"): default input device, scripted
+/// calibrator (T11 flip: the real one), lease-typical fake APO not required —
+/// uses a plain Local\ mapping that reports bypass. Run with:
+/// `cargo nextest run -p tine-engine --test autotune --run-ignored only real_mic_run --no-capture`
+#[test]
+#[ignore = "opens the real default microphone for ~9 s"]
+fn real_mic_run_completes_in_about_9s() {
+    // A lease-honouring fake APO so bypass confirms immediately.
+    let (ctx, mut cfg) = spawn_ctx("realmic", true, None);
+    // Real capture: `TINE_HW_IN` (or the system default input) at 48 kHz.
+    let device = std::env::var("TINE_HW_IN").map_or_else(
+        |_| tine_engine::audio_io::DeviceRef::Default,
+        |arg| tine_engine::audio_io::DeviceRef::parse(&arg),
+    );
+    cfg.capture = CaptureSpec::Device {
+        device,
+        want_rate: Some(48_000),
+    };
+
+    let start = Instant::now();
+    let run = AutoTuneRunner::start(cfg);
+    let outcome = run
+        .wait(Duration::from_secs(30))
+        .unwrap_or_else(|| panic!("no outcome"));
+    let elapsed = start.elapsed();
+    println!("real-mic run: {elapsed:.2?} -> {outcome:?}");
+    assert!(
+        matches!(outcome, AutoTuneOutcome::Applied(_)),
+        "real-mic run must produce a report (got {outcome:?})"
+    );
+    // ~9 s of phases at 30 Hz capture cadence plus analysis.
+    assert!(elapsed.as_secs_f32() >= 8.0, "finished too fast: {elapsed:?}");
+    assert!(elapsed.as_secs_f32() <= 15.0, "finished too slowly: {elapsed:?}");
+}
