@@ -13,22 +13,20 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::mpsc::Sender;
 
-use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    HLOCAL,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HLOCAL,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
-    WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, OpenProcessToken};
+use windows::core::{PCWSTR, w};
 
 use crate::proto::{PIPE_UNLIMITED_INSTANCES, PipeRequest, PipeResponse};
 
@@ -88,9 +86,8 @@ impl UserToken {
         let mut buf = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
         // SAFETY: `buf` is 8-byte aligned and covers at least `needed` bytes
         // as reported by the size query.
-        let ok = unsafe {
-            GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), needed, &raw mut needed)
-        };
+        let ok =
+            unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), needed, &raw mut needed) };
         // SAFETY: the token handle is no longer needed.
         unsafe {
             let _ = CloseHandle(token);
@@ -120,7 +117,7 @@ impl UserToken {
     }
 
     /// The SID bytes (for building the pipe DACL).
-    fn sid_bytes(&self) -> Option<Vec<u8>> {
+    fn sid_bytes(&self) -> Vec<u8> {
         // SAFETY: `buf` holds a valid `TOKEN_USER`.
         let token_user = unsafe { &*(self.buf.as_ptr().cast::<TOKEN_USER>()) };
         // SAFETY: the SID pointer stays valid while `buf` is alive; its
@@ -128,7 +125,7 @@ impl UserToken {
         let len = unsafe { windows::Win32::Security::GetLengthSid(token_user.User.Sid) } as usize;
         // SAFETY: reading `len` bytes from the SID pointer inside `buf`.
         let slice = unsafe { std::slice::from_raw_parts(token_user.User.Sid.0.cast::<u8>(), len) };
-        Some(slice.to_vec())
+        slice.to_vec()
     }
 }
 
@@ -140,7 +137,7 @@ pub fn current_user_sid() -> Option<String> {
 
 /// The current user's SID bytes, or `None` on failure.
 fn current_user_sid_bytes() -> Option<Vec<u8>> {
-    UserToken::query().and_then(|t| t.sid_bytes())
+    UserToken::query().map(|t| t.sid_bytes())
 }
 
 /// `\\.\pipe\tine-<user SID>` (falls back to `\\.\pipe\tine-default`).
@@ -176,10 +173,7 @@ fn acquire_locked() -> (Option<InstanceGuard>, bool) {
         }
         return (None, false);
     }
-    (
-        Some(InstanceGuard { mutex, pipe_name }),
-        true,
-    )
+    (Some(InstanceGuard { mutex, pipe_name }), true)
 }
 
 /// Acquires the single-instance mutex, or forwards `open` to the running
@@ -290,19 +284,16 @@ pub fn spawn_server(pipe_name: String, jobs: Sender<PipeJob>) {
     let sid = current_user_sid_bytes();
     std::thread::Builder::new()
         .name("tine-pipe-server".to_owned())
-        .spawn(move || server_loop(pipe_name, jobs, sid))
+        .spawn(move || server_loop(&pipe_name, &jobs, sid.as_deref()))
         .ok();
 }
 
-fn server_loop(pipe_name: String, jobs: Sender<PipeJob>, sid: Option<Vec<u8>>) {
-    let wide = to_wide_null(&pipe_name);
+fn server_loop(pipe_name: &str, jobs: &Sender<PipeJob>, sid: Option<&[u8]>) {
+    let wide = to_wide_null(pipe_name);
     loop {
-        let pipe = match create_user_pipe(&wide, sid.as_deref()) {
-            Some(h) => h,
-            None => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            }
+        let Some(pipe) = create_user_pipe(&wide, sid) else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
         };
         // SAFETY: `pipe` is a valid server-side pipe handle.
         let connected = unsafe { ConnectNamedPipe(pipe, None) }.is_ok()
@@ -310,7 +301,7 @@ fn server_loop(pipe_name: String, jobs: Sender<PipeJob>, sid: Option<Vec<u8>>) {
             // have connected between create and connect).
             || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
         if connected {
-            serve_connection(pipe, &jobs);
+            serve_connection(pipe, jobs);
         }
         // SAFETY: the connection is done; close before creating the next
         // instance.
@@ -334,7 +325,7 @@ fn create_user_pipe(wide: &[u16], sid: Option<&[u8]>) -> Option<HANDLE> {
             4096,
             4096,
             0,
-            Some(&sec.attrs),
+            Some(&raw const sec.attrs),
         )
     };
     (!pipe.is_invalid()).then_some(pipe)
@@ -358,20 +349,25 @@ fn serve_connection(pipe: HANDLE, jobs: &Sender<PipeJob>) {
     }
     // Newline-delimited JSON: serve exactly the first complete request per
     // connection (the protocol is one request, one response).
-    let first = crate::proto::take_line(&mut buf);
-    let text = match first {
-        Some(line) => String::from_utf8_lossy(&line)
-            .trim()
-            .trim_end_matches(['\r', '\n'])
-            .to_owned(),
-        None => return,
+    let Some(line) = crate::proto::take_line(&mut buf) else {
+        return; // no complete request line on this connection
     };
+    let text = String::from_utf8_lossy(&line)
+        .trim()
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
     let parsed: Option<PipeRequest> = serde_json::from_str(&text).ok();
     if let Some(request) = parsed {
         // Dedicated reply channel per request: the app loop answers exactly
         // one response (fast commands immediately, `soak` when it finishes).
         let (tx_reply, rx_reply) = std::sync::mpsc::channel::<PipeResponse>();
-        if jobs.send(PipeJob { request, reply: tx_reply }).is_ok() {
+        if jobs
+            .send(PipeJob {
+                request,
+                reply: tx_reply,
+            })
+            .is_ok()
+        {
             let response = rx_reply
                 .recv_timeout(std::time::Duration::from_secs(600))
                 .unwrap_or_else(|_| PipeResponse::err(1, "tine.exe did not answer in time"));

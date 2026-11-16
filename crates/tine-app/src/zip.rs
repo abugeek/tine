@@ -12,7 +12,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= u32::from(byte);
         for _bit in 0..8 {
-            let mask = u32::from(crc & 1).wrapping_neg();
+            let mask = (crc & 1).wrapping_neg();
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
@@ -41,9 +41,7 @@ pub fn stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         out.extend_from_slice(&crc);
         out.extend_from_slice(&sizes); // compressed size
         out.extend_from_slice(&sizes); // uncompressed size
-        out.extend_from_slice(&u16_to_le(
-            u16::try_from(name_bytes.len()).unwrap_or(0),
-        ));
+        out.extend_from_slice(&u16_to_le(u16::try_from(name_bytes.len()).unwrap_or(0)));
         out.extend_from_slice(&u16_to_le(0)); // extra len
         out.extend_from_slice(name_bytes);
         let file_start = out.len();
@@ -60,9 +58,7 @@ pub fn stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         central.extend_from_slice(&crc);
         central.extend_from_slice(&sizes);
         central.extend_from_slice(&sizes);
-        central.extend_from_slice(&u16_to_le(
-            u16::try_from(name_bytes.len()).unwrap_or(0),
-        ));
+        central.extend_from_slice(&u16_to_le(u16::try_from(name_bytes.len()).unwrap_or(0)));
         central.extend_from_slice(&u16_to_le(0)); // extra
         central.extend_from_slice(&u16_to_le(0)); // comment
         central.extend_from_slice(&u16_to_le(0)); // disk start
@@ -77,12 +73,8 @@ pub fn stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     out.extend_from_slice(&u32_to_le(0x0605_4b50));
     out.extend_from_slice(&u16_to_le(0)); // disk
     out.extend_from_slice(&u16_to_le(0)); // disk with central dir
-    out.extend_from_slice(&u16_to_le(
-        u16::try_from(entries.len()).unwrap_or(0),
-    ));
-    out.extend_from_slice(&u16_to_le(
-        u16::try_from(entries.len()).unwrap_or(0),
-    ));
+    out.extend_from_slice(&u16_to_le(u16::try_from(entries.len()).unwrap_or(0)));
+    out.extend_from_slice(&u16_to_le(u16::try_from(entries.len()).unwrap_or(0)));
     out.extend_from_slice(&u32_to_le((out.len() - central_offset) as u32));
     out.extend_from_slice(&u32_to_le(central_offset as u32));
     out.extend_from_slice(&u16_to_le(0)); // comment len
@@ -115,12 +107,7 @@ mod tests {
         let count = u16::from_le_bytes([zip[eocd + 10], zip[eocd + 11]]);
         assert_eq!(count, 2);
         // The central directory starts with a PK\x01\x02 record.
-        let cd_offset = u32::from_le_bytes([
-            zip[eocd + 16],
-            zip[eocd + 17],
-            zip[eocd + 18],
-            zip[eocd + 19],
-        ]) as usize;
+        let cd_offset = u32::from_le_bytes([zip[eocd + 16], zip[eocd + 17], zip[eocd + 18], zip[eocd + 19]]) as usize;
         assert_eq!(&zip[cd_offset..cd_offset + 4], b"PK\x01\x02");
     }
 

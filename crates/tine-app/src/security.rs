@@ -1,17 +1,16 @@
 //! Win32 security plumbing: a `SECURITY_ATTRIBUTES` with a DACL that grants
 //! the current user full access to the named pipe — and nobody else.
 
-use windows::core::PWSTR;
 use windows::Win32::Foundation::HLOCAL;
 use windows::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
-    TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    InitializeSecurityDescriptor, NO_INHERITANCE, SetSecurityDescriptorDacl, ACL, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR, PSID,
+    ACL, InitializeSecurityDescriptor, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
 };
 use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+use windows::core::PWSTR;
 
 /// Owns the SID buffer, the DACL, and the security descriptor referenced by
 /// the exposed `SECURITY_ATTRIBUTES`. Keep it alive across the
@@ -79,8 +78,7 @@ pub fn user_only_security_attributes(sid: Option<&[u8]>) -> Option<UserOnlySecur
         return None;
     }
 
-    let mut descriptor: Box<[u8; size_of::<SECURITY_DESCRIPTOR>()]> =
-        Box::new([0u8; size_of::<SECURITY_DESCRIPTOR>()]);
+    let mut descriptor: Box<[u8; size_of::<SECURITY_DESCRIPTOR>()]> = Box::new([0u8; size_of::<SECURITY_DESCRIPTOR>()]);
     let desc = PSECURITY_DESCRIPTOR(descriptor.as_mut_ptr().cast());
     // SAFETY: `descriptor` provides `size_of::<SECURITY_DESCRIPTOR>()` writable
     // bytes — the documented requirement for `InitializeSecurityDescriptor`.

@@ -198,9 +198,11 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap_or_default();
         let back: PipeResponse = serde_json::from_str(&json).unwrap_or(PipeResponse::empty());
         assert_eq!(back, resp);
-        assert!(serde_json::to_string(&PipeResponse::empty())
-            .unwrap_or_default()
-            .contains("\"code\":0"));
+        assert!(
+            serde_json::to_string(&PipeResponse::empty())
+                .unwrap_or_default()
+                .contains("\"code\":0")
+        );
     }
 
     #[test]

@@ -58,12 +58,12 @@ impl Shell {
             s.monitor = model.monitor.enabled;
             s.archetype = model.profile.archetype;
         }
-        if let Some(model) = &self.model {
-            if let Some(endpoint) = &model.endpoint {
-                let raw = endpoint.as_str();
-                s.endpoint_id = Some(raw.to_owned());
-                s.mic_name = self.mic_name(raw);
-            }
+        if let Some(model) = &self.model
+            && let Some(endpoint) = &model.endpoint
+        {
+            let raw = endpoint.as_str();
+            s.endpoint_id = Some(raw.to_owned());
+            s.mic_name = self.mic_name(raw);
         }
         s
     }
@@ -126,9 +126,10 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     let entered = Instant::now();
 
     // 1. Single instance: forward `open` (or exit quietly for --background).
-    let (guard, primary) = match background {
-        true => crate::single_instance::acquire_quiet(),
-        false => crate::single_instance::acquire_or_forward_open(),
+    let (guard, primary) = if background {
+        crate::single_instance::acquire_quiet()
+    } else {
+        crate::single_instance::acquire_or_forward_open()
     };
     if !primary {
         return exit_code::OK;
@@ -228,9 +229,6 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                 shell.link = link;
                 shell.sync_tray(&tx);
             }
-            Msg::Engine(Event::ParamsResolved(_)) => {
-                // Resolved params already reached the shared-memory target.
-            }
             Msg::Engine(Event::Error(e)) => {
                 tracing::error!(target: "tine::shell", error = ?e, "engine error");
             }
@@ -242,7 +240,6 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                 break;
             }
             Msg::Tray(TrayEvent::Menu(id)) => shell.on_tray_menu(&id),
-            Msg::Tray(_) => {} // rune may add tray events; ignore unknown ones
             Msg::Pipe(job) => {
                 if matches!(job.request, PipeRequest::Quit) {
                     tracing::info!(target: "tine::shell", "quit requested via pipe");
@@ -252,6 +249,9 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                 }
                 shell.on_pipe(job);
             }
+            // `ParamsResolved` and unknown future tray events need no work:
+            // resolved params already reached the shared-memory target.
+            Msg::Engine(Event::ParamsResolved(_)) | Msg::Tray(_) => {}
         }
     }
 
@@ -264,10 +264,10 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     for join in shell.soaks.drain(..) {
         let _ = join.join();
     }
-    shell
-        .ui_child
-        .take()
-        .and_then(|mut child| child.kill().ok().and_then(|_| child.wait().ok()));
+    if let Some(mut child) = shell.ui_child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     drop(shell); // drops its controller handle clone
     drop(handle); // drops the last handle -> controller thread flushes and exits
     drop(forwarder);
@@ -321,7 +321,7 @@ impl Shell {
                 let _ = self.handle.send(Command::SetBypass(next));
             }
             menu_id::MONITOR => {
-                let current = self.model.as_ref().map_or(false, |m| m.monitor.enabled);
+                let current = self.model.as_ref().is_some_and(|m| m.monitor.enabled);
                 let next = !current;
                 self.apply_monitor(next, None);
             }
@@ -384,13 +384,15 @@ impl Shell {
                 }))
             }
             PipeRequest::Calibrate => {
-                if services::AUTOTUNE_AVAILABLE {
-                    services::autotune_start();
-                    PipeResponse::ok(json!({"calibrate": "started"}))
+                // The stub logs the request either way (services.rs TODO(T16));
+                // the response states whether the flow is live yet.
+                services::autotune_start();
+                let state = if services::AUTOTUNE_AVAILABLE {
+                    "started"
                 } else {
-                    services::autotune_start();
-                    PipeResponse::ok(json!({"calibrate": "deferred: engine audio services pending (T16)"}))
-                }
+                    "deferred: engine audio services pending (T16)"
+                };
+                PipeResponse::ok(json!({ "calibrate": state }))
             }
             PipeRequest::Quit => PipeResponse::empty(), // handled by the loop
             PipeRequest::Set { key, value } => match crate::cli::param_id_by_key(&key) {
@@ -438,18 +440,16 @@ impl Shell {
                 let join = std::thread::Builder::new()
                     .name("tine-soak".to_owned())
                     .spawn(move || {
-                        let report_doc = crate::soak::run_blocking(
-                            minutes,
-                            std::path::Path::new(&path_report),
-                            json!({
-                                "where": "running instance",
-                                "requested": "tine soak",
-                            }),
-                            move || handle.telemetry().sequence,
-                        );
+                        let seq = move || handle.telemetry().sequence;
+                        let notes = json!({
+                            "where": "running instance",
+                            "requested": "tine soak",
+                        });
+                        let report_doc =
+                            crate::soak::run_blocking(minutes, std::path::Path::new(&path_report), &notes, &seq);
                         tracing::info!(
                             target: "tine::shell",
-                            summary = %report_doc.get("summary").map(|s| s.to_string()).unwrap_or_default(),
+                            summary = ?report_doc.get("summary"),
                             "soak finished"
                         );
                     })
@@ -470,22 +470,22 @@ impl Shell {
             "endpoint_id": snapshot.endpoint_id.clone().unwrap_or_default(),
             "mic_name": snapshot.mic_name,
             "archetype": model.map_or("unknown", |m| m.profile.archetype.id()),
-            "macros": model.map(|m| {
+            "macros": model.map_or(Value::Null, |m| {
                 json!({
                     "purity": Macro::Purity.get(&m.profile.macros),
                     "body": Macro::Body.get(&m.profile.macros),
                     "presence": Macro::Presence.get(&m.profile.macros),
                     "leveler": Macro::Leveler.get(&m.profile.macros),
                 })
-            }).unwrap_or(Value::Null),
-            "bypass": model.map_or(false, |m| m.bypass),
+            }),
+            "bypass": model.is_some_and(|m| m.bypass),
             "state": if self.link.is_linked() {
-                if model.map_or(false, |m| m.bypass) { "bypassed" } else { "processing" }
+                if model.is_some_and(|m| m.bypass) { "bypassed" } else { "processing" }
             } else {
                 "inactive"
             },
             "link": link_string(&self.link),
-            "monitor": model.map_or(false, |m| m.monitor.enabled),
+            "monitor": model.is_some_and(|m| m.monitor.enabled),
             "monitor_device": model.and_then(|m| m.monitor.output_device.clone()),
             "autostart": self.autostart,
             "autostart_command": if self.autostart {
@@ -521,23 +521,10 @@ mod tests {
     fn link_strings_are_stable() {
         assert_eq!(link_string(&LinkState::Unlinked), "unlinked");
         assert_eq!(
-            link_string(&LinkState::VersionMismatch {
-                actual: 2,
-                expected: 1
-            }),
+            link_string(&LinkState::VersionMismatch { actual: 2, expected: 1 }),
             "version-mismatch"
         );
-        assert_eq!(
-            link_string(&LinkState::Stale {
-                heartbeat_age_ms: 5
-            }),
-            "stale"
-        );
-        assert_eq!(
-            link_string(&LinkState::Linked {
-                heartbeat_age_ms: 0
-            }),
-            "linked"
-        );
+        assert_eq!(link_string(&LinkState::Stale { heartbeat_age_ms: 5 }), "stale");
+        assert_eq!(link_string(&LinkState::Linked { heartbeat_age_ms: 0 }), "linked");
     }
 }

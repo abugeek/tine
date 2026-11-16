@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use windows::Win32::Foundation::FILETIME;
-use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+use windows::Win32::System::ProcessStatus::{
+    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+};
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 /// Sample cadence while soaking.
@@ -63,11 +65,10 @@ impl Soak {
         let now = Instant::now();
         let (k, u) = cpu_times_us();
         let period_s = self.last_at.elapsed().as_secs_f64().max(1e-3);
-        let cpu_pct =
-            (k.saturating_sub(self.last_kernel_us) + u.saturating_sub(self.last_user_us)) as f64
+        let cpu_pct = (k.saturating_sub(self.last_kernel_us) + u.saturating_sub(self.last_user_us)) as f64
                 / 10_000.0 // µs → ms
                 / period_s
-                * 100.0;
+            * 100.0;
         let (working_set, private_bytes) = memory_bytes();
         let s = Sample {
             t_s: self.started.elapsed().as_secs_f64(),
@@ -127,18 +128,20 @@ fn time_100ns_to_us(t: FILETIME) -> u64 {
 }
 
 fn memory_bytes() -> (u64, u64) {
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
-    // SAFETY: the current process pseudo-handle is valid and `counters` is a
-    // correctly sized `PROCESS_MEMORY_COUNTERS_EX` (cb set below).
-    counters.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    // `cb` set in the initializer: the struct must describe its own size.
+    let cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb,
+        ..PROCESS_MEMORY_COUNTERS_EX::default()
+    };
     // SAFETY: the current process pseudo-handle is valid, and `counters` is a
     // `PROCESS_MEMORY_COUNTERS_EX` with `cb` set to its own size (the API
-    // also accepts it for the plain `PROCESS_MEMORY_COUNTERS` view).
+    // accepts the wider struct for the plain view).
     let ok = unsafe {
         GetProcessMemoryInfo(
             GetCurrentProcess(),
-            &raw mut counters as *mut PROCESS_MEMORY_COUNTERS,
-            counters.cb,
+            (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+            cb,
         )
     };
     if ok.is_ok() {
@@ -150,7 +153,7 @@ fn memory_bytes() -> (u64, u64) {
 
 /// Builds the JSON report document.
 #[must_use]
-pub fn report_json(s: &Soak, notes: Value) -> Value {
+pub fn report_json(s: &Soak, notes: &Value) -> Value {
     let samples: Vec<Value> = s
         .samples()
         .iter()
@@ -164,12 +167,7 @@ pub fn report_json(s: &Soak, notes: Value) -> Value {
             })
         })
         .collect();
-    let avg_cpu = s
-        .samples()
-        .iter()
-        .map(|x| x.cpu_pct)
-        .sum::<f64>()
-        / s.samples().len().max(1) as f64;
+    let avg_cpu = s.samples().iter().map(|x| x.cpu_pct).sum::<f64>() / s.samples().len().max(1) as f64;
     let max_ws = s.samples().iter().map(|x| x.working_set).max().unwrap_or(0);
     let max_priv = s.samples().iter().map(|x| x.private_bytes).max().unwrap_or(0);
     let max_cpu = s.samples().iter().map(|x| x.cpu_pct).fold(0.0, f64::max);
@@ -201,7 +199,10 @@ pub fn write_report(path: &Path, report: &Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(report).unwrap_or_else(|_| b"{}".to_vec()))
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(report).unwrap_or_else(|_| b"{}".to_vec()),
+    )
 }
 
 /// Samples the process in the foreground until the window elapses (CLI mode).
@@ -209,7 +210,12 @@ pub fn write_report(path: &Path, report: &Value) -> std::io::Result<()> {
 /// # Panics
 /// Never: running inside the process it measures; all failures degrade to
 /// zeroed samples.
-pub fn run_blocking(minutes: u64, report_path: &Path, notes: Value, telemetry_seq: impl Fn() -> u64 + Send) -> Value {
+pub fn run_blocking(
+    minutes: u64,
+    report_path: &Path,
+    notes: &Value,
+    telemetry_seq: &(dyn Fn() -> u64 + Send),
+) -> Value {
     let mut soak = Soak::new();
     let deadline = Duration::from_secs(minutes.saturating_mul(60));
     while soak.elapsed() < deadline && !crate::console::interrupted() {
@@ -235,24 +241,30 @@ mod tests {
         assert!(sample.t_s >= 0.0);
         assert!(sample.cpu_pct >= 0.0);
         assert_eq!(sample.telemetry_sequence, 42);
-        let report = report_json(&s, json!({"where": "test"}));
-        let samples = report.get("samples").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+        let report = report_json(&s, &json!({"where": "test"}));
+        let samples = report
+            .get("samples")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(samples.len(), 1);
         assert_eq!(
-            samples[0].get("telemetry_sequence").and_then(|v| v.as_u64()),
+            samples[0].get("telemetry_sequence").and_then(serde_json::Value::as_u64),
             Some(42)
         );
-        assert!(report
-            .get("summary")
-            .and_then(|s| s.get("max_working_set_mb"))
-            .is_some());
+        assert!(
+            report
+                .get("summary")
+                .and_then(|s| s.get("max_working_set_mb"))
+                .is_some()
+        );
     }
 
     #[test]
     fn report_writes_pretty_json_to_disk() {
         let mut s = Soak::new();
-        s.sample(0);
-        let report = report_json(&s, json!({"where": "test"}));
+        let _ = s.sample(0);
+        let report = report_json(&s, &json!({"where": "test"}));
         let dir = std::env::temp_dir().join(format!("tine-soak-{}", std::process::id()));
         let file = dir.join("soak.json");
         write_report(&file, &report).unwrap_or(());

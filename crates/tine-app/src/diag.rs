@@ -38,14 +38,12 @@ pub fn collect(paths: &EnginePaths) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let virtual_cable = tine_engine::apo_admin::find_virtual_cable_sink()
-        .map(|sink| match sink {
-            Some(sink) => json!({ "name": sink.name, "available": sink.is_available }),
-            None => Value::Null,
-        })
-        .unwrap_or(Value::Null);
+    let virtual_cable = tine_engine::apo_admin::find_virtual_cable_sink().map_or(Value::Null, |sink| match sink {
+        Some(sink) => json!({ "name": sink.name, "available": sink.is_available }),
+        None => Value::Null,
+    });
 
-    let settings = hash_endpoint_ids(persist::load_settings(paths).into_value());
+    let settings = hash_endpoint_ids(&persist::load_settings(paths).into_value());
 
     json!({
         "tine_version": version::tine_version(),
@@ -62,7 +60,7 @@ pub fn collect(paths: &EnginePaths) -> Value {
 /// Hashes the endpoint ids in a settings document (`FNV-1a/64`, hex) so the
 /// file has no machine identifiers.
 #[must_use]
-pub fn hash_endpoint_ids(settings: tine_protocol::settings::AppSettings) -> Value {
+pub fn hash_endpoint_ids(settings: &tine_protocol::settings::AppSettings) -> Value {
     json!({
         "schema": settings.schema,
         "selected_endpoint_id": settings.selected_endpoint_id.as_deref().map(crate::hash::fnv64_hex),
@@ -124,11 +122,14 @@ pub fn build_zip(paths: &EnginePaths, extra: Value) -> Vec<(String, Vec<u8>)> {
 ///
 /// # Errors
 /// Returns the io error when the target cannot be written.
-pub fn write(path: &Path, entries: Vec<(String, Vec<u8>)>) -> std::io::Result<()> {
+pub fn write(path: &Path, entries: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let zip = crate::zip::stored_zip(&entries);
+    let zip = crate::zip::stored_zip(entries);
     std::fs::write(path, zip)
 }
 
@@ -161,10 +162,7 @@ fn recent_logs(paths: &EnginePaths, n: usize) -> Vec<RecentLog> {
         if !file.exists() || generation > 20 {
             break;
         }
-        logs.push(RecentLog {
-            _gen: generation,
-            file,
-        });
+        logs.push(RecentLog { _gen: generation, file });
     }
     if n >= logs.len() {
         logs
@@ -189,9 +187,11 @@ mod tests {
 
     #[test]
     fn settings_ids_are_hashed() {
-        let mut s = AppSettings::default();
-        s.selected_endpoint_id = Some("{very-identifying-device-guid}".to_owned());
-        let json = hash_endpoint_ids(s);
+        let s = AppSettings {
+            selected_endpoint_id: Some("{very-identifying-device-guid}".to_owned()),
+            ..AppSettings::default()
+        };
+        let json = hash_endpoint_ids(&s);
         let selected = json
             .as_object()
             .and_then(|o| o.get("selected_endpoint_id"))
@@ -210,7 +210,10 @@ mod tests {
         assert!(obj.contains_key("tine_version"));
         assert!(obj.contains_key("cpu_model"));
         assert!(obj.contains_key("routing"));
-        assert_eq!(obj.get("routing").and_then(Value::as_str), Some("virtual-cable (D-018)"));
+        assert_eq!(
+            obj.get("routing").and_then(Value::as_str),
+            Some("virtual-cable (D-018)")
+        );
         assert!(obj.contains_key("capture_endpoints"));
     }
 

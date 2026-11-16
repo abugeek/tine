@@ -8,12 +8,12 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
-use windows::core::w;
 use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_READ, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ, RegCloseKey, RegDeleteValueW,
+    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
+use windows::core::w;
 
 /// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 const RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -30,6 +30,8 @@ pub fn is_enabled() -> Result<bool, String> {
     // SAFETY: `key` is a valid open `Run` key handle; this is an existence
     // probe (null data pointer, live size slot, per the API contract).
     let mut size = 0u32;
+    // SAFETY: existence probe on an open `Run` key handle: null data pointer,
+    // live size slot, per the `RegQueryValueExW` contract.
     let status = unsafe { RegQueryValueExW(key, VALUE_NAME, None, None, None, Some(&raw mut size)) };
     close_key(key);
     Ok(status == ERROR_SUCCESS)
@@ -53,8 +55,7 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
     let wide: Vec<u16> = OsStr::new(&data).encode_wide().collect();
     // SAFETY: `wide` stays alive for the call; REG_SZ payload is its raw
     // little-endian UTF-16 bytes.
-    let payload =
-        unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * size_of::<u16>()) };
+    let payload = unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * size_of::<u16>()) };
     let key = open_run_key(KEY_SET_VALUE)?;
     // SAFETY: `key` is valid and `payload` matches the REG_SZ contract.
     let status = unsafe { RegSetValueExW(key, VALUE_NAME, None, REG_SZ, Some(payload)) };

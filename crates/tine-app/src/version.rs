@@ -1,10 +1,10 @@
 //! Version and host introspection for `status` and `diag` (control-plane
 //! thread only).
 
-use windows::core::{PCWSTR, w};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
 };
+use windows::core::{PCWSTR, w};
 
 /// The `tine.exe` crate version (from Cargo).
 #[must_use]
@@ -34,9 +34,9 @@ fn close_key(key: HKEY) {
 /// Reads a `REG_SZ` value under a `HKLM` key; returns `None` on any failure.
 fn read_reg_string(key_path: PCWSTR, value: PCWSTR) -> Option<String> {
     let key = open_hklm_key(key_path)?;
-    // SAFETY: size probe with a null data buffer and a live size slot.
     let mut needed = 0u32;
     unsafe {
+        // SAFETY: size probe with a null data buffer and a live size slot.
         let _ = RegQueryValueExW(key, value, None, None, None, Some(&raw mut needed));
     }
     if needed == 0 || needed > 64 * 1024 {
@@ -46,19 +46,19 @@ fn read_reg_string(key_path: PCWSTR, value: PCWSTR) -> Option<String> {
     let mut buf = vec![0u8; needed as usize];
     let mut read = needed;
     // SAFETY: `buf` covers `needed` writable bytes as reported by the probe.
-    let ok = unsafe {
-        RegQueryValueExW(key, value, None, None, Some(buf.as_mut_ptr()), Some(&raw mut read))
-    };
+    let ok = unsafe { RegQueryValueExW(key, value, None, None, Some(buf.as_mut_ptr()), Some(&raw mut read)) };
     close_key(key);
     if ok.is_err() {
         return None;
     }
     buf.truncate(read as usize);
-    // The payload is NUL-terminated UTF-16.
-    let units: Vec<u16> = buf
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    // The payload is NUL-terminated UTF-16 (little-endian on-disk bytes).
+    let mut units: Vec<u16> = Vec::with_capacity(buf.len() / 2);
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        units.push(u16::from_le_bytes([buf[i], buf[i + 1]]));
+        i += 2;
+    }
     let trimmed: &[u16] = match units.iter().position(|&u| u == 0) {
         Some(zero) => &units[..zero],
         None => &units,
@@ -73,7 +73,9 @@ fn read_reg_string(key_path: PCWSTR, value: PCWSTR) -> Option<String> {
 pub fn windows_edition() -> String {
     let product = read_reg_string(WINVER_KEY, w!("ProductName")).unwrap_or_else(|| "Windows".to_owned());
     let build = read_reg_string(WINVER_KEY, w!("CurrentBuild")).unwrap_or_default();
-    let ubr = read_reg_string_u32(WINVER_KEY, w!("UBR")).map(|n| n.to_string()).unwrap_or_default();
+    let ubr = read_reg_string_u32(WINVER_KEY, w!("UBR"))
+        .map(|n| n.to_string())
+        .unwrap_or_default();
     let display = read_reg_string(WINVER_KEY, w!("DisplayVersion")).unwrap_or_default();
     let build_str = if build.is_empty() {
         String::new()
@@ -91,9 +93,7 @@ fn read_reg_string_u32(key_path: PCWSTR, value: PCWSTR) -> Option<u32> {
     let mut data = [0u8; 4];
     let mut read = 4u32;
     // SAFETY: `data` covers 4 bytes as required for a REG_DWORD read.
-    let ok = unsafe {
-        RegQueryValueExW(key, value, None, None, Some(data.as_mut_ptr()), Some(&raw mut read))
-    };
+    let ok = unsafe { RegQueryValueExW(key, value, None, None, Some(data.as_mut_ptr()), Some(&raw mut read)) };
     close_key(key);
     if ok.is_err() || read < 4 {
         return None;
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn version_string_comes_from_cargo() {
-        assert!(!tine_version().is_empty());
+        assert!(!tine_version().is_empty(), "the Cargo version must not be empty");
     }
 
     #[test]

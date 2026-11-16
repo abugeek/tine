@@ -10,14 +10,15 @@
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::core::{PCWSTR, w};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, SetConsoleCtrlHandler, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-    STD_HANDLE,
+    ATTACH_PARENT_PROCESS, AttachConsole, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    SetStdHandle,
 };
+use windows::core::{PCWSTR, w};
 
 /// Set while the console Ctrl handler saw an interrupt (checked by long CLI
 /// operations like `soak` so they can exit cleanly).
@@ -85,7 +86,7 @@ fn rebind_std(which: STD_HANDLE, name: PCWSTR) {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
-            Default::default(),
+            FILE_FLAGS_AND_ATTRIBUTES::default(),
             None,
         )
     };

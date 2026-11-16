@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 use lexopt::Parser;
 use serde_json::{Value, json};
-use tine_protocol::params::{SPECS, ParamId};
-use tine_protocol::presets::Archetype;
 use tine_engine::model::Macro;
+use tine_protocol::params::{ParamId, SPECS};
+use tine_protocol::presets::Archetype;
 
 use crate::proto::{PipeRequest, PipeResponse, exit_code};
 use crate::single_instance;
@@ -191,7 +191,7 @@ fn scan(mut parser: Parser) -> Result<Args, String> {
 /// Returns a usage error message for malformed invocations (empty string =
 /// plain `--help`).
 pub fn parse(args: Vec<OsString>) -> Result<Mode, String> {
-    let args = scan(Parser::from_args(args.into_iter()))?;
+    let args = scan(Parser::from_args(args))?;
     if args.flag("version").is_some() {
         return Ok(Mode::Version);
     }
@@ -218,8 +218,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Mode, String> {
         "diag" => CliCommand::Diag {
             out: p
                 .value("out")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("tine-diag.zip")),
+                .map_or_else(|| PathBuf::from("tine-diag.zip"), PathBuf::from),
         },
         "set" => CliCommand::Set {
             key: take_word(&p, 0, "set <key> <value>")?,
@@ -285,8 +284,8 @@ fn take_f32(p: &Args, idx: usize, usage: &str) -> Result<f32, String> {
 
 fn on_off(p: &Args, idx: usize, usage: &str) -> Result<bool, String> {
     match p.positional.get(idx).map(String::as_str) {
-        Some("on") | Some("1") | Some("true") => Ok(true),
-        Some("off") | Some("0") | Some("false") => Ok(false),
+        Some("on" | "1" | "true") => Ok(true),
+        Some("off" | "0" | "false") => Ok(false),
         _ => Err(format!("usage: tine {usage}")),
     }
 }
@@ -319,30 +318,28 @@ pub fn run(cmd: CliCommand) -> i32 {
     match cmd {
         CliCommand::Status => cmd_status(),
         CliCommand::Diag { out } => cmd_diag(&out),
-        CliCommand::Set { key, value } => forward(PipeRequest::Set { key, value }, "set"),
+        CliCommand::Set { key, value } => forward(&PipeRequest::Set { key, value }, "set"),
         CliCommand::Macro { name, value } => {
             if Macro::from_name(&name).is_none() {
                 println!("error: unknown macro `{name}` (purity|body|presence|leveler)");
                 return exit_code::USAGE;
             }
-            forward(PipeRequest::Macro { name, value }, "macro")
+            forward(&PipeRequest::Macro { name, value }, "macro")
         }
         CliCommand::Archetype { name } => {
             if archetype_from_name(&name).is_none() {
                 println!("error: unknown archetype `{name}` (dynamic|condenser|headset|laptop)");
                 return exit_code::USAGE;
             }
-            forward(PipeRequest::Archetype { name }, "archetype")
+            forward(&PipeRequest::Archetype { name }, "archetype")
         }
-        CliCommand::Bypass { on } => forward(PipeRequest::Bypass { on }, "bypass"),
-        CliCommand::Monitor { on, device } => {
-            forward(PipeRequest::Monitor { on, device }, "monitor")
-        }
-        CliCommand::Calibrate => forward(PipeRequest::Calibrate, "calibrate"),
-        CliCommand::Meters => forward(PipeRequest::Meters, "meters"),
+        CliCommand::Bypass { on } => forward(&PipeRequest::Bypass { on }, "bypass"),
+        CliCommand::Monitor { on, device } => forward(&PipeRequest::Monitor { on, device }, "monitor"),
+        CliCommand::Calibrate => forward(&PipeRequest::Calibrate, "calibrate"),
+        CliCommand::Meters => forward(&PipeRequest::Meters, "meters"),
         CliCommand::Apo { sub, endpoint } => cmd_apo(sub, endpoint.as_deref()),
         CliCommand::Soak { minutes, report } => forward(
-            PipeRequest::Soak {
+            &PipeRequest::Soak {
                 minutes,
                 report: report.display().to_string(),
             },
@@ -351,9 +348,9 @@ pub fn run(cmd: CliCommand) -> i32 {
     }
 }
 
-fn forward(req: PipeRequest, what: &str) -> i32 {
+fn forward(req: &PipeRequest, what: &str) -> i32 {
     let name = single_instance::pipe_name_for_user();
-    match single_instance::send_request(&name, &req) {
+    match single_instance::send_request(&name, req) {
         Ok(resp) => {
             print_response(&resp, what);
             resp.code
@@ -396,15 +393,15 @@ fn compact(v: &Value, key: &str) -> String {
         Value::Null => String::new(),
         Value::Number(n) => n.to_string(),
         other => match key {
-            "telemetry" | "macros" => other
-                .as_object()
-                .map(|o| {
+            "telemetry" | "macros" => other.as_object().map_or_else(
+                || other.to_string(),
+                |o| {
                     o.iter()
                         .map(|(k, v)| format!("{k}={}", compact(v, k)))
                         .collect::<Vec<_>>()
                         .join(" ")
-                })
-                .unwrap_or_else(|| other.to_string()),
+                },
+            ),
             _ => other.to_string(),
         },
     }
@@ -422,15 +419,22 @@ fn cmd_status() -> i32 {
             };
             let started = field("uptime_s")
                 .as_f64()
-                .map(|s| format!("{s:.0} s"))
-                .unwrap_or_else(|| "—".to_owned());
+                .map_or_else(|| "—".to_owned(), |s| format!("{s:.0} s"));
             println!("tine {} — running ({started})", crate::version::tine_version());
-            println!("endpoint: {} ({})", compact(&field("mic_name"), "mic_name"), compact(&field("endpoint_id"), "endpoint_id"));
+            println!(
+                "endpoint: {} ({})",
+                compact(&field("mic_name"), "mic_name"),
+                compact(&field("endpoint_id"), "endpoint_id")
+            );
             println!("archetype: {}", compact(&field("archetype"), "archetype"));
             println!("state: {}", compact(&field("state"), "state"));
             println!("link: {}", compact(&field("link"), "link"));
             println!("autostart: {}", compact(&field("autostart"), "autostart"));
-            println!("monitor: {} ({})", compact(&field("monitor"), "monitor"), compact(&field("monitor_device"), "monitor_device"));
+            println!(
+                "monitor: {} ({})",
+                compact(&field("monitor"), "monitor"),
+                compact(&field("monitor_device"), "monitor_device")
+            );
             println!("windows: {}", compact(&field("windows"), "windows"));
             exit_code::OK
         }
@@ -443,7 +447,10 @@ fn cmd_status() -> i32 {
             println!("tine {} — not running", crate::version::tine_version());
             println!("windows: {}", crate::version::windows_edition());
             println!("cpu: {}", crate::version::cpu_model());
-            println!("autostart: {}", crate::autostart::is_enabled().map(|b| b.to_string()).unwrap_or_else(|e| e));
+            println!(
+                "autostart: {}",
+                crate::autostart::is_enabled().map_or_else(|e| e, |b| b.to_string())
+            );
             println!("capture endpoints:");
             match tine_engine::apo_admin::list_capture_endpoints() {
                 Ok(list) => {
@@ -476,7 +483,7 @@ fn cmd_diag(out: &std::path::Path) -> i32 {
         }
     });
     let entries = crate::diag::build_zip(&paths, extra);
-    match crate::diag::write(out, entries) {
+    match crate::diag::write(out, &entries) {
         Ok(()) => {
             println!("wrote {}", out.display());
             exit_code::OK
@@ -491,9 +498,7 @@ fn cmd_diag(out: &std::path::Path) -> i32 {
 fn cmd_apo(sub: ApoSub, endpoint: Option<&str>) -> i32 {
     match sub {
         ApoSub::Status => match tine_engine::apo_admin::list_capture_endpoints() {
-            Ok(list)
-                if list.is_empty() && endpoint.is_none() =>
-            {
+            Ok(list) if list.is_empty() && endpoint.is_none() => {
                 println!("no capture endpoints found");
                 exit_code::OK
             }
@@ -508,9 +513,9 @@ fn cmd_apo(sub: ApoSub, endpoint: Option<&str>) -> i32 {
                     }
                     matched += 1;
                     println!(
-                        "{} [{}] — {} ({})",
+                        "{} [{:?}] — {} ({})",
                         ep.name,
-                        format!("{:?}", ep.form_factor),
+                        ep.form_factor,
                         crate::diag::apo_state_string(&ep.state),
                         ep.id
                     );
@@ -586,7 +591,10 @@ mod tests {
     }
 
     fn app() -> Mode {
-        Mode::App { background: false, metrics: false }
+        Mode::App {
+            background: false,
+            metrics: false,
+        }
     }
 
     #[test]
@@ -594,11 +602,17 @@ mod tests {
         assert_eq!(super::parse(argv(&[])), Ok(app()));
         assert_eq!(
             super::parse(argv(&["--background"])),
-            Ok(Mode::App { background: true, metrics: false })
+            Ok(Mode::App {
+                background: true,
+                metrics: false
+            })
         );
         assert_eq!(
             super::parse(argv(&["--background", "--metrics"])),
-            Ok(Mode::App { background: true, metrics: true })
+            Ok(Mode::App {
+                background: true,
+                metrics: true
+            })
         );
     }
 
@@ -623,7 +637,9 @@ mod tests {
         );
         assert_eq!(
             super::parse(argv(&["archetype", "laptop"])),
-            Ok(Mode::Cli(CliCommand::Archetype { name: "laptop".to_owned() }))
+            Ok(Mode::Cli(CliCommand::Archetype {
+                name: "laptop".to_owned()
+            }))
         );
     }
 
@@ -642,15 +658,23 @@ mod tests {
     fn parses_diag_apo_soak() {
         assert_eq!(
             super::parse(argv(&["diag"])),
-            Ok(Mode::Cli(CliCommand::Diag { out: "tine-diag.zip".into() }))
+            Ok(Mode::Cli(CliCommand::Diag {
+                out: "tine-diag.zip".into()
+            }))
         );
         assert_eq!(
             super::parse(argv(&["apo", "status", "--endpoint", "mic0"])),
-            Ok(Mode::Cli(CliCommand::Apo { sub: ApoSub::Status, endpoint: Some("mic0".to_owned()) }))
+            Ok(Mode::Cli(CliCommand::Apo {
+                sub: ApoSub::Status,
+                endpoint: Some("mic0".to_owned())
+            }))
         );
         assert_eq!(
             super::parse(argv(&["soak", "--minutes", "1", "--report", "target/soak.json"])),
-            Ok(Mode::Cli(CliCommand::Soak { minutes: 1, report: "target/soak.json".into() }))
+            Ok(Mode::Cli(CliCommand::Soak {
+                minutes: 1,
+                report: "target/soak.json".into()
+            }))
         );
     }
 
@@ -666,9 +690,12 @@ mod tests {
 
     #[test]
     fn help_and_errors() {
-        assert!(matches!(super::parse(argv(&["--help"])), Err(_)));
+        assert!(super::parse(argv(&["--help"])).is_err());
         assert!(super::parse(argv(&["frobnicate"])).is_err());
-        assert!(super::parse(argv(&["soak", "--report", "x"])).is_err(), "missing --minutes");
+        assert!(
+            super::parse(argv(&["soak", "--report", "x"])).is_err(),
+            "missing --minutes"
+        );
         assert!(super::parse(argv(&["bypass", "maybe"])).is_err());
     }
 

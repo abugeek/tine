@@ -135,34 +135,52 @@ pub fn build_menu(s: &TraySnapshot) -> Vec<TrayItem> {
     items
 }
 
-/// Generates the tuning-fork glyph icon in the variant's palette
+/// Tuning-fork silhouette test (24×24 pixel space): two prongs, a bridge,
+/// a stem. Plain range checks so the test stays `const`.
+const fn fork_glyph(x: u32, y: u32) -> bool {
+    let in_prong = x >= 6 && x <= 8;
+    let in_prong_r = x >= 15 && x <= 17;
+    let in_bridge_span = x >= 6 && x <= 17;
+    let in_bridge_h = y >= 13 && y <= 15;
+    let in_stem_h = x >= 11 && x <= 12;
+    let in_body = y >= 3 && y <= 13;
+    let in_stem = y >= 15 && y <= 21;
+    let prong_l = in_prong && in_body;
+    let prong_r = in_prong_r && in_body;
+    let bridge = in_bridge_span && in_bridge_h;
+    let stem = in_stem_h && in_stem;
+    prong_l || prong_r || bridge || stem
+}
+
+/// Generates the tuning-fork glyph pixels in the variant's palette
 /// (runtime-generated RGBA, 24×24 — no external asset needed).
 #[must_use]
-pub fn make_icon(variant: TrayVariant) -> TrayIcon {
+pub fn fork_pixels(variant: TrayVariant) -> (u32, u32, Vec<u8>) {
     const W: u32 = 24;
     const H: u32 = 24;
     let rgb: [u8; 3] = match variant {
-        TrayVariant::Active => [0x38, 0xBD, 0xF8], // accent cyan
+        TrayVariant::Active => [0x38, 0xBD, 0xF8],   // accent cyan
         TrayVariant::Bypassed => [0xFB, 0xBF, 0x24], // amber
-        TrayVariant::Error => [0xF8, 0x71, 0x71], // red
+        TrayVariant::Error => [0xF8, 0x71, 0x71],    // red
     };
     let mut rgba = vec![0u8; (W * H * 4) as usize];
-    for (idx, pixel) in rgba.chunks_exact_mut(4).enumerate() {
-        let x = u32::try_from(idx % W as usize).unwrap_or(0);
-        let y = u32::try_from(idx / W as usize).unwrap_or(0);
-        // Tuning-fork silhouette: two prongs, a bridge, a stem.
-        let prong_l = (6..=8).contains(&x) && (3..=13).contains(&y);
-        let prong_r = (15..=17).contains(&x) && (3..=13).contains(&y);
-        let bridge = (6..=17).contains(&x) && (13..=15).contains(&y);
-        let stem = (11..=12).contains(&x) && (15..=21).contains(&y);
-        if prong_l || prong_r || bridge || stem {
-            pixel[0] = rgb[0];
-            pixel[1] = rgb[1];
-            pixel[2] = rgb[2];
-            pixel[3] = 0xFF;
+    for i in 0..W * H {
+        if fork_glyph(i % W, i / W) {
+            let base = (i * 4) as usize;
+            rgba[base] = rgb[0];
+            rgba[base + 1] = rgb[1];
+            rgba[base + 2] = rgb[2];
+            rgba[base + 3] = 0xFF;
         }
     }
-    TrayIcon::rgba(W, H, rgba)
+    (W, H, rgba)
+}
+
+/// Wraps [`fork_pixels`] into a `rune::TrayIcon`.
+#[must_use]
+pub fn make_icon(variant: TrayVariant) -> TrayIcon {
+    let (w, h, rgba) = fork_pixels(variant);
+    TrayIcon::rgba(w, h, rgba)
 }
 
 /// Creates the tray for the given snapshot.
@@ -185,7 +203,7 @@ pub fn create(s: &TraySnapshot, on_event: impl Fn(TrayEvent) + Send + Sync + 'st
 
 #[cfg(test)]
 mod tests {
-    use super::{TraySnapshot, TrayVariant, build_menu, make_icon, menu_id};
+    use super::{TraySnapshot, TrayVariant, build_menu, menu_id};
     use tine_protocol::presets::Archetype;
 
     #[test]
@@ -204,7 +222,6 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 rune::TrayItem::Action { label, .. } => Some(label.as_str()),
-                rune::TrayItem::Separator => None,
                 _ => None,
             })
             .collect();
@@ -227,7 +244,6 @@ mod tests {
             .into_iter()
             .filter_map(|item| match item {
                 rune::TrayItem::Action { label, .. } => Some(label),
-                rune::TrayItem::Separator => None,
                 _ => None,
             })
             .collect();
@@ -241,7 +257,6 @@ mod tests {
             .into_iter()
             .filter_map(|item| match item {
                 rune::TrayItem::Action { id, .. } => Some(id),
-                rune::TrayItem::Separator => None,
                 _ => None,
             })
             .collect();
@@ -286,13 +301,13 @@ mod tests {
             let (w, h, rgba) = super::fork_pixels(variant);
             assert_eq!((w, h), (24, 24));
             assert_eq!(rgba.len(), 24 * 24 * 4);
-            assert!(rgba.chunks_exact(4).all(|p| p[3] == 0 || p[3] == 0xFF));
-            let any_of_variant = rgba.chunks_exact(4).any(|p| p[0] == leading);
-            assert!(any_of_variant, "no {leading:#x} pixels for {variant:?}");
-            let (w2, h2) = (w, h);
-            let icon = super::make_icon(variant);
-            assert_eq!((w2, h2), (24, 24));
-            let _ = icon;
+            // Alpha is every 4th byte (offset 3); red is every 4th from 0.
+            assert!(rgba.iter().skip(3).step_by(4).all(|&a| a == 0 || a == 0xFF));
+            assert!(
+                rgba.iter().step_by(4).any(|&r| r == leading),
+                "no {leading:#x} pixels for {variant:?}"
+            );
+            let _ = super::make_icon(variant);
         }
     }
 }

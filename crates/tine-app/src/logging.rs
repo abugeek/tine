@@ -39,7 +39,7 @@ impl RotatingFile {
         let base = dir.join("tine.log");
         prune_dir(dir, KEEP);
         let file = open_append(&base)?;
-        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let written = file.metadata().map_or(0, |m| m.len());
         Ok(Self {
             dir: dir.to_owned(),
             file: Some(file),
@@ -90,15 +90,14 @@ impl RotatingFile {
 
 impl Write for RotatingFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.written >= self.max_bytes {
+        // Rotate *before* the active file would pass the cap, so a single
+        // large line never overflows into the next generation by half.
+        if self.written > 0 && self.written.saturating_add(buf.len() as u64) > self.max_bytes {
             self.rotate();
         }
         let file = match &mut self.file {
             Some(f) => f,
-            None => match open_append(&self.dir.join("tine.log")) {
-                Ok(f) => self.file.insert(f),
-                Err(e) => return Err(e),
-            },
+            None => self.file.insert(open_append(&self.dir.join("tine.log"))?),
         };
         file.write_all(buf)?;
         self.written = self.written.saturating_add(buf.len() as u64);
@@ -143,7 +142,7 @@ fn prune_dir(dir: &Path, keep: u32) {
         })
         .collect();
     logs.sort_by_key(|(n, _)| *n);
-        // Generation 0 is the live file; only generations >= keep - 1 remaining
+    // Generation 0 is the live file; only generations >= keep - 1 remaining
     // after a roll would exceed the budget.
     let max_gen = keep.saturating_sub(1);
     for (n, path) in logs {
@@ -225,14 +224,14 @@ mod tests {
     #[test]
     fn rotates_at_max_and_deletes_oldest() {
         let dir = temp("rotate");
-        let mut f = RotatingFile::with_limits(&dir, 120, 4).unwrap();
+        let mut f = RotatingFile::with_limits(&dir, 120, 4).expect("open");
         let line = format!("{}\n", "x".repeat(100));
         for _ in 0..60 {
-            write!(f, "{line}").unwrap();
+            f.write_all(line.as_bytes()).expect("write");
         }
         let mut names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
         // Cap: tine.log + tine.1.log + tine.2.log + tine.3.log.
@@ -244,9 +243,12 @@ mod tests {
     #[test]
     fn first_write_then_rollover_keeps_tail() {
         let dir = temp("tail");
-        let mut f = RotatingFile::with_limits(&dir, 50, 3).unwrap();
-        write!(f, "short line\n").unwrap();
-        write!(f, "{}\n", "y".repeat(200)).unwrap();
+        let mut f = RotatingFile::with_limits(&dir, 50, 3).expect("open");
+        f.write_all(b"short line\n").expect("write");
+        // One `write_all` of the whole oversized line, like tracing emits it.
+        let mut long_line = vec![b'y'; 200];
+        long_line.push(b'\n');
+        f.write_all(&long_line).expect("write");
         let content = std::fs::read_to_string(dir.join("tine.log")).unwrap_or_default();
         assert!(content.starts_with('y'), "fresh file holds the long line");
         assert!(dir.join(rolled_name(1)).exists(), "previous file rolled");

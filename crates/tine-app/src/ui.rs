@@ -20,6 +20,7 @@ use crate::single_instance;
 const STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Placeholder UI state.
+#[derive(Default)]
 struct UiState {
     /// Latest status payload from the parent (`None` until it answers).
     status: Option<Value>,
@@ -33,7 +34,11 @@ struct UiState {
 fn fetch_status() -> Result<Value, String> {
     let name = single_instance::pipe_name_for_user();
     match single_instance::send_request(&name, &PipeRequest::Status) {
-        Ok(PipeResponse { ok: true, data: Some(data), .. }) => Ok(data),
+        Ok(PipeResponse {
+            ok: true,
+            data: Some(data),
+            ..
+        }) => Ok(data),
         Ok(resp) => Err(resp.error.unwrap_or_else(|| "unexpected reply".to_owned())),
         Err(e) => Err(e),
     }
@@ -61,13 +66,16 @@ fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             .key(key)
             .gap(space::S3)
             .child(
-                el()
-                    .w(110.0)
+                el().w(110.0)
                     .child(text(label).font(type_::LABEL).color(t.text_secondary)),
             )
             .child(text(field(s, key)).font(type_::BODY).color(t.text))
     };
-    let live_dot = if s.ticks.is_multiple_of(2) { accent } else { t.text_secondary };
+    let live_dot = if s.ticks.is_multiple_of(2) {
+        accent
+    } else {
+        t.text_secondary
+    };
     col()
         .key("root")
         .w_full()
@@ -97,35 +105,32 @@ fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
         .child(line("link", "Link"))
         .child(line("autostart", "Autostart"))
         .child(
-            text(s.error.clone().map(|e| format!("{e}")).unwrap_or_default())
+            text(s.error.clone().unwrap_or_default())
                 .font(type_::BODY)
                 .color(t.text_secondary),
         )
         .child(
-            row()
-                .key("actions")
-                .gap(space::S2)
-                .child(
-                    row()
-                        .key("close-button")
-                        .role("button")
-                        .label("Close")
-                        .focusable(true)
-                        .h(30.0)
-                        .px(space::S3)
-                        .center()
-                        .radius(radius::MD)
-                        .fill(t.card)
-                        .border(1.0, t.card_border)
-                        .on_press_tx(|_: &mut UiState, tx| tx.close_window())
-                        .child(text("Close").font(type_::LABEL).color(t.text)),
-                ),
+            row().key("actions").gap(space::S2).child(
+                row()
+                    .key("close-button")
+                    .role("button")
+                    .label("Close")
+                    .focusable(true)
+                    .h(30.0)
+                    .px(space::S3)
+                    .center()
+                    .radius(radius::MD)
+                    .fill(t.card)
+                    .border(1.0, t.card_border)
+                    .on_press_tx(|_: &mut UiState, tx| tx.close_window())
+                    .child(text("Close").font(type_::LABEL).color(t.text)),
+            ),
         )
 }
 
 fn on_key(_: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     match ev.key {
-        Key::Command('w') | Key::Command('q') | Key::Escape => tx.close_window(),
+        Key::Command('w' | 'q') | Key::Escape => tx.close_window(),
         _ => return false,
     }
     true
@@ -148,11 +153,7 @@ pub fn run_ui_child() {
         // stopped when this process exits (window closed). Until then the
         // placeholder polls the parent's status snapshot (below).
         tracing::info!(target: "tine::ui", "UI child started (placeholder view)");
-        UiState {
-            status: None,
-            error: None,
-            ticks: 0,
-        }
+        UiState::default()
     })
     .on_window(|_| {
         tracing::debug!(target: "tine::ui", "window opened");
@@ -161,35 +162,27 @@ pub fn run_ui_child() {
     let handle = app.handle();
     std::thread::Builder::new()
         .name("tine-status-poll".to_owned())
-        .spawn(move || loop {
-            match fetch_status() {
-                Ok(status) => {
-                    handle.update(move |s, _| {
-                        s.status = Some(status);
-                        s.error = None;
-                        s.ticks = s.ticks.wrapping_add(1);
-                    });
+        .spawn(move || {
+            loop {
+                match fetch_status() {
+                    Ok(status) => {
+                        handle.update(move |s, _| {
+                            s.status = Some(status);
+                            s.error = None;
+                            s.ticks = s.ticks.wrapping_add(1);
+                        });
+                    }
+                    Err(e) => {
+                        handle.update(move |s, _| {
+                            s.error = Some(e);
+                            s.ticks = s.ticks.wrapping_add(1);
+                        });
+                    }
                 }
-                Err(e) => {
-                    handle.update(move |s, _| {
-                        s.error = Some(e);
-                        s.ticks = s.ticks.wrapping_add(1);
-                    });
-                }
+                std::thread::sleep(STATUS_POLL);
             }
-            std::thread::sleep(STATUS_POLL);
         })
         .ok();
 
     app.run();
-}
-
-impl Default for UiState {
-    fn default() -> Self {
-        Self {
-            status: None,
-            error: None,
-            ticks: 0,
-        }
-    }
 }
