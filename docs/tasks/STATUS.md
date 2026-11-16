@@ -12,7 +12,7 @@
 | T08 | Stage 5–6: compressor, lookahead limiter | A — DSP | done | `task/T08-dsp-dynamics` | #11 | T08-worker |
 | T09 | Wire stages, fixtures, golden regression, perf gate | A — DSP | done | `task/T09-dsp-integration` | #15 | t09 (GLM) |
 | T10 | Archetype presets + `MacroMapper` | A — DSP | done | `task/T10-archetypes-macros` | #16 | t10 (GLM) |
-| T11 | `AutoCalibrator` | A — DSP | todo | — | — | — |
+| T11 | `AutoCalibrator` | A — DSP | done | `task/T11-auto-calibrator` | #20 | t11 (GLM) |
 | T12 | cpal audio I/O module + `tine-devhost` | C — Engine / App | done | `task/T12-audio-io` | #9 | T12-worker |
 | T13 | Virtual-cable DSP routing loop (`D-018`) | B — Virtual Cable | done | `task/T13-virtual-cable` | #13 | T13-worker |
 | T14 | Virtual cable discovery, DeviceWatcher & endpoint admin (`D-018`) | B — Virtual Cable | done | `task/T14-endpoint-admin` | #12 | T14-worker |
