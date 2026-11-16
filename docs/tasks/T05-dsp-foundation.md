@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: T05-worker) |
 | Lane | 0 — Foundation |
 | Depends on | T04 |
 | Unblocks | T06, T07, T08 (stages), T12 (devhost), T13 (APO) |
