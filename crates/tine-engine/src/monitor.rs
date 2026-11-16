@@ -221,7 +221,6 @@ mod tests {
         // Warm-up (buffers fill, drift control settles), then the soak.
         std::thread::sleep(std::time::Duration::from_secs(2));
         let mut last_stats = monitor.stats();
-        let _ = last_stats.clone();
         while start.elapsed() < std::time::Duration::from_secs(secs) {
             std::thread::sleep(std::time::Duration::from_secs(5));
             last_stats = monitor.stats();
