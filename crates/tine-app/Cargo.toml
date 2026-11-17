@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "tine_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tine"
 path = "src/main.rs"
@@ -15,6 +19,7 @@ default = []
 ui-tooling = ["tine-ui/tooling", "rune/tooling"]
 
 [dependencies]
+tine-dsp = { workspace = true, features = ["std"] }
 tine-engine.workspace = true
 tine-protocol.workspace = true
 tine-ui.workspace = true
@@ -26,6 +31,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_System_Memory",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
@@ -38,3 +44,6 @@ windows = { workspace = true, features = [
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
