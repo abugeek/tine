@@ -1,0 +1,214 @@
+<!--
+  Tine MSI (T23). WiX v5 (wix CLI 5.x), per-machine, x64.
+
+  Decision D-030: under the D-018 virtual-cable topology there is NO APO DLL and
+  NO COM registration in this installer. It only:
+    - copies tine.exe + the dual-license texts to ProgramFiles64Folder\Tine\
+    - creates ProgramData\Tine\endpoints\ with a Users-modify ACL
+      (the unelevated app persists per-endpoint boot params there, D-022)
+    - adds an all-users Start-menu shortcut
+    - writes the HKCU Run autostart value (D-025): quoted exe path + the
+      "-background" flag
+    - stops a running tine.exe so upgrades replace the file without a reboot
+  Uninstall removes app files, the shortcut and the Run key. User data
+  (APPDATA\Tine, LOCALAPPDATA\Tine, ProgramData\Tine) is KEPT by default;
+  "msiexec /x {ProductCode} REMOVESAVEDDATA=1" opts into deleting it (D-030).
+
+  Build (see build-msi.ps1):
+    wix extension add WixToolset.UI.wixext/5.0.2 (and Util), then
+    wix build -arch x64 -d Version=x.y.z -d ReleaseDir=... packaging\tine.wxs
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <!-- Stable across releases: upgrades of any 0.x replace this product. -->
+  <?ifndef UpgradeCodeGuid?>
+  <?define UpgradeCodeGuid = "159d5692-2ccf-4639-8f1a-b4b4331f41bc"?>
+  <?endif?>
+  <?ifndef Version?>
+  <?define Version = "0.1.0"?>
+  <?endif?>
+  <?ifndef ReleaseDir?>
+  <?define ReleaseDir = "..\target\release"?>
+  <?endif?>
+  <?ifndef RepoDir?>
+  <?define RepoDir = ".."?>
+  <?endif?>
+
+  <Package Name="Tine"
+           Manufacturer="Tine Contributors"
+           Version="$(var.Version)"
+           UpgradeCode="$(var.UpgradeCodeGuid)"
+           Scope="perMachine"
+           Language="1033"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <SummaryInformation Description="Tine microphone conditioner $(var.Version) (virtual-cable routing)" />
+
+    <!-- Windows 10 22H2+ / Windows 11, x64 (D-001); InstallerVersion 500 ships
+         with Win7+, so the launch gate is only about the 64-bit OS floor. -->
+    <Launch Message="Tine requires a 64-bit Windows 10 (22H2 or newer) or Windows 11."
+            Condition="Installed OR VersionNT64 &gt;= 603" />
+
+    <MajorUpgrade Schedule="afterInstallValidate"
+                 DowngradeErrorMessage="A newer version of Tine is already installed. Uninstall that version first." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- App metadata shown in Apps & Features. -->
+    <Property Id="ARPCOMMENTS" Value="Ultra-lightweight native microphone DSP engine" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/abugeek/tine" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/abugeek/tine" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <!-- WixUI_InstallDir: minimal MSI UI (license dialog + install dir). -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoDir)\packaging\license.rtf" Overridable="yes" />
+
+    <!-- Optional "Run Tine now" checkbox on the exit dialog (first run
+         starts onboarding, including virtual-cable validation). -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Run Tine now" />
+
+    <util:CloseApplication Id="CloseTine"
+                           Target="tine.exe"
+                           CloseMessage="yes"
+                           RebootPrompt="no"
+                           TerminateProcess="0" />
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="TineShortcutDir" Name="Tine" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="Tine">
+        <Directory Id="LicenseDir" Name="license" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Machine-wide data. The endpoints\ ACL is the whole point (D-022):
+         the user-session app runs unelevated and writes boot params here -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="TineProgramDataDir" Name="Tine">
+        <Directory Id="EndpointsDataDir" Name="endpoints" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Per-user data locations (kept on uninstall by default; only the
+         REMOVESAVEDDATA custom actions below touch them, on explicit request).
+         They are never created by the installer itself. -->
+    <StandardDirectory Id="AppDataFolder">
+      <Directory Id="TineRoamingDir" Name="Tine">
+        <Directory Id="ProfilesDir" Name="profiles" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="TineLocalDir" Name="Tine">
+        <Directory Id="LogsDir" Name="logs" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="ProductFeature" Title="Tine" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+
+    <ComponentGroup Id="ProductComponents">
+      <!-- tine.exe + Start-menu shortcut. -->
+      <Component Id="TineExe" Directory="INSTALLDIR" Bitness="always64">
+        <File Id="tine.exe"
+              Name="tine.exe"
+              Source="$(var.ReleaseDir)\tine.exe"
+              KeyPath="yes" />
+        <Shortcut Id="StartMenuShortcut"
+                  Directory="TineShortcutDir"
+                  Name="Tine"
+                  Description="Tine microphone conditioner"
+                  WorkingDirectory="INSTALLDIR" />
+        <RemoveFolder Id="RemoveShortcutDir" Directory="TineShortcutDir" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\Tine" Name="StartMenuShortcut"
+                       Type="integer" Value="1" />
+      </Component>
+
+      <!-- Dual-license texts bundled for the installer (D-015). -->
+      <Component Id="LicenseMit" Directory="LicenseDir" Bitness="always64">
+        <File Id="license_mit.txt" Source="$(var.RepoDir)\LICENSE-MIT" KeyPath="yes" />
+      </Component>
+      <Component Id="LicenseApache" Directory="LicenseDir" Bitness="always64">
+        <File Id="license_apache.txt" Source="$(var.RepoDir)\LICENSE-APACHE" KeyPath="yes" />
+      </Component>
+
+      <!-- ProgramData\Tine root (default inherited ACL). -->
+      <Component Id="ProgramDataRoot" Directory="TineProgramDataDir" Bitness="always64">
+        <CreateFolder />
+        <RegistryValue Root="HKLM" Key="Software\Tine" Name="ProgramDataRoot"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- ProgramData\Tine\endpoints with Users: modify (D-030). -->
+      <Component Id="EndpointsData" Directory="EndpointsDataDir" Bitness="always64">
+        <CreateFolder>
+          <util:PermissionEx User="Users" GenericAll="yes" />
+        </CreateFolder>
+        <RegistryValue Root="HKLM" Key="Software\Tine" Name="EndpointsData"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- Autostart (D-025): HKCU Run value is the source of truth; install
+           and uninstall are symmetric for the elevating user. -->
+      <Component Id="AutostartRunKey" Directory="INSTALLDIR" Bitness="always64">
+        <RegistryValue Root="HKCU"
+                       Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="Tine"
+                       Type="string"
+                       Value="&quot;[INSTALLDIR]tine.exe&quot; --background"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Optional data removal at explicit request only:
+         "msiexec /x {ProductCode} REMOVESAVEDDATA=1".
+         Paths resolve to the uninstalling user's profiles (the same user who
+         installed, in the normal single-user flow). DELETE-NEVER-BY-DEFAULT is
+         the contract (D-030); upgrades never touch these (UPGRADINGPRODUCTCODE
+         is set during a MajorUpgrade remove-half). -->
+    <SetProperty Id="RemoveRoamingDataCmd" Sequence="execute" Before="RemoveRoamingData"
+                 Value="cmd.exe /c rmdir /s /q &quot;[AppDataFolder]Tine&quot;"
+                 Condition="REMOVE=&quot;ALL&quot; AND REMOVESAVEDDATA AND NOT UPGRADINGPRODUCTCODE" />
+    <SetProperty Id="RemoveLocalDataCmd" Sequence="execute" Before="RemoveLocalData"
+                 Value="cmd.exe /c rmdir /s /q &quot;[LocalAppDataFolder]Tine&quot;"
+                 Condition="REMOVE=&quot;ALL&quot; AND REMOVESAVEDDATA AND NOT UPGRADINGPRODUCTCODE" />
+    <SetProperty Id="RemoveProgramDataCmd" Sequence="execute" Before="RemoveProgramData"
+                 Value="cmd.exe /c rmdir /s /q &quot;[CommonAppDataFolder]Tine&quot;"
+                 Condition="REMOVE=&quot;ALL&quot; AND REMOVESAVEDDATA AND NOT UPGRADINGPRODUCTCODE" />
+
+    <CustomAction Id="RemoveRoamingData" Property="RemoveRoamingDataCmd" ExeCommand=""
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RemoveLocalData" Property="RemoveLocalDataCmd" ExeCommand=""
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RemoveProgramData" Property="RemoveProgramDataCmd" ExeCommand=""
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RemoveRoamingData" After="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND REMOVESAVEDDATA AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RemoveLocalData" After="RemoveRoamingData"
+              Condition="REMOVE=&quot;ALL&quot; AND REMOVESAVEDDATA AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RemoveProgramData" After="RemoveLocalData"
+              Condition="REMOVE=&quot;ALL&quot; AND REMOVESAVEDDATA AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <!-- "Run Tine now" checkbox on the exit dialog: a non-elevated
+         client-side ExeCommand custom action in the UI sequence only. -->
+    <CustomAction Id="LaunchTine" Directory="INSTALLDIR"
+                  ExeCommand="&quot;[INSTALLDIR]tine.exe&quot;"
+                  Return="asyncNoWait" />
+    <UI>
+      <!-- WiX v5 exposes the dialog sets via arch-specific symbols (plain
+           WixUI_InstallDir is private; WIX0094). With -arch x64 use _X64. -->
+      <UIRef Id="WixUI_InstallDir_X64" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchTine"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX AND NOT Installed" />
+    </UI>
+
+  </Package>
+</Wix>
