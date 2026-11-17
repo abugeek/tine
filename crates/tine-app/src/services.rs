@@ -903,6 +903,16 @@ pub fn take_messages() -> Vec<String> {
     with(|s| std::mem::take(&mut s.messages))
 }
 
+/// Queues one user-facing message for the next [`take_messages`] pull
+/// (`status` notes and the window's message toast both show it).
+///
+/// Control-plane callers state non-fatal failures through this so nothing
+/// fails silently (the engine error path in `shell.rs` loses a user's
+/// changes otherwise, e.g. a full disk rejects the settings save).
+pub fn surface_message(msg: impl Into<String>) {
+    with(|s| s.surface(msg.into()));
+}
+
 // ---------------------------------------------------------------------------
 // "Hear Myself" monitor
 // ---------------------------------------------------------------------------
@@ -1199,6 +1209,20 @@ mod tests {
                 .any(|m| m.contains("apply or discard the pending Auto-Tune results")),
             "pending results must be protected with an actionable message"
         );
+    }
+
+    #[test]
+    fn surface_message_round_trips_through_take_messages() {
+        // Regression (T22 QA, FI-5): a persist failure surfaced by the shell
+        // must land in the message queue the next `take_messages` drain
+        // consumes (the `status` notes and the window toast), never be
+        // dropped on the floor.
+        super::shutdown();
+        surface_message("Tine couldn't apply or save a change: disk full (simulated)");
+        let drained = take_messages();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].contains("couldn't apply or save"));
+        let _ = take_messages();
     }
 
     #[test]
