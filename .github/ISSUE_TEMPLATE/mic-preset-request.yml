@@ -1,0 +1,56 @@
+name: Microphone preset request
+description: Ask for archetype/curve support or tuning help for a specific microphone.
+labels: ["preset"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tine adapts to any mic in theory; presets make the *starting point*
+        good. If Auto-Tune left a specific microphone sounding wrong, tell us
+        — and attach recordings if you can (48 kHz raw is ideal: a few
+        seconds of normal speech, a few seconds of a quiet room, and a
+        sibilant sentence). Describe any vendor software (Nahimic, Realtek,
+        NVIDIA Broadcast…) running on the mic.
+  - type: input
+    id: mic
+    attributes:
+      label: Microphone make & model
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Connection
+      options:
+        - USB (dynamic)
+        - USB (condenser)
+        - XLR (interface)
+        - Headset (analog jack)
+        - Headset (USB/Dongle)
+        - Webcam built-in
+        - Laptop built-in
+        - Bluetooth
+    validations:
+      required: true
+  - type: textarea
+    id: symptoms
+    attributes:
+      label: What does it sound like after Auto-Tune?
+      description: Too dark/thin/harsh, gated wrongly, hiss remains, pumping, clipping… be specific.
+    validations:
+      required: true
+  - type: textarea
+    id: recordings
+    attributes:
+      label: Recordings (optional, hugely helpful)
+      description: 48 kHz raw WAVs — ~5 s of normal speech, ~5 s of quiet room, one sibilant sentence. Attach or link.
+  - type: textarea
+    id: vendor
+    attributes:
+      label: Vendor software on the device
+      description: Realtek Audio Console, Nahimic, Sonar, NVIDIA Broadcast… names + enabled effects.
+  - type: textarea
+    id: diag
+    attributes:
+      label: `tine diag` bundle (optional)
+      description: If you already ran Auto-Tune, `tine diag` carries the applied parameters (no audio inside).

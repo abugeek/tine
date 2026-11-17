@@ -1,0 +1,220 @@
+# Release build (T23). Fires on a pushed v* tag (or manual dispatch).
+#
+# NOTE (R-14): GitHub Actions billing has kept every workflow run from
+# starting on this repo, so this pipeline is a reviewed-by-inspection
+# artifact until the maintainer fixes the billing/spending limit: it mirrors
+# the proven step shapes from ci.yml, and the MSI build itself was dry-run
+# locally with the same pinned WiX versions (see packaging/README.md).
+#
+# Publishing stays with the maintainer: on a v* tag this workflow creates a
+# *draft* GitHub Release (D-030 signing runbook in
+# docs/tasks/done/T23-packaging-release.md); the maintainer reviews and
+# publishes. Unsigned beta artifacts are expected until signing lands (R-02):
+# SHA-256 sums are always attached, and the README documents SmartScreen.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (x.y.z) when not dispatched from a tag"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # draft release + artifact upload
+
+env:
+  CARGO_TERM_COLOR: always
+  # Set TINE_SIGNING_ENABLED=true and TINE_SIGN_COMMAND to a signtool.exe
+  # command line (SignPath / Azure Trusted Signing; see the runbook) to sign
+  # before hashing. Empty/absent = unsigned build (beta default).
+  TINE_SIGNING_ENABLED: ${{ secrets.TINE_SIGNING_ENABLED }}
+  TINE_SIGN_COMMAND: ${{ secrets.TINE_SIGN_COMMAND }}
+
+jobs:
+  release:
+    name: Build, test, package (MSI/zip/PDB), draft release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Determine version
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ref = "${{ github.ref_name }}"
+          $v = "${{ github.event.inputs.version }}"
+          if (-not $v) { $v = $ref.TrimStart("v") }
+          if ($v -notmatch '^\d+\.\d+\.\d+(-[\w.]+)?$') {
+            Write-Error "Cannot derive an x.y.z version from ref '$ref' / input '$v'"
+            exit 1
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Check clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests (nextest)
+        run: cargo nextest run --workspace
+
+      - name: Run headless UI verification
+        run: cargo test -p tine-ui
+
+      # Spec: build --release. The workspace has no "tooling" member; the
+      # installer ships only tine.exe under the D-018 virtual-cable topology
+      # (no APO DLL, no COM registration).
+      - name: Build release binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release -p tine-app
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-Item "target\release\tine.exe"
+          "{0:N0} bytes ({1:N2} MiB)" -f $exe.Length, ($exe.Length / 1MB) | Write-Host
+          # Release gate: 24 MiB (R-21: tine.exe measures 20.63 MiB and the
+          # main 20 MB CI budget is an open maintainer decision).
+          if ($exe.Length -ge 24MB) { Write-Error "tine.exe exceeds the 24 MiB release gate!"; exit 1 }
+
+      - name: Install WiX v5 CLI (user-profile dotnet tool)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          dotnet tool install --global wix --version 5.*
+          $env:DOTNET_ROLL_FORWARD = "LatestMajor"
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build the MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:DOTNET_ROLL_FORWARD = "LatestMajor"
+          # build-msi.ps1 re-runs cargo with -p tine-app; keep the release dir
+          # to reuse the tree (cargo is incremental, this is a fast no-op).
+          pwsh -File packaging\build-msi.ps1 -Version "${{ steps.ver.outputs.version }}" -SkipBuild
+
+      - name: Build the portable zip and the PDB zip (dev use)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+          Copy-Item target\release\tine.exe portable\
+          Copy-Item LICENSE-MIT portable\
+          Copy-Item LICENSE-APACHE portable\
+          Compress-Archive -Path portable\* -DestinationPath "tine-$v-portable-win-x64.zip" -Force
+          Compress-Archive -Path target\release\tine.pdb -DestinationPath "tine-$v-pdb-win-x64.zip" -Force
+          Get-ChildItem *.zip | ForEach-Object { Write-Host "$($_.Name) $($_.Length) bytes" }
+
+      - name: Sign artifacts (skipped unless TINE_SIGNING_ENABLED=true)
+        if: ${{ env.TINE_SIGNING_ENABLED == 'true' }}
+        shell: pwsh
+        run: |
+          # TINE_SIGN_COMMAND (repo secret) is a signtool.exe command line
+          # covered by the runbook (SignPath Foundation / Azure Trusted
+          # Signing). Signing must happen BEFORE hashing; the sums below
+          # always cover the final files.
+          $ErrorActionPreference = "Stop"
+          $v = "${{ steps.ver.outputs.version }}"
+          $files = @("packaging\out\tine-$v-x64.msi", "target\release\tine.exe")
+          foreach ($f in $files) {
+            Write-Host "signing $f"
+            $cmd = "$env:TINE_SIGN_COMMAND `"$f`""
+            Invoke-Expression $cmd
+            if ($LASTEXITCODE -ne 0) { Write-Error "signing failed for $f"; exit 1 }
+          }
+
+      - name: Generate SHA-256 sums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = "${{ steps.ver.outputs.version }}"
+          $files = @(
+            "packaging\out\tine-$v-x64.msi",
+            "tine-$v-portable-win-x64.zip",
+            "tine-$v-pdb-win-x64.zip"
+          )
+          $sums = foreach ($f in $files) {
+            $h = Get-FileHash -Algorithm SHA256 $f
+            "{0}  {1}" -f $h.Hash.ToLower(), (Split-Path -Leaf $f)
+          }
+          $sums | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Extract release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = "${{ steps.ver.outputs.version }}"
+          $lines = Get-Content CHANGELOG.md
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^## \[?v?$([regex]::Escape($v))(\]| |-)") { $start = $i; break }
+          }
+          if ($start -eq -1) {
+            Write-Host "No CHANGELOG section for $v; using the Unreleased section."
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match "^## \[Unreleased\]") { $start = $i; break }
+            }
+          }
+          $out = @()
+          if ($start -ge 0) {
+            for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match "^## ") { break }
+              $out += $lines[$i]
+            }
+          } else {
+            $out += "See CHANGELOG.md."
+          }
+          $text = ($out -join "`n").Trim()
+          if (-not $text) { $text = "See CHANGELOG.md." }
+          $text += "`n`n---`n`nSHA-256:`n`n" + (Get-Content SHA256SUMS.txt -Raw)
+          Set-Content -Encoding utf8 RELEASE_NOTES.md $text
+
+      - name: Upload workflow artifacts (always, testable without a tag)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tine-${{ steps.ver.outputs.version }}-win-x64
+          path: |
+            packaging/out/tine-*-x64.msi
+            tine-*-portable-win-x64.zip
+            tine-*-pdb-win-x64.zip
+            SHA256SUMS.txt
+            RELEASE_NOTES.md
+          if-no-files-found: error
+
+      # Draft release on v* tags only. Publishing (review + "Publish") is the
+      # maintainer's action, as is the signing setup (runbook).
+      - name: Create draft GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: Tine ${{ steps.ver.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            packaging/out/tine-*-x64.msi
+            tine-*-portable-win-x64.zip
+            tine-*-pdb-win-x64.zip
+            SHA256SUMS.txt
