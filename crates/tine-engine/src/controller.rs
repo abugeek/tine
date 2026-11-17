@@ -626,24 +626,26 @@ mod tests {
             Arc::clone(&block),
             paths,
         ));
-        std::thread::sleep(Duration::from_millis(50));
+        // Wait for the controller's startup snapshot to be published so the
+        // next ParamBlock change is the command's, not the initial publish
+        // (ParamBlock::new() starts at generation 2 before the thread runs).
+        let startup = wait_event(&rx, |e| matches!(e, Event::ModelChanged(_)), Duration::from_secs(2));
+        assert!(startup.is_some(), "startup ModelChanged must arrive");
+        let mut warmup = DspParams::DEFAULT;
+        let mut warm_gen = 0u64;
+        assert!(
+            block.load_if_changed(&mut warm_gen, &mut warmup),
+            "startup snapshot must be visible in ParamBlock"
+        );
+        assert!(
+            (warmup.denoise_mix - 0.5).abs() < f32::EPSILON,
+            "startup snapshot is neutral (macro 0.5)"
+        );
         let t0 = Instant::now();
         let sent = handle.send(Command::SetMacro(Macro::Purity, 0.1));
         assert!(sent.is_ok(), "send must succeed while the handle is alive");
         let mut visible = None;
         let mut params = DspParams::DEFAULT;
-        // Consume the startup snapshot first so the next change is the
-        // command's, not the initial publish.
-        let mut warmup = DspParams::DEFAULT;
-        let mut warm_gen = 0u64;
-        while warm_gen == 0 {
-            let _ = block.load_if_changed(&mut warm_gen, &mut warmup);
-            std::thread::sleep(Duration::from_micros(50));
-        }
-        assert!(
-            (warmup.denoise_mix - 0.5).abs() < f32::EPSILON,
-            "startup snapshot is neutral (macro 0.5)"
-        );
         let mut last_gen = warm_gen;
         while t0.elapsed() < Duration::from_secs(2) {
             let mut probe = DspParams::DEFAULT;
@@ -655,7 +657,11 @@ mod tests {
             std::thread::sleep(Duration::from_micros(50));
         }
         assert!(visible.is_some(), "SetMacro must reach the ParamBlock");
-        assert!((params.denoise_mix - 0.1).abs() < f32::EPSILON);
+        assert!(
+            (params.denoise_mix - 0.1).abs() < f32::EPSILON,
+            "expected denoise_mix ~= 0.1, got {} (warm_gen={warm_gen}, last_gen={last_gen})",
+            params.denoise_mix
+        );
         drop(handle);
         drop(rx);
     }
