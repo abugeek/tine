@@ -12,7 +12,7 @@
 | Machine | AMD Ryzen 7 9800X3D (8 C / 16 T), 32 GB RAM |
 | OS | Windows 11 Pro, 10.0.26300 (Insider 26H2), build 26300.9818 |
 | Audio devices | Microphone (AB13X USB Audio) 48 kHz/1 ch · Microphone (fifine Microphone) 48 kHz/2 ch · SteelSeries Sonar - Microphone (virtual, **default capture**) · SteelSeries Sonar - Chat (the D-018 routing sink, discovered automatically) · Speakers (AB13X USB Audio) · Speakers (fifine Microphone) · Sonar - Gaming (default render, 96 kHz/8 ch) |
-| Build | `cargo build --release -p tine-app` on `main@9ccfff5`, branch `task/T22-qa` |
+| Build | `cargo build --release -p tine-app` on `main@8841fce` (T23-era), branch `task/T22-qa` (rebased) |
 | Rust | 1.99.1 (pinned), `x86_64-pc-windows-msvc`, `-C target-cpu=x86-64-v2`, fat LTO |
 | Test flavor | release binary live over the real named pipe (`\\.\pipe\tine-tine-S-1-5-21-…-1001`; every command the CLI sends). The release CLI's console rebind hides stdout under PTYs (known R-17), so QA drove the pipe protocol directly. |
 
@@ -81,7 +81,10 @@ TINE_HW_IN="{0.0.1.00000000}.{1524e3bf-…}" TINE_HW_OUT="{0.0.0.00000000}.{a2d0
 TINE_SOAK_SECS=1800 cargo nextest run -p tine-engine --run-ignored only monitor_soak --no-capture
 ```
 
-Result: **FILLED below after the run — see §10 scoreboard**. This re-tests the D-027 headroom fix (drift buffer 2→6 callbacks, T16 follow-up #25) which T16 could not close.
+Result: **PASS — 1 passed (1802.7 s)**:
+`monitor soak (1800 s): underruns=0 overruns=0 callbacks=360419 max_callback_us=119 capture=48000 Hz playback=48000 Hz latency badge=41.6 ms`
+
+This **closes the T16 acceptance that was left open** (T16 measured 2 underruns in 30 min with the old 2-callback drift headroom): with the D-027 headroom fix (drift buffer centered at 6 callbacks, PR #25) the same 30-minute hardware test now runs **0 underruns, 0 overruns**, max callback 119 µs. T16's own re-run prerequisite is satisfied.
 
 ## 4. Failure injection (all executed live)
 
@@ -177,9 +180,16 @@ Owner for all rows: **maintainer (human)** — none are executable headlessly wi
 
 | Criterion | Status | Evidence |
 | :--- | :--- | :--- |
-| 30-min and 4-h soaks: 0 dropouts, 0 latches, no memory growth | **4-h automated: PASS** (§3.2 headline) · 30-min monitor segment (Hear-Myself, physical output): §3.2 · the **Discord-connected** 4-h overnight variant: §7.1 B-1 | sampler/ticker/soak JSONLs |
-| Every perf budget met or a recorded decision explains the miss | 8 of 10 MET/N/A-MET; `tine.exe` size NOT MET → recorded decision §2 row 10 + §7.1 B-9; 8 MB RSS stretch target missed → §2 row 4 | §2 |
-| Every local matrix row passes; beta coverage + failures triaged | Local rows PASS (§5) incl. rate coverage answer; **beta coverage pending by definition (human round §7.1 B-10)** | §5, §8 |
+| 30-min and 4-h soaks: 0 dropouts, 0 latches, no memory growth | **PASS**: 4-h app soak 0 underruns/overruns/latches/heartbeat gaps (§3.2); 30-min Hear-Myself monitor harness **0 underruns, 0 overruns, 119 µs max callback** (§3.4) — the T16 open item closed; memory: no leak-shaped growth, slow WS creep +2.8 MB/4 h recorded as a beta watch item (§3.2) · the **Discord-connected** 4-h overnight variant: §7.1 B-1 | §3.2/§3.4 JSONLs + nextest output |
+| Every perf budget met or a recorded decision explains the miss | 8 rows MET/N/A-recorded; misses recorded exactly: `tine.exe` **20.63 MiB vs 20 MB** (R-21, §7.1 B-9 decision), idle-with-router **~1.07 % of one core / WS creeping past 20 MB by hour 4** (§2 row 4 — D-018-era re-basing needed) | §2 |
+| Every local matrix row passes; beta coverage + failures triaged | Local rows PASS (§5) incl. the rate-coverage answer (48 kHz shared mix only; DSP layer covers 44.1 k); beta coverage **pending by definition (human round §7.1 B-10)**; beta failure triage process in §8 | §5, §8 |
 | Tine preferred over raw for every archetype in the blind test | **PENDING-MAINTAINER (B-2)** — needs ≥5 humans; fixtures + protocol prepared | §7.1 |
 
 **Overall gate:** v0.1 may tag only after §7.1 blocking items close. The automated surface of this report is green except R-21 (decision) — the remaining risk is concentrated exactly where humans are required.
+
+## 11. Environment updates discovered during this task
+
+- **R-19 is resolved by T23's PR #28** (rustfmt 1.99.1 hang workaround in `tine-dsp/src/primitives/math.rs`): `cargo fmt --all --check` now completes cleanly on this machine (verified on the T22 branch, post-rebase). The per-package workaround is no longer needed for local DoD runs.
+- The `tine soak` CPU numbers published by earlier task Results (incl. T17's "avg CPU 0.0 %") came through the mis-scaled formula fixed in PR #30; all CPU figures in THIS report were computed independently (external 10 s sampler over `Get-Process`, and the in-process numbers divided back to ground truth, cross-checked: 107.64 raw ↔ 1.074 % true).
+- SteelSeries Sonar's virtual devices are the machine's D-018 "cable" — the QA suite exercised the exact shipped topology (router → "SteelSeries Sonar - Chat" sink discovered automatically, apps capture "Sonar - Microphone"). The GG GUI's internal routing of that virtual mic is the only human-dependent link (§6, §7.1 B-8).
+- One flaky `tine-app` services test observation (global-singleton parallelism, not reproduced in 11 consecutive runs) is noted on PR #26 for future hardening.
