@@ -250,6 +250,9 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
             }
             Msg::Engine(Event::Error(e)) => {
                 tracing::error!(target: "tine::shell", error = ?e, "engine error");
+                // Persist failures (e.g. a full disk rejects the settings
+                // save) must reach the user, not only the log (T22 QA).
+                services::surface_message(format!("Tine couldn't apply or save a change: {e}"));
             }
             Msg::Tray(TrayEvent::Activate { .. }) => shell.open_ui(),
             Msg::Tray(TrayEvent::Menu(id)) if id == menu_id::OPEN => shell.open_ui(),
