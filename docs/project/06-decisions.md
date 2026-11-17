@@ -203,3 +203,25 @@ A calibration's derived `input_gain_db`, `gate_threshold_db`, `denoise_mix`, `co
 - "Hear Myself" monitors the *input* signal (processed-capture needs WASAPI render-loopback, outside T12's audio IO) — documented limitation.
 - `tine.exe` grows to 21,627,392 bytes; the trims were measured and recorded (R-21) without touching the T01-owned budget.
 
+### D-030 · 2026-11-17 · Accepted — Installer: WiX v5 MSI, per-machine (resolves Q-04; adapted to the D-018 virtual-cable topology)
+
+**Decision:** The v0.1 installer is a **WiX v5 (`wix` CLI 5.0.2, .NET tool) per-machine x64 MSI** with a minimal `WixUI_InstallDir` UI, a fixed `UpgradeCode` + `MajorUpgrade` (upgrade = file replace + settings migration on the app side, no reboot), and — under D-018, there being **no APO DLL and no COM registration** — exactly these effects:
+
+- copy `tine.exe` + the repo's `LICENSE-MIT` and `LICENSE-APACHE` texts (the "license texts bundled for the installer" of the spec — there is no NOTICE file) to `%ProgramFiles64Folder%\Tine\license\` alongside the exe;
+- create `%ProgramData%\Tine\endpoints\` with a `util:PermissionEx` ACL — **Users: modify** — so the *unelevated* user-session app can persist per-endpoint boot params there (D-022); these are the "ProgramData ACLs" of the old spec, minus the LocalService reader that existed only for `audiodg`;
+- an all-users Start-menu shortcut and the exit-dialog "Launch Tine now" checkbox (first-run onboarding, incl. virtual-cable validation);
+- autostart per **D-025**: the MSI writes the `HKCU\…\Run` value `Tine` = `"<exe>" --background` (for the installing/elevating user) and removes it on uninstall;
+- `util:CloseApplication` stops a running `tine.exe` so upgrades replace the file without a reboot;
+- uninstall removes app files, shortcut and the `Run` key; **user data is kept by default** — `msiexec /x {ProductCode} REMOVESAVEDDATA=1` opts into deleting `%APPDATA%\Tine`, `%LOCALAPPDATA%\Tine` and `%ProgramData%\Tine` (WiX itself never prompts; "ask before deleting settings" = delete-never-by-default + an explicit, documented opt-in).
+
+**Why:** Per-machine remains right even without an APO: only an elevated install can create the `ProgramData` folder with the Users-modify ACL cheaply, the Start-menu shortcut is for all users, and MSI gives the native Apps & Features uninstall path and transactional rollback. WiX v5 is the spec's recommendation, FOSS, scriptable in CI (`wix build`), and needed no system-level install (a `dotnet tool install --global wix`, user-profile only).
+
+**Consequences:** `packaging/tine.wxs` is the single source of MSI truth; `packaging/build-msi.ps1` wraps build + SHA-256; `.github/workflows/release.yml` builds it on `v*` tags. Signing (SignPath Foundation / Azure Trusted Signing) applies to `tine.exe` and the MSI only (R-02) and is a maintainer runbook step; until then the beta ships unsigned with documented SmartScreen steps + published SHA-256 sums.
+
+### D-031 · 2026-11-17 · Accepted — No update check in v0.1; manual "check Releases" until beta feedback (resolves Q-06)
+
+**Decision:** v0.1 ships **no in-app update check**. The README documents checking GitHub Releases manually; every release carries its SHA-256 sums. The option is revisited after the beta (D-016) with real feedback; the natural seam (`version::tine_version()` / `tine status`) exists and stays untouched.
+
+**Why:** The check would need the shell's first HTTP client (GitHub Releases API), which D-025 explicitly avoids adding (in-house shell utilities policy), inflates the R-21-stressed binary, and expands the attack surface of a process that autostarts for every user. The version seam already exists and a manual check costs the user one page load.
+
+**Consequences:** The spec's "opt-in update check" step is dropped for v0.1 (documented in the task file's adapted steps and the README FAQ); if beta feedback demands it, it lands as an opt-in `settings.json` flag + one "new version available" tray notice, per the original Q-06 recommendation.
