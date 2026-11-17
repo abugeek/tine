@@ -65,10 +65,10 @@ impl Soak {
         let now = Instant::now();
         let (k, u) = cpu_times_us();
         let period_s = self.last_at.elapsed().as_secs_f64().max(1e-3);
-        let cpu_pct = (k.saturating_sub(self.last_kernel_us) + u.saturating_sub(self.last_user_us)) as f64
-                / 10_000.0 // µs → ms
-                / period_s
-            * 100.0;
+        let cpu_pct = cpu_pct_from_us(
+            k.saturating_sub(self.last_kernel_us) + u.saturating_sub(self.last_user_us),
+            period_s,
+        );
         let (working_set, private_bytes) = memory_bytes();
         let s = Sample {
             t_s: self.started.elapsed().as_secs_f64(),
@@ -125,6 +125,17 @@ fn cpu_times_us() -> (u64, u64) {
 
 fn time_100ns_to_us(t: FILETIME) -> u64 {
     (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10
+}
+
+/// Process CPU percentage of one core, from the CPU time delta in **micro-
+/// seconds** consumed over `period_s` seconds.
+///
+/// `30_000 µs` over one second is 3.0 % (T22 QA found the previous formula
+/// reported 100× too much: it divided by 10⁴ — as if the input were in
+/// 100 ns ticks — and then multiplied by 100 again).
+#[must_use]
+fn cpu_pct_from_us(delta_us: u64, period_s: f64) -> f64 {
+    delta_us as f64 / 1_000_000.0 / period_s.max(1e-9) * 100.0
 }
 
 fn memory_bytes() -> (u64, u64) {
@@ -229,9 +240,21 @@ pub fn run_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::{Soak, report_json, write_report};
+    use super::{Soak, cpu_pct_from_us, report_json, write_report};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn cpu_pct_scaling_is_percent_of_one_core() {
+        // Regression (T22 QA): 30 ms of CPU in a 1 s window is 3 % of one
+        // core — the old formula reported 300 for this input.
+        assert!((cpu_pct_from_us(30_000, 1.0) - 3.0).abs() < 1e-9);
+        // 60 ms over a 2 s window is 3 %.
+        assert!((cpu_pct_from_us(60_000, 2.0) - 3.0).abs() < 1e-9);
+        // Full core for a full second is 100 %.
+        assert!((cpu_pct_from_us(1_000_000, 1.0) - 100.0).abs() < 1e-9);
+        assert_eq!(cpu_pct_from_us(0, 1.0), 0.0);
+    }
 
     #[test]
     fn samples_carry_time_and_memory() {
