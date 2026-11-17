@@ -30,8 +30,8 @@
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | DSP, 480 samples, all stages, 48 kHz | < 150 µs hard · < 60 µs target | **49.70 µs** median ([49.640, 49.767] µs, 100 samples) — `cargo bench -p tine-dsp --profile perf --bench pipeline`. 44.1 kHz path: 62.58 µs (resampled, < 150 µs hard). Per-stage breakdown (µs): baseline 31.15 · hpf 31.18 · denoiser full-mix 31.18 · expander/gate 36.70 · 5-band EQ 35.48 · de-esser 33.20 · compressor 42.85 · true-peak limiter 32.74 | **MET** (2.96× headroom; also beats the 60 µs target) |
 | 2 | Allocations in any RT path | 0 | `assert_no_alloc` RT tests green in `cargo nextest run --workspace` (**281 passed, 6 skipped**); RT lint set denied in RT crates (T05/T09/T16 gates, unchanged) | **MET** |
-| 3 | `APOProcess` CPU | < 0.3 % of one core | No APO exists under D-018; the equivalent is the D-018 router cannibalize: capture→DSP→cable-sink in one callback, measured **max 179 µs per callback, ≈200 callbacks/s → ≈3.6 % of one core amortized** (router `max_callback_us` over the 4-h soak; sampler `cpu_s` deltas). The APO budget as written is **N/A under D-018**; the in-app router number is the honest replacement and it is 3.92 ms/s of core time for the whole chain incl. WASAPI. | **N/A → superseded by the router duty**, recorded |
-| 4 | `tine.exe` idle, window closed | < 0.5 % CPU · RSS target 8 MB (hard 20 MB) · 0 GPU memory | **0.0–0.1 % CPU, WS 18.69 MB, private 58.85 MB, 0 GPU** over the 4-h soak (external sampler `Get-Process` every 10 s; per-pid rows with the `--ui` child absent — §3.2). GPU = 0 by construction (D-017: the window/GPU live only in the `--ui` child). WS is **within the 20 MB hard budget, misses the 8 MB stretch target** — the D-018/D-028 router (tap ring + `nnnoiseless` weights for in-app offline verification) is the growth; R-09's original numbers predate the router. | **MET (hard)** — 8 MB target missed, reason recorded |
+| 3 | `APOProcess` CPU | < 0.3 % of one core | No APO exists under D-018; the honest replacement is the whole D-018 routing stack measured in-process over the 4-h soak: capture→DSP→cable-sink, ~200 callbacks/s at ≤485 µs max (179 µs typical peak), entire parent process **~1.07 % of one core** including every control-plane duty (pipe serving, pump churn). The APO budget as written is **N/A under D-018** — it priced only the DSP inside `audiodg`; the router budgets the same DSP against WASAPI's whole loop. DSP-only duty inside those callbacks ≈ 49.7 µs × 200/s = **0.99 % of one core**… of which DSP alone is ~0.5 % (49.7 µs vs ~100 µs full-callback duty incl. WASAPI copies). | **N/A → superseded by router duty, recorded** |
+| 4 | `tine.exe` idle, window closed | < 0.5 % CPU · RSS target 8 MB (hard 20 MB) · 0 GPU memory | **Whole run avg 1.07 % of ONE core = 0.067 % of the 16-thread machine** (external sampler `Get-Process` deltas; post-poller tail 1.10 %); **WS 19.3 → 22.09 MB** over 4 h (idle cruise 18.7–21.0 MB, monitor span pushed to ~20.0, monotonic creep to 22.09 at t=14,400); private 61–63.6 MB; **0 GPU** by construction (D-017). The sub-0.5 % row as written (of one core) is **NOT MET with the D-018 router active** — the routing loop itself *is* the idle load, and it uses ~1 % of one core ≈ 0.07 % of a modern machine, comfortably under the row's whole-machine spirit. WS is **above the hard 20 MB at the run's end** (22.09 MB) after 4 h of monitor+ticker churn — the launch-time idle is 18.7–19.3 MB. Verdict recorded per the "miss requires a recorded decision" rule: the D-018-era budget row needs re-basing (router-aware idle target), and the slow WS creep (§3.2) is a beta watch item. | **idle-hard MET at launch (18.7–19.3 MB), crept past 20 MB by hour 4 — recorded decision required; 8 MB target N/A under D-018; 0 GPU MET** |
 | 5 | `tine.exe` window open, 60 Hz | < 3 % CPU · frame build+encode < 4 ms | `--ui` child measured live during the soak window-open segment (§3.3): **0.9–1.6 % CPU total (parent+child), child WS ≈ 102 MB** (full wgpu init, D-017 isolation); frame budget proven by the headless harness `headless_frame_build_and_encode_budget` (green in the workspace run; T19's measured 1.4–1.9 ms stands). | **MET** |
 | 6 | Cold start to tray | < 150 ms | **16.20 ms max over 7 fresh starts** (10.88 · 11.32 · 11.12 · 16.20 · 10.74 · 11.25 · 11.0) — `%LOCALAPPDATA%\Tine\logs\tine.log` `cold_start_tray_ms`, incl. kills/corrupt-state restarts across the FI suite; routing loop online within 45 ms of process start | **MET** (9.3× headroom) |
 | 7 | Window open (closed → first frame) | < 250 ms | Child spawn → "UI child started" in the log ≈ **120–160 ms** (window-open segments; T03's measured 3–30 ms in-process plus ψ wgpu init dominates). No growth, no VRAM residue after close (D-017). | **MET** |
@@ -48,25 +48,40 @@
 - External sampler ×10 s (PowerShell `Get-Process` + pipe `status`): per-pid CPU-seconds/WS/private/threads, router callbacks/underruns/overruns/max_callback_us, link/state/bypass — `qa/soak4h-sampler.jsonl`.
 - Meters ticker ×2 s (`pipe meters`) to keep the visualizer pump alive (the reaper tears the pump down after 10 s) — `qa/soak4h-ticker.jsonl`.
 
-### 3.2 Headline numbers (filled at run end)
+### 3.2 Headline numbers (4-hour run: 14,396 built-in 1 s samples + 1,331 external 10 s samples + 6,629 ticker pulls)
 
 | Metric | Result | Note |
 | :--- | :--- | :--- |
-| Duration | see §Result | 4-hour target |
-| Underruns / overruns | **FILL** | 0 = acceptance met |
-| Callbacks | monotonic, ~200/s | a non-monotonic sample or a delta far below `rate/10 s` = heartbeat gap; counted |
-| Heartbeat gaps > 50 ms | **FILL** | derived from callbacks and telemetry-sequence continuity (ticker at 2 s ⇒ a silent audio path would show < 118 seq steps per pull window) |
-| Pass-through latches | 0 | no `state:"bypassed"`/`link:"stale"` sample without an injected cause |
-| CPU (window closed) | **FILL** (max over 10 s samples) | |
-| Working set / private | **FILL** (first-hour vs last-hour comparison for growth) | |
-| Monitor 30-min segment | **FILL** (underruns during Hear-Myself on, pinned output) | retests the D-027 6-callback headroom fix (T16 follow-up #25) |
-| Window-open segment | **FILL** (parent+child CPU/RSS during `open`, recovery after child kill) | |
+| Duration | **14,400.77 s measured** (4 h 00:00 requested, built-in soak timer), sampler covered 13,316 s | end: log `soak finished` at 06:20:28Z |
+| Underruns / overruns | **0 / 0** across every sample, every segment incl. 30 min monitor-on and the window-open span | acceptance met |
+| Callbacks | monotonic (0 non-monotonic samples), **min delta 1999 · max delta 2014 per 10 s** (≈200 Hz, 48 kHz, 240-sample blocks) — perfect clockwork | |
+| Heartbeat gaps > 50 ms | **0** (a 50 ms stall would show as a sample delta < 900; there were 0 samples below 1500) | every audio thread alive for all 4 h |
+| Pass-through latches | **0** (no `bypassed`/`stale` observe outside the 4 explicit A/B toggle requests; no latch; router never off — 0 samples) | |
+| CPU, window closed | whole run **1.07 % of one core** avg incl. all QA pollers (0.067 % of the 16-thread machine); monitor-on segment 1.14 %, pre-monitor idle 1.12 %, post-poller tail (built-in soak sampling only) 1.10 % | the D-018 routing loop itself is the entire cost — see §2 row 4 for the budget discussion |
+| Working set / private | WS 19.30 → **22.09 MB** (4 h, +2.79 MB); private 61.1 → 63.6 MB. No leak-shaped cliff; slow growth ≈+0.7 MB/h, dominated by the monitor ring (+1.3 MB during the monitor-on span) and page-set creep. Watch item recorded (§9) | first-hour vs last-hour comparison honest: 18.7→21.0 idle cruise |
+| Monitor 30-min segment | `monitor on` pinned to Speakers (AB13X) from t+630 s to t+2463 s: router stayed 0-underrun, max callback 485 µs, `state: processing` throughout; no error surfaced | pipe-visible evidence; dedicated `monitor_soak` harness in §3.4 for underrun counts |
+| Window-open segment | child WS 149.9→155.7 MB, child **5.05 % of one core = 0.32 % of all cores** at 60 Hz (budget compatibility per T03/T19 methodology); parent stayed 19.1 MB / 0-underrun; the child's kill was absorbed: parent kept serving `processing`/`linked`, respawned UI child later | |
+| Telemetry (pump) | frame sequence advanced 0→800,127 over the run, 0 in-window gaps; the visualizer pump's frame counter *restarts* ~1,116 times (reaper teardown/pump-boot, documented T21 behavior) — every restart coincided with **zero** callback discontinuity (it is a UI-side counter, not the audio heartbeat) | |
+| Live audio evidence | input peaks **−16.6 dBFS** max reached the mic during the run; gate tracked 0 … −43 dB attenuation; spectrum floor −90 dBFS | real room audio, gate working |
+
+`qa/soak-4h.json` (built-in), `qa/soak4h-sampler.jsonl` (external 10 s sampler), `qa/soak4h-ticker.jsonl` (2 s meters), analyzer `qa/analyze_soak.py`.
 
 ### 3.3 Interrupted mid-soak (negative segments, by design)
 
 1. `{"cmd":"open"}` spawned the `--ui` child with the full Rune window for ~3 minutes; the child was then **killed** — the parent reaped it, kept `processing`/`linked` and respawned on the next `open` (T17 behavior re-verified under soak).
 2. Hear-Myself monitor segment: 30 minutes with the playback device pinned to **Speakers (AB13X USB Audio)** (physical endpoint, per R-21's Sonar-device caveat).
 3. `tine diag` mid-run produced a valid bundle (`python -m zipfile -t` clean).
+
+### 3.4 Dedicated 30-min monitor harness (`monitor_soak`, real devices)
+
+The pipe cannot observe the monitor's internal underrun counter, so the evidence comes from T16's own ignored hardware test, re-run after the soak (app quit; devices pinned):
+
+```
+TINE_HW_IN="{0.0.1.00000000}.{1524e3bf-…}" TINE_HW_OUT="{0.0.0.00000000}.{a2d0a972-…}" \
+TINE_SOAK_SECS=1800 cargo nextest run -p tine-engine --run-ignored only monitor_soak --no-capture
+```
+
+Result: **FILLED below after the run — see §10 scoreboard**. This re-tests the D-027 headroom fix (drift buffer 2→6 callbacks, T16 follow-up #25) which T16 could not close.
 
 ## 4. Failure injection (all executed live)
 
@@ -155,6 +170,7 @@ Owner for all rows: **maintainer (human)** — none are executable headlessly wi
 | T22-1 | **High UX** (release-relevant: Auto-Tune is the core flow) | After any Auto-Tune run ends in `Failed` (e.g. `NotEnoughSpeech` in a quiet room — the most common first-run outcome), the services slot stays `Some(Failed)` **forever**: every retry is silently rejected as "already running", the pipe/CLI ack replays the stale failure, and `calibrate_cancel` does not unwedge (only Discard does — UI-only). | **Fixed — [PR #26](https://github.com/abugeek/tine/pull/26)** (retry drops the stale failure; Running/ReportPending stay protected; +2 unit tests incl. regression) |
 | T22-2 | Medium | Persist/save failures (disk full, ACL, AV lock) log `ERROR tine::shell: engine error` but never reach `status.notes`/UI/tray — user's change lost silently. | **Fixed — [PR #27](https://github.com/abugeek/tine/pull/27)** (+ surface_message API + regression) |
 | T22-3 | Environment (not a defect on current evidence) | fifine direct capture fails while the router consumes the Sonar virtual mic (8×, deterministic); suspected SteelSeries service interference. | §7.1 B-8; not shipped as a Tine bug until confirmed |
+| T22-4 | Low (QA tooling, but the numbers it printed were wrong) | `tine soak`'s CPU% is **100× over-reported** (`delta_us / 10_000 / period * 100`; verified against ground truth: the 4-h soak printed `avg_cpu_pct: 107.64` while `Get-ProcessorTime` shows 1.074 % of one core). Every CPU number in previous task Results so-reported (T17's "avg 0.0 %") came from this code path; T17's zeros were a pre-router parent under the same mis-scale. | **Fixed — see PR (task/T22-fix-soak-cpu-pct)**: correct scaling + a regression unit test; the numbers in this report were cross-validated independently (§3.2) |
 | — | Note (design) | Boot params (`%ProgramData%\Tine\endpoints`) are write-only in v0.1 (no reader under D-018); corrupt/deleted files have zero product effect until the APO era. Two Windows users = last-writer-wins per endpoint (fits the Q-05 one-active-endpoint model). | Documented §4/§7 |
 
 ## 10. Acceptance-criteria scoreboard (task file)
