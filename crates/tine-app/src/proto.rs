@@ -17,7 +17,8 @@ pub enum PipeRequest {
     Status,
     /// Live telemetry + spectrum.
     Meters,
-    /// Run the 8-second Auto-Tune calibration (TODO(T16): service wiring).
+    /// Runs the 8-second Auto-Tune calibration against the live audio path
+    /// (D-018 lease shim when no APO mapping exists).
     Calibrate,
     /// Flush persistence and shut the app down.
     Quit,
@@ -59,6 +60,30 @@ pub enum PipeRequest {
         /// Report file path (written by the app).
         report: String,
     },
+    /// Switch the capture endpoint the engine processes (the D-018
+    /// routing loop follows the controller's model automatically).
+    Endpoint {
+        /// WASAPI endpoint id of the capture device.
+        id: String,
+    },
+    /// Unpin one Pro-mode parameter (back to the archetype line, D-007).
+    Unpin {
+        /// Stable machine key from `tine_protocol::params::SPECS`.
+        key: String,
+    },
+    /// Unpin every parameter (the whole rack back to the archetype line).
+    UnpinAll,
+    /// Auto-Tune wizard progress query (the UI child's ~10 Hz poll).
+    CalibrateQuery,
+    /// Cancel the Auto-Tune run in flight.
+    CalibrateCancel,
+    /// Apply the pending Auto-Tune results.
+    CalibrateApply {
+        /// Keep the user's pinned parameters (`true`, D-007).
+        keep_pins: bool,
+    },
+    /// Discard the pending Auto-Tune results.
+    CalibrateDiscard,
 }
 
 /// Server reply. `code` doubles as the CLI exit code: 0 ok, 1 failure,
@@ -175,6 +200,17 @@ mod tests {
                 minutes: 1,
                 report: "target/soak.json".to_owned(),
             },
+            PipeRequest::Endpoint {
+                id: "{mic-1}".to_owned(),
+            },
+            PipeRequest::Unpin {
+                key: "input_gain_db".to_owned(),
+            },
+            PipeRequest::UnpinAll,
+            PipeRequest::CalibrateQuery,
+            PipeRequest::CalibrateCancel,
+            PipeRequest::CalibrateApply { keep_pins: true },
+            PipeRequest::CalibrateDiscard,
         ];
         for req in &cases {
             let json = serde_json::to_string(req).unwrap_or_default();

@@ -37,7 +37,7 @@ use tine_dsp::presets::builtin as builtin_preset;
 use tine_engine::apo_admin::{self, ApoState, CaptureEndpoint};
 use tine_engine::audio_io::{DeviceRef, list_outputs};
 use tine_engine::autotune::{
-    AutoTuneConfig, AutoTuneEvent, AutoTuneHandle, AutoTuneOutcome, AutoTuneRunner, CalPhase, CalProgress,
+    AutoTuneConfig, AutoTuneEvent, AutoTuneHandle, AutoTuneOutcome, AutoTuneRunner, CalFailure, CalPhase, CalProgress,
     CalibrationReport, CalibratorFactory, CaptureSpec,
 };
 use tine_engine::controller::{Command, ControllerHandle, Event};
@@ -47,13 +47,16 @@ use tine_engine::paths::EnginePaths;
 use tine_engine::persist::{self, Loaded};
 use tine_engine::shm_client::ShmClient;
 use tine_engine::visualizer::{EngineSignals, UiFrame, Visualizer};
-use tine_protocol::params::{DspParams, ParamId, SPECS};
+use tine_protocol::params::{DspParams, ParamId, SPECS, Unit};
 use tine_protocol::presets::{Archetype, EndpointProfile, MacroPositions};
 use tine_protocol::sync::Triple;
 use tine_protocol::telemetry::AudioTelemetryFrame;
 use tine_ui::state::LiveFrame;
 use tine_ui::views::autotune::{autotune_from_progress, calibration_from_report};
-use tine_ui::{ApoBadge, AppState, AutoTuneUi, EndpointRow, Intent, IntentSink, Macro as UiMacro, MonitorUi, UiModel};
+use tine_ui::{
+    ApoBadge, AppState, AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, EndpointRow,
+    Intent, IntentSink, Macro as UiMacro, MonitorUi, UiModel,
+};
 
 use crate::proto::{PipeRequest, PipeResponse};
 use crate::single_instance;
@@ -108,6 +111,132 @@ pub fn live_from_meters(data: &Value) -> Option<LiveFrame> {
         *slot = band_level(v.as_f64().map_or(SPECTRUM_FLOOR_DB, |x| x as f32));
     }
     Some(LiveFrame { telemetry, spectrum })
+}
+
+/// Wire period of the child's Auto-Tune wizard poll (progress driven at
+/// ≥ 10 Hz while a run is in flight; one query round-trips over the
+/// pipe, so the cadence is well below its 2 s status twin).
+const WIZARD_PERIOD: Duration = Duration::from_millis(100);
+
+/// Parses the wire phase name (`Debug` form of `CalPhase`).
+fn phase_from_wire(s: &str) -> CalPhase {
+    match s {
+        "Noise" => CalPhase::Noise,
+        "Voice" => CalPhase::Voice,
+        "Analyzing" => CalPhase::Analyzing,
+        "Done" => CalPhase::Done,
+        "Failed" => CalPhase::Failed,
+        _ => CalPhase::Countdown,
+    }
+}
+
+/// Parses the wire rejection (`{"type":"TooNoisy","snr_db":…}`); `None`
+/// for unknown or missing types.
+fn failure_from_wire(v: &Value) -> Option<CalFailure> {
+    let get = |k: &str| v.get(k).and_then(Value::as_f64).map(|x| x as f32);
+    match v.get("type").and_then(Value::as_str)? {
+        "TooQuiet" => Some(CalFailure::TooQuiet),
+        "TooNoisy" => Some(CalFailure::TooNoisy {
+            snr_db: get("snr_db").unwrap_or_default(),
+        }),
+        "Clipping" => Some(CalFailure::Clipping {
+            pct: get("pct").unwrap_or_default(),
+        }),
+        "NotEnoughSpeech" => Some(CalFailure::NotEnoughSpeech {
+            voiced_ms: v.get("voiced_ms").and_then(Value::as_u64).unwrap_or_default() as u32,
+        }),
+        "GainOutOfRange" => Some(CalFailure::GainOutOfRange {
+            needed_db: get("needed_db").unwrap_or_default(),
+        }),
+        _ => None,
+    }
+}
+
+/// Viewer-facing unit suffix for a diff row (the child-side twin of
+/// `tine-ui`'s private `unit_suffix` — the wire carries SPECS keys, the
+/// card carries `ParamId`s with labels).
+fn unit_suffix(id: ParamId) -> &'static str {
+    match id.spec().unit {
+        Unit::Db => "dB",
+        Unit::Dbfs => "dBFS",
+        Unit::Hz => "Hz",
+        Unit::Ms => "ms",
+        Unit::Ratio | Unit::None => "",
+    }
+}
+
+/// Maps the `calibrate_query` payload (the parent's Auto-Tune flow
+/// state) into the wizard's view model, the results card it may carry,
+/// and whether the flow reached a terminal state (the poll can stop).
+/// `None` when the payload is malformed — callers ignore that frame.
+#[must_use]
+pub fn autotune_ui_from_state(data: &Value) -> Option<(AutoTuneUi, Option<CalibrationUi>, bool)> {
+    match data.get("flow").and_then(Value::as_str)? {
+        "idle" => Some((AutoTuneUi::default(), None, true)),
+        "running" => {
+            let progress = CalProgress {
+                phase: phase_from_wire(data.get("phase").and_then(Value::as_str).unwrap_or_default()),
+                phase_progress: data.get("progress").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                live_level_db: data.get("level_db").and_then(Value::as_f64).unwrap_or(-90.0) as f32,
+                voiced_ms: data.get("voiced_ms").and_then(Value::as_u64).unwrap_or_default() as u32,
+            };
+            Some((autotune_from_progress(&progress, None), None, false))
+        }
+        "report-pending" => {
+            let calibration = data.get("report").and_then(calibration_from_state);
+            let ui = AutoTuneUi {
+                step: AutoTuneStep::Results,
+                progress: 1.0,
+                ..AutoTuneUi::default()
+            };
+            Some((ui, calibration, true))
+        }
+        "failed" => {
+            let failure = data
+                .get("failure")
+                .and_then(failure_from_wire)
+                .unwrap_or(CalFailure::TooQuiet);
+            let ui = AutoTuneUi {
+                step: AutoTuneStep::Failed(CalFailureUi::from(failure)),
+                progress: 1.0,
+                ..AutoTuneUi::default()
+            };
+            Some((ui, None, true))
+        }
+        _ => None, // unknown future flow: skip this frame
+    }
+}
+
+/// Results-card view model from the wire report (SPECS-keyed changes
+/// become `ParamId` rows with labels and units).
+#[must_use]
+pub fn calibration_from_state(data: &Value) -> Option<CalibrationUi> {
+    let get = |k: &str| data.get(k).and_then(Value::as_f64).map(|x| x as f32);
+    let mut changes = Vec::new();
+    if let Some(list) = data.get("changes").and_then(Value::as_array) {
+        for entry in list {
+            let Some(key) = entry.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(id) = crate::cli::param_id_by_key(key) else {
+                continue;
+            };
+            changes.push(CalibrationParamDiff {
+                param: id,
+                label: id.spec().label,
+                before: entry.get("before").and_then(Value::as_f64).map_or(0.0, |x| x as f32),
+                after: entry.get("after").and_then(Value::as_f64).map_or(0.0, |x| x as f32),
+                unit: unit_suffix(id),
+            });
+        }
+    }
+    Some(CalibrationUi {
+        noise_rms_db: get("noise_rms_db").unwrap_or(SPECTRUM_FLOOR_DB),
+        speech_rms_db: get("speech_rms_db").unwrap_or(SPECTRUM_FLOOR_DB),
+        simulated_peak_db: get("simulated_peak_db").unwrap_or(SPECTRUM_FLOOR_DB),
+        simulated_rms_db: get("simulated_rms_db").unwrap_or(SPECTRUM_FLOOR_DB),
+        changes,
+    })
 }
 
 /// Maps the T14 virtual-cable [`ApoState`] to the UI badge (D-018: the
@@ -827,11 +956,13 @@ impl IntentSink for ChildSink {
 }
 
 /// Cached status fields the child needs for toggle intents (the pipe
-/// request needs the *next* state, which the optimistic UI flipped).
+/// request needs the *next* state, which the optimistic UI flipped) plus
+/// the endpoint ids the picker indexes into.
 struct ChildModel {
     bypass: bool,
     monitor_on: bool,
     endpoint_id: String,
+    endpoints: Vec<String>,
 }
 
 impl ChildModel {
@@ -840,6 +971,9 @@ impl ChildModel {
             bypass: false,
             monitor_on: false,
             endpoint_id: String::new(),
+            endpoints: apo_admin::list_capture_endpoints()
+                .map(|list| list.into_iter().map(|e| e.id).collect::<Vec<_>>())
+                .unwrap_or_default(),
         }
     }
 }
@@ -983,23 +1117,57 @@ pub fn run_ui_child() {
 }
 
 /// The child's bridge worker: intent dispatch to the pipe (admin requests
-/// run here, on this worker thread) plus timed `status`/`meters` polls
-/// that post coalesced, visibility-gated updates to the Rune state.
+/// run here, on this worker thread), the Auto-Tune wizard's ~10 Hz
+/// progress poll while a run is in flight, plus timed `status`/`meters`
+/// polls that post coalesced, visibility-gated updates to the Rune state.
 fn child_worker(handle: &rune::AppHandle<AppState>, rx_intents: &Receiver<Intent>) {
     let pipe = single_instance::pipe_name_for_user();
     let mut model = ChildModel::new();
+    let mut autotune_active = false;
     let epoch = Instant::now();
     let mut last_status = epoch.checked_sub(STATUS_PERIOD).unwrap_or(epoch);
     let mut last_meters = epoch.checked_sub(METERS_PERIOD).unwrap_or(epoch);
+    let mut last_wizard = epoch.checked_sub(WIZARD_PERIOD).unwrap_or(epoch);
     loop {
         // 1. Pending intents take priority (latency-free UI).
-        match rx_intents.recv_timeout(METERS_PERIOD) {
+        let woke = match rx_intents.recv_timeout(METERS_PERIOD) {
             Ok(intent) => child_dispatch(handle, &pipe, &mut model, &intent),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        if woke {
+            autotune_active = true;
+            last_wizard = epoch.checked_sub(WIZARD_PERIOD).unwrap_or(epoch);
         }
         let now = Instant::now();
-        // 2. Meters at ≤ 60 Hz while the window is visible, coalesced: a
+        // 2. Wizard progress at ~10 Hz while the parent calibrates (the
+        //    poll stops on the first terminal frame).
+        if autotune_active && now.duration_since(last_wizard) >= WIZARD_PERIOD {
+            last_wizard = now;
+            if let Ok(PipeResponse {
+                ok: true,
+                data: Some(data),
+                ..
+            }) = single_instance::send_request(&pipe, &PipeRequest::CalibrateQuery)
+            {
+                if let Some((ui, calibration, terminal)) = autotune_ui_from_state(&data) {
+                    if terminal {
+                        autotune_active = false;
+                    }
+                    handle.update_if(move |s, _| {
+                        s.model.autotune = ui;
+                        s.model.calibration = calibration;
+                        true
+                    });
+                }
+            } else {
+                // Parent unreachable or refused: stop the wizard, the
+                // last rendered step stays on screen.
+                tracing::warn!(target: "tine::ui", "auto-tune progress unavailable; wizard poll stopped");
+                autotune_active = false;
+            }
+        }
+        // 3. Meters at ≤ 60 Hz while the window is visible, coalesced: a
         //    queued-but-undrained update drops the older frame.
         if WINDOW_VISIBLE.load(Ordering::Acquire)
             && now.duration_since(last_meters) >= METERS_PERIOD
@@ -1017,7 +1185,7 @@ fn child_worker(handle: &rune::AppHandle<AppState>, rx_intents: &Receiver<Intent
                 });
             }
         }
-        // 3. Model refresh at a slow snapshot cadence.
+        // 4. Model refresh at a slow snapshot cadence.
         if now.duration_since(last_status) >= STATUS_PERIOD {
             last_status = now;
             child_refresh_model(handle, &mut model);
@@ -1025,15 +1193,45 @@ fn child_worker(handle: &rune::AppHandle<AppState>, rx_intents: &Receiver<Intent
     }
 }
 
+/// Resets the wizard and results card in the Rune state (the optimistic
+/// close after Apply / Discard; the render thread applies it when idle).
+fn close_wizard(handle: &rune::AppHandle<AppState>) {
+    let ui = AutoTuneUi::default();
+    handle.update_if(move |s, _| {
+        s.model.autotune = ui;
+        s.model.calibration = None;
+        true
+    });
+}
+
 /// Forwards one intent to the parent's pipe, or handles it locally.
-fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut ChildModel, intent: &Intent) {
+/// Returns `true` when the Auto-Tune wizard poll should start (the
+/// parent accepted a calibration start).
+fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut ChildModel, intent: &Intent) -> bool {
     // Admin intents run on their own worker thread (never the UI thread)
     // and post the refreshed badge back through `AppHandle::update`.
     if let Intent::InstallApo | Intent::RepairApo = intent {
         spawn_admin_check(handle.clone());
-        return;
+        return false;
     }
-    let req = match &intent {
+    if let Intent::ApplyCalibration { keep_pins } = intent {
+        // Close the wizard + results card locally on the optimistic path;
+        // the parent's apply lands in the next model refresh.
+        tracing::debug!(target: "tine::ui", keep_pins, "auto-tune results applied via parent");
+        close_wizard(handle);
+    } else if let Intent::DiscardCalibration = intent {
+        tracing::info!(target: "tine::ui", "auto-tune results discarded");
+        close_wizard(handle);
+    }
+    let req = match intent {
+        Intent::SelectEndpoint(idx) => model
+            .endpoints
+            .get(*idx)
+            .map(|id| PipeRequest::Endpoint { id: id.clone() })
+            .or_else(|| {
+                tracing::warn!(target: "tine::ui", idx, "endpoint index has no picker row; not routed");
+                None
+            }),
         Intent::SetArchetype(a) => Some(PipeRequest::Archetype {
             name: a.id().to_owned(),
         }),
@@ -1045,6 +1243,8 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
             key: key.to_owned(),
             value: *v,
         }),
+        Intent::Unpin(id) => param_key(*id).map(|key| PipeRequest::Unpin { key: key.to_owned() }),
+        Intent::UnpinAll => Some(PipeRequest::UnpinAll),
         Intent::ToggleBypass => Some(PipeRequest::Bypass { on: !model.bypass }),
         Intent::ToggleMonitor => Some(PipeRequest::Monitor {
             on: !model.monitor_on,
@@ -1055,35 +1255,50 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
             device: Some(name.clone()),
         }),
         Intent::StartAutoTune => Some(PipeRequest::Calibrate),
-        // Not yet routable through the pipe protocol — see the task's
-        // `## Requests`. Surfaced, never silently dropped.
-        _ => None,
+        Intent::CancelAutoTune => Some(PipeRequest::CalibrateCancel),
+        Intent::ApplyCalibration { keep_pins } => Some(PipeRequest::CalibrateApply { keep_pins: *keep_pins }),
+        Intent::DiscardCalibration => Some(PipeRequest::CalibrateDiscard),
+        Intent::OpenSettings
+        | Intent::SetProDrawerOpen(_)
+        | Intent::CloseWindow
+        | Intent::InstallApo
+        | Intent::RepairApo => None,
     };
-    match req {
-        Some(req) => match single_instance::send_request(pipe, &req) {
-            Ok(PipeResponse { ok: true, .. }) => {
-                tracing::debug!(target: "tine::ui", intent = ?intent, "intent applied");
-                if let PipeRequest::Bypass { on } = req {
-                    model.bypass = on;
-                }
-                if let PipeRequest::Monitor { on, .. } = req {
-                    model.monitor_on = on;
-                }
+    let started_calibrate = matches!(req, Some(PipeRequest::Calibrate));
+    let Some(req) = req else {
+        tracing::debug!(target: "tine::ui", intent = ?intent, "local-only intent (no pipe request)");
+        return false;
+    };
+    match single_instance::send_request(pipe, &req) {
+        Ok(PipeResponse { ok: true, data, .. }) => {
+            tracing::debug!(target: "tine::ui", intent = ?intent, "intent applied");
+            if let PipeRequest::Bypass { on } = req {
+                model.bypass = on;
             }
-            Ok(resp) => {
-                let msg = resp.error.unwrap_or_else(|| "request failed".to_owned());
-                tracing::error!(target: "tine::ui", intent = ?intent, "{msg}");
+            if let PipeRequest::Monitor { on, .. } = req {
+                model.monitor_on = on;
             }
-            Err(e) => {
-                tracing::error!(target: "tine::ui", intent = ?intent, "parent unreachable: {e}");
+            if let PipeRequest::Endpoint { id } = req {
+                model.endpoint_id = id;
             }
-        },
-        None => {
-            tracing::warn!(
-                target: "tine::ui",
-                intent = ?intent,
-                "intent not yet routable through the pipe protocol (see T21 ## Requests)"
-            );
+            // The wizard poll starts only when the parent actually
+            // began a run (a missing routing link answers otherwise).
+            started_calibrate
+                && data
+                    .as_ref()
+                    .and_then(|d| d.get("calibrate"))
+                    .and_then(|c| c.get("flow"))
+                    .and_then(Value::as_str)
+                    == Some("running")
+        }
+        Ok(resp) => {
+            let msg = resp.error.unwrap_or_else(|| "request failed".to_owned());
+            tracing::error!(target: "tine::ui", intent = ?intent, "{msg}");
+            false
+        }
+        Err(e) => {
+            tracing::error!(target: "tine::ui", intent = ?intent, "parent unreachable: {e}");
+            false
         }
     }
 }
@@ -1120,6 +1335,21 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
         tracing::debug!(target: "tine::ui", "status unavailable (parent starting?)");
         return;
     };
+    // Picker rows the parent's next `SelectEndpoint` indexes into.
+    model.endpoints = apo_admin::list_capture_endpoints().map_or_else(
+        |e| {
+            tracing::warn!(target: "tine::ui", "endpoint re-enumeration failed: {e}");
+            model.endpoints.clone()
+        },
+        |list| list.into_iter().map(|e| e.id).collect::<Vec<_>>(),
+    );
+    if let Some(notes) = status.get("notes").and_then(Value::as_array)
+        && !notes.is_empty()
+    {
+        for note in notes {
+            tracing::warn!(target: "tine::ui", "{note}");
+        }
+    }
     model.bypass = status.get("bypass").and_then(Value::as_bool).unwrap_or(model.bypass);
     model.monitor_on = status
         .get("monitor")
@@ -1320,5 +1550,56 @@ mod tests {
     #[test]
     fn nominal_monitor_latency_matches_the_d026_formula() {
         assert!((nominal_monitor_latency_ms() - (10.0 + 10.0 + 21.6)).abs() < 0.01);
+    }
+
+    #[test]
+    fn wizard_state_maps_each_flow_of_the_wire_payload() {
+        // Running: phase + level drive the wizard's step + meter.
+        let (ui, cal, terminal) = autotune_ui_from_state(&serde_json::json!({
+            "flow": "running", "phase": "Noise", "progress": 0.5,
+            "level_db": -40.0, "voiced_ms": 0
+        }))
+        .expect("running frame");
+        assert!(matches!(ui.step, AutoTuneStep::Silence { .. }), "{:?}", ui.step);
+        assert!((ui.level_db - (-40.0)).abs() < 0.01);
+        assert!(!terminal && cal.is_none());
+
+        // Report-pending: the results card carries the measured numbers
+        // and SPECS-keyed diffs become labeled rows.
+        let (ui, cal, terminal) = autotune_ui_from_state(&serde_json::json!({
+            "flow": "report-pending", "summary": "measured",
+            "report": {
+                "noise_rms_db": -50.0, "speech_rms_db": -20.0,
+                "simulated_peak_db": -4.5, "simulated_rms_db": -18.0,
+                "changes": [ { "key": "input_gain_db", "before": 0.0, "after": 6.5 } ]
+            }
+        }))
+        .expect("results frame");
+        assert!(matches!(ui.step, AutoTuneStep::Results));
+        let cal = cal.expect("results card");
+        assert!((cal.simulated_peak_db - (-4.5)).abs() < 0.01);
+        assert_eq!(cal.changes.len(), 1);
+        assert_eq!(cal.changes[0].param, ParamId::InputGainDb);
+        assert_eq!(cal.changes[0].unit, "dB");
+        assert!(terminal);
+
+        // Failed: the typed rejection maps the failure card.
+        let (ui, _, terminal) = autotune_ui_from_state(&serde_json::json!({
+            "flow": "failed",
+            "failure": { "type": "TooNoisy", "snr_db": 4.0 },
+            "message": "too noisy"
+        }))
+        .expect("failure frame");
+        assert!(matches!(
+            ui.step,
+            AutoTuneStep::Failed(CalFailureUi::TooNoisy { snr_db }) if (snr_db - 4.0).abs() < 0.01
+        ));
+        assert!(terminal);
+
+        // Idle closes the wizard; an unknown flow is skipped, not mapped.
+        let (ui, _, terminal) = autotune_ui_from_state(&serde_json::json!({ "flow": "idle" })).expect("idle frame");
+        assert!(matches!(ui.step, AutoTuneStep::Idle));
+        assert!(terminal);
+        assert!(autotune_ui_from_state(&serde_json::json!({ "flow": "from-the-future" })).is_none());
     }
 }

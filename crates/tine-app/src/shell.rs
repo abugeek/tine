@@ -14,7 +14,7 @@ use std::time::Instant;
 use rune::{Tray, TrayEvent};
 use serde_json::{Value, json};
 use tine_engine::controller::{Command, Controller, EngineConfig, Event};
-use tine_engine::model::{EndpointId, Macro, MonitorSettings};
+use tine_engine::model::{EndpointId, KeepPins, Macro, MonitorSettings};
 use tine_engine::paths::EnginePaths;
 use tine_engine::persist;
 use tine_engine::shm_client::LinkState;
@@ -154,6 +154,8 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     // 3. Controller (thread; blocks on its own channel, no polling while
     //    linked). Endpoint: persisted selection, else the default capture
     //    device, else a placeholder id — no COM on the cold-start path.
+    //    D-018: the target is the in-process parameter block the
+    //    virtual-cable routing loop reads (the router is started below).
     let settings = persist::load_settings(&paths).into_value();
     let endpoint = settings
         .selected_endpoint_id
@@ -162,7 +164,11 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
         .or_else(default_capture_endpoint)
         .unwrap_or_else(|| EndpointId::new("default"));
     tracing::info!(target: "tine::shell", endpoint = endpoint.as_str(), "controller starting");
-    let (handle, rx_events) = Controller::spawn(EngineConfig::shm(&endpoint, paths.clone()));
+    let (handle, rx_events) = Controller::spawn(EngineConfig::block(
+        endpoint.clone(),
+        services::param_block(),
+        paths.clone(),
+    ));
 
     // 4. App loop plumbing.
     let (tx, rx) = channel::<Msg>();
@@ -215,6 +221,15 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     }
     crate::single_instance::spawn_server(guard.pipe_name.clone(), tx_jobs);
 
+    // 6b. D-018 routing: the virtual-cable loop runs in this process
+    //     (audio keeps flowing while the window is closed); the router
+    //     follows the controller's endpoint on every `ModelChanged`.
+    //     The loop's health is this topology's "linked" notion — with
+    //     the block target the engine never emits `ApoLink`.
+    let routed = services::router_follow(endpoint.as_str());
+    shell.link = link_from_router(routed);
+    shell.sync_tray(&tx);
+
     // 7. Event loop.
     let mut code = exit_code::OK;
     while let Ok(msg) = rx.recv() {
@@ -222,6 +237,10 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
             Msg::Engine(Event::ModelChanged(model)) => {
                 shell.ensure_endpoint_names();
                 shell.model = Some(model);
+                if let Some(endpoint) = shell.model.as_ref().and_then(|m| m.endpoint.as_ref()) {
+                    let routed = services::router_follow(endpoint.as_str());
+                    shell.link = link_from_router(routed);
+                }
                 shell.sync_tray(&tx);
             }
             Msg::Engine(Event::ApoLink(link)) => {
@@ -255,10 +274,13 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
         }
     }
 
-    // 8. Clean shutdown: stop services, flush persistence (dropping every
-    //    `ControllerHandle` ends the controller thread, which flushes on
-    //    channel close), remove the tray, kill the UI child, exit.
+    // 8. Clean shutdown: stop services (monitor, Auto-Tune shim, routing
+    //    loop — releasing the mic and the cable sink), flush persistence
+    //    (dropping every `ControllerHandle` ends the controller thread,
+    //    which flushes on channel close), remove the tray, kill the UI
+    //    child, exit.
     tracing::info!(target: "tine::shell", "shutting down");
+    services::shutdown();
     // Interrupt any running soak so its thread joins within a sample period.
     crate::console::INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
     for join in shell.soaks.drain(..) {
@@ -375,8 +397,11 @@ impl Shell {
                 PipeResponse::ok(self.status_value())
             }
             PipeRequest::Meters => {
-                let telemetry = self.handle.telemetry();
+                // D-018: with the router running, the pull order matters
+                // (single `UiFrame` reader): spectrum first caches the
+                // frame; the telemetry read then comes from that cache.
                 let spectrum = services::spectrum();
+                let telemetry = services::telemetry_live().unwrap_or_else(|| self.handle.telemetry());
                 PipeResponse::ok(json!({
                     "telemetry": {
                         "sequence": telemetry.sequence,
@@ -392,50 +417,67 @@ impl Shell {
                 }))
             }
             PipeRequest::Calibrate => {
-                // The stub logs the request either way (services.rs TODO(T16));
-                // the response states whether the flow is live yet.
                 services::autotune_start();
-                let state = if services::AUTOTUNE_AVAILABLE {
-                    "started"
-                } else {
-                    "deferred: engine audio services pending (T16)"
-                };
+                // The reply carries the flow state: `running` right away,
+                // or the surfaced reason when the run could not start.
+                let state = services::autotune_state();
+                if state.get("flow").and_then(Value::as_str) != Some("running") {
+                    for note in services::take_messages() {
+                        tracing::warn!(target: "tine::shell", "{note}");
+                    }
+                }
                 PipeResponse::ok(json!({ "calibrate": state }))
             }
             PipeRequest::Quit => PipeResponse::empty(), // handled by the loop
-            PipeRequest::Set { key, value } => match crate::cli::param_id_by_key(&key) {
-                Some(id) => {
-                    let _ = self.handle.send(Command::SetParam(id, value));
-                    PipeResponse::ok(json!({"set": key, "value": value}))
+            PipeRequest::Set { .. }
+            | PipeRequest::Macro { .. }
+            | PipeRequest::Archetype { .. }
+            | PipeRequest::Bypass { .. }
+            | PipeRequest::Endpoint { .. }
+            | PipeRequest::Unpin { .. }
+            | PipeRequest::UnpinAll => match pipe_control_command(&req) {
+                Ok(cmd) => {
+                    let _ = self.handle.send(cmd);
+                    let ack = match &req {
+                        PipeRequest::Set { key, value } => json!({ "set": key, "value": value }),
+                        PipeRequest::Macro { name, value } => json!({ "macro": name, "value": value }),
+                        PipeRequest::Archetype { name } => match crate::cli::archetype_from_name(name) {
+                            Some(a) => json!({ "archetype": a.id() }),
+                            None => json!({ "archetype": name }),
+                        },
+                        PipeRequest::Bypass { on } => json!({ "bypass": on }),
+                        PipeRequest::Endpoint { id } => json!({ "endpoint": id }),
+                        PipeRequest::Unpin { key } => json!({ "unpin": key }),
+                        PipeRequest::UnpinAll => json!({ "unpin": "all" }),
+                        _ => Value::Null,
+                    };
+                    PipeResponse::ok(ack)
+                }
+                Err(msg) => PipeResponse::err(exit_code::USAGE, msg),
+            },
+            PipeRequest::CalibrateQuery => PipeResponse::ok(services::autotune_state()),
+            PipeRequest::CalibrateCancel => {
+                services::autotune_cancel();
+                PipeResponse::ok(json!({ "calibrate": "cancelling" }))
+            }
+            PipeRequest::CalibrateApply { keep_pins } => match services::autotune_take_pending() {
+                Some(calibration) => {
+                    let keep = if keep_pins { KeepPins::Keep } else { KeepPins::Clear };
+                    if let Err(e) = self.handle.send(Command::ApplyCalibration(calibration, keep)) {
+                        tracing::error!(target: "tine::shell", error = %e, "calibration apply failed");
+                        return PipeResponse::err(exit_code::FAILURE, format!("Tine engine unreachable: {e}"));
+                    }
+                    tracing::info!(target: "tine::shell", keep_pins, "calibration applied");
+                    PipeResponse::ok(json!({ "calibrate": "applied" }))
                 }
                 None => PipeResponse::err(
-                    exit_code::USAGE,
-                    format!("unknown parameter key `{key}` (see docs/project/03-dsp-pipeline.md)"),
+                    exit_code::NOT_RUNNING,
+                    "no Auto-Tune results to apply (run a calibration first)",
                 ),
             },
-            PipeRequest::Macro { name, value } => match Macro::from_name(&name) {
-                Some(m) => {
-                    let _ = self.handle.send(Command::SetMacro(m, value));
-                    PipeResponse::ok(json!({ "macro": name, "value": value }))
-                }
-                None => PipeResponse::err(
-                    exit_code::USAGE,
-                    format!("unknown macro `{name}` (purity|body|presence|leveler)"),
-                ),
-            },
-            PipeRequest::Archetype { name } => match crate::cli::archetype_from_name(&name) {
-                Some(a) => {
-                    let _ = self.handle.send(Command::SetArchetype(a));
-                    PipeResponse::ok(json!({ "archetype": a.id() }))
-                }
-                None => PipeResponse::err(
-                    exit_code::USAGE,
-                    format!("unknown archetype `{name}` (dynamic|condenser|headset|laptop)"),
-                ),
-            },
-            PipeRequest::Bypass { on } => {
-                let _ = self.handle.send(Command::SetBypass(on));
-                PipeResponse::ok(json!({ "bypass": on }))
+            PipeRequest::CalibrateDiscard => {
+                services::autotune_discard();
+                PipeResponse::ok(json!({ "calibrate": "discarded" }))
             }
             PipeRequest::Monitor { on, device } => {
                 self.apply_monitor(on, device);
@@ -495,6 +537,9 @@ impl Shell {
             "link": link_string(&self.link),
             "monitor": model.is_some_and(|m| m.monitor.enabled),
             "monitor_device": model.and_then(|m| m.monitor.output_device.clone()),
+            "router": services::router_status(),
+            "autotune": services::autotune_state(),
+            "notes": services::take_messages(),
             "autostart": self.autostart,
             "autostart_command": if self.autostart {
                 crate::autostart::command_line_for_current_exe()
@@ -508,6 +553,55 @@ impl Shell {
             },
             "windows": crate::version::windows_edition(),
         })
+    }
+}
+
+/// Wire-to-engine mapping of every *pure control* pipe request: no shell
+/// state is consulted, so this is the single place the pipe protocol's
+/// control surface resolves to [`Command`]s — and the seam the pipe
+/// integration tests drive against a real controller.
+///
+/// `Err` carries the human-facing usage message (unknown key/macro/…).
+/// Requests that need shell or services state (`open`, `status`,
+/// `meters`, `calibrate*`, `monitor`, `soak`, `quit`) are not control
+/// commands; they are mapped in [`Shell::execute_pipe`] and land here
+/// only as an `Err` the shell never produces.
+pub fn pipe_control_command(req: &PipeRequest) -> Result<Command, String> {
+    match req {
+        PipeRequest::Set { key, value } => crate::cli::param_id_by_key(key)
+            .map(|id| Command::SetParam(id, *value))
+            .ok_or_else(|| format!("unknown parameter key `{key}` (see docs/project/03-dsp-pipeline.md)")),
+        PipeRequest::Macro { name, value } => Macro::from_name(name)
+            .map(|m| Command::SetMacro(m, *value))
+            .ok_or_else(|| format!("unknown macro `{name}` (purity|body|presence|leveler)")),
+        PipeRequest::Archetype { name } => crate::cli::archetype_from_name(name)
+            .map(Command::SetArchetype)
+            .ok_or_else(|| format!("unknown archetype `{name}` (dynamic|condenser|headset|laptop)")),
+        PipeRequest::Bypass { on } => Ok(Command::SetBypass(*on)),
+        PipeRequest::Endpoint { id } => Ok(Command::SelectEndpoint(EndpointId::new(id.clone()))),
+        PipeRequest::Unpin { key } => crate::cli::param_id_by_key(key)
+            .map(Command::Unpin)
+            .ok_or_else(|| format!("unknown parameter key `{key}` (see docs/project/03-dsp-pipeline.md)")),
+        PipeRequest::UnpinAll => Ok(Command::UnpinAll),
+        other => Err(format!("{} is not a control request", json_cmd(other))),
+    }
+}
+
+/// The request's tag (`cmd`) for messages (control arms never land here).
+fn json_cmd(req: &PipeRequest) -> String {
+    serde_json::to_value(req)
+        .ok()
+        .and_then(|v| v.get("cmd").cloned())
+        .map_or_else(|| "unknown".to_owned(), |c| c.to_string())
+}
+
+/// The D-018 "linked" notion: the routing loop's health (the block
+/// target never emits an `ApoLink` event).
+fn link_from_router(routed: bool) -> LinkState {
+    if routed {
+        LinkState::Linked { heartbeat_age_ms: 0 }
+    } else {
+        LinkState::Unlinked
     }
 }
 
