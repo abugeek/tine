@@ -497,9 +497,28 @@ impl tine_engine::autotune::SampleSource for RouterTapSource {
 
 /// [`autotune_start`] against explicit persistence roots (test seam).
 pub fn autotune_start_on(paths: &EnginePaths) {
-    if with(|s| s.autotune.is_some()) {
+    if with(|s| matches!(s.autotune, Some(AutotuneState::Running { .. }))) {
         tracing::info!(target: "tine::services", "auto-tune already running");
         return;
+    }
+    if with(|s| matches!(s.autotune, Some(AutotuneState::ReportPending { .. }))) {
+        with(|s| {
+            s.surface("Auto-Tune: apply or discard the pending Auto-Tune results before starting a new run".to_owned());
+        });
+        return;
+    }
+    // A terminal `Failed` state from a previous run is a stale failure card,
+    // not a lock (T22 QA: a NotEnoughSpeech rejection left every retry
+    // silently rejected as "already running"). Drop it so the new run
+    // starts from `idle`; `Running` and `ReportPending` above stay protected.
+    if with(|s| {
+        let stale = matches!(s.autotune, Some(AutotuneState::Failed { .. }));
+        if stale {
+            s.autotune = None;
+        }
+        stale
+    }) {
+        tracing::info!(target: "tine::services", "auto-tune stale failure cleared for retry");
     }
     let routed_rate = with(|s| s.router.as_ref().map(|r| r.rate_hz));
     let client = endpoint_client(paths).or_else(|| {
@@ -1093,6 +1112,93 @@ mod tests {
                 .any(|m| m.contains("Auto-Tune needs a live processing link"))
         );
         assert_eq!(autotune_state()["flow"], "idle");
+    }
+
+    #[test]
+    fn autotune_retry_after_a_failed_run_is_not_wedged() {
+        // Regression (T22 QA): a terminal `Failed` state (e.g. the silent-room
+        // `NotEnoughSpeech` rejection) used to block every later start as an
+        // unnoticed "already running" reject. A retry must proceed: here the
+        // proceed-path surfaces the same live-link message a cold start does
+        // (no router is up in this test) and leaves the flow back at `idle`.
+        let paths = temp_paths();
+        super::shutdown();
+        with(|s| {
+            s.autotune = Some(AutotuneState::Failed {
+                failure: Some(CalFailure::NotEnoughSpeech { voiced_ms: 0 }),
+                message: "Auto-Tune rejected the capture".to_owned(),
+            });
+        });
+        autotune_start_on(&paths);
+        assert!(
+            take_messages()
+                .iter()
+                .any(|m| m.contains("Auto-Tune needs a live processing link")),
+            "retry must have proceeded past the stale failure card"
+        );
+        assert_eq!(autotune_state()["flow"], "idle");
+    }
+
+    #[test]
+    fn autotune_retry_keeps_running_and_pending_states_protected() {
+        let paths = temp_paths();
+        super::shutdown();
+        // In-flight run: politely rejected, untouched.
+        with(|s| {
+            s.autotune = Some(AutotuneState::Running {
+                phase: CalPhase::Countdown,
+                progress: 0.0,
+                level_db: -90.0,
+                voiced_ms: 0,
+            });
+        });
+        autotune_start_on(&paths);
+        assert_eq!(autotune_state()["flow"], "running");
+        assert!(
+            !take_messages().iter().any(|m| m.contains("live processing link")),
+            "a concurrent run must not proceed to a second capture"
+        );
+
+        // Applied-pending results: rejected with an actionable message.
+        let report = tine_engine::autotune::CalibrationReport {
+            calibration: tine_protocol::presets::Calibration {
+                noise_rms_db: -80.0,
+                noise_peak_db: -70.0,
+                speech_rms_db: -18.0,
+                crest_db: 12.0,
+                tilt_db: 3.0,
+                derived: tine_protocol::presets::CalibrationOverrides {
+                    input_gain_db: 9.5,
+                    gate_threshold_db: -55.0,
+                    denoise_mix: 0.85,
+                    comp_thresh_db: -16.0,
+                    comp_makeup_db: 2.5,
+                },
+            },
+            changes: [
+                (tine_protocol::params::ParamId::InputGainDb, 0.0, 9.5),
+                (tine_protocol::params::ParamId::GateThresholdDb, -40.0, -55.0),
+                (tine_protocol::params::ParamId::DenoiseMix, 0.5, 0.85),
+                (tine_protocol::params::ParamId::CompThreshDb, -20.0, -16.0),
+                (tine_protocol::params::ParamId::CompMakeupDb, 0.0, 2.5),
+            ],
+            simulated_peak_db: -5.2,
+            simulated_rms_db: -18.4,
+        };
+        with(|s| {
+            s.autotune = Some(AutotuneState::ReportPending {
+                report,
+                summary: "measured".to_owned(),
+            });
+        });
+        autotune_start_on(&paths);
+        assert_eq!(autotune_state()["flow"], "report-pending");
+        assert!(
+            take_messages()
+                .iter()
+                .any(|m| m.contains("apply or discard the pending Auto-Tune results")),
+            "pending results must be protected with an actionable message"
+        );
     }
 
     #[test]
