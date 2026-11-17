@@ -2,7 +2,7 @@
 
 | Field | Value |
 | :--- | :--- |
-| Status | todo |
+| Status | in-progress (agent: tine-worker) |
 | Lane | Z — Ship |
 | Depends on | T21 |
 | Unblocks | T23 |
