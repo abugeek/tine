@@ -35,14 +35,14 @@ pub struct PresetDef {
 /// Dynamic USB / XLR broadcast mic (Fifine AM8, SM7B, `PodMic`).
 ///
 /// HPF 80 Hz · low-shelf +2.0 dB @ 110 Hz · peaking −3.0 dB @ 340 Hz (Q 1.4)
-/// · high-shelf +3.5 dB @ 5.5 kHz.
+/// · high-shelf +3.5 dB @ 8.0 kHz.
 pub const DYNAMIC: PresetDef = PresetDef {
     archetype: Archetype::Dynamic,
     id: "dynamic",
     name: "Dynamic USB / XLR",
     base: DspParams {
         hpf_freq_hz: 80.0,
-        eq_freq_hz: [110.0, 340.0, 950.0, 4200.0, 5500.0],
+        eq_freq_hz: [110.0, 340.0, 950.0, 4200.0, 8000.0],
         eq_gain_db: [2.0, -3.0, 0.0, 0.0, 3.5],
         eq_q: [0.707, 1.4, 1.0, 1.0, 0.707],
         ..DspParams::DEFAULT
@@ -83,14 +83,14 @@ pub const CONDENSER: PresetDef = PresetDef {
 /// Gaming headset / boom mic.
 ///
 /// HPF 100 Hz · low-shelf +4.0 dB @ 130 Hz (synthetic body)
-/// · peaking −3.5 dB @ 950 Hz (Q 1.2) · high-shelf +2.0 dB @ 4.5 kHz.
+/// · peaking −3.5 dB @ 950 Hz (Q 1.2) · high-shelf +2.0 dB @ 8.0 kHz.
 pub const HEADSET: PresetDef = PresetDef {
     archetype: Archetype::Headset,
     id: "headset",
     name: "Gaming Headset / Boom",
     base: DspParams {
         hpf_freq_hz: 100.0,
-        eq_freq_hz: [130.0, 320.0, 950.0, 4200.0, 4500.0],
+        eq_freq_hz: [130.0, 320.0, 950.0, 4200.0, 8000.0],
         eq_gain_db: [4.0, 0.0, -3.5, 0.0, 2.0],
         eq_q: [0.707, 1.0, 1.2, 1.0, 0.707],
         ..DspParams::DEFAULT

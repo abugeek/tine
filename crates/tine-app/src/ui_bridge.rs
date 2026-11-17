@@ -42,9 +42,9 @@ use tine_engine::autotune::{
 };
 use tine_engine::controller::{Command, ControllerHandle, Event};
 use tine_engine::model::{AppModel, EndpointId, EngineError, KeepPins, Macro as EngineMacro, MonitorSettings, resolve};
-use tine_engine::monitor::Monitor;
+use tine_engine::monitor::{Monitor, MonitorFeed};
 use tine_engine::paths::EnginePaths;
-use tine_engine::persist::{self, Loaded};
+use tine_engine::persist;
 use tine_engine::shm_client::ShmClient;
 use tine_engine::visualizer::{EngineSignals, UiFrame, Visualizer};
 use tine_protocol::params::{DspParams, ParamId, SPECS, Unit};
@@ -333,24 +333,33 @@ impl EndpointAdmin for ComEndpointAdmin {
 /// recorder in tests.
 pub trait MonitorHost: Send {
     /// Starts or restarts the streams and returns the latency badge (ms).
-    fn apply(&mut self, enabled: bool, endpoint: &DeviceRef, output: Option<&str>) -> Result<f32, String>;
+    fn apply(&mut self, enabled: bool, output: Option<&str>) -> Result<f32, String>;
     /// Stops monitoring (teardown on disable/shutdown).
     fn stop(&mut self);
     /// `true` when the underlying stream reported an error.
     fn has_error(&self) -> bool;
 }
 
-/// Production [`MonitorHost`] owning the T16 `Monitor` (cpal capture of the
-/// processed endpoint → playback, restart on device change).
+/// Production [`MonitorHost`] owning the T16 `Monitor` (cpal playback of the
+/// post-DSP [`MonitorFeed`], restart on device change).
 pub struct CpalMonitorHost {
     monitor: Option<Monitor>,
+    feed: Option<MonitorFeed>,
 }
 
 impl CpalMonitorHost {
     /// Creates the idle host (no stream until [`MonitorHost::apply`]).
     #[must_use]
     pub fn new() -> Self {
-        Self { monitor: None }
+        Self {
+            monitor: None,
+            feed: None,
+        }
+    }
+
+    /// Attaches or replaces the post-DSP [`MonitorFeed`] from the active router.
+    pub fn set_feed(&mut self, feed: Option<MonitorFeed>) {
+        self.feed = feed;
     }
 }
 
@@ -361,20 +370,23 @@ impl Default for CpalMonitorHost {
 }
 
 impl MonitorHost for CpalMonitorHost {
-    fn apply(&mut self, enabled: bool, endpoint: &DeviceRef, output: Option<&str>) -> Result<f32, String> {
+    fn apply(&mut self, enabled: bool, output: Option<&str>) -> Result<f32, String> {
         let out = output.map_or_else(DeviceRef::default, DeviceRef::parse);
         if !enabled {
             self.stop();
             return Ok(0.0);
         }
+        let Some(feed) = &self.feed else {
+            return Err("Hear Myself will start once audio routing is active".to_owned());
+        };
         match &mut self.monitor {
             Some(m) => {
-                m.restart(endpoint, &out)
+                m.restart(feed, &out)
                     .map_err(|e| format!("Hear Myself restart failed: {e}"))?;
             }
             None => {
                 self.monitor =
-                    Some(Monitor::start(endpoint, &out).map_err(|e| format!("Hear Myself failed to start: {e}"))?);
+                    Some(Monitor::start(feed, &out).map_err(|e| format!("Hear Myself failed to start: {e}"))?);
             }
         }
         Ok(self
@@ -523,10 +535,10 @@ impl EngineBridge {
         std::mem::take(&mut self.messages)
     }
 
-    /// `true` while this is the first run ever (no settings file yet).
+    /// `true` while onboarding has not yet been completed.
     #[must_use]
     pub fn first_run(&self) -> bool {
-        matches!(persist::load_settings(&self.paths), Loaded::Missing(_))
+        !persist::load_settings(&self.paths).into_value().onboarding_completed
     }
 
     /// Refreshes the endpoint list and the D-018 badge from the admin
@@ -633,7 +645,7 @@ impl EngineBridge {
                     let endpoint = m.endpoint.clone();
                     if endpoint != self.monitor_endpoint {
                         self.monitor_endpoint.clone_from(&endpoint);
-                        self.monitor_apply(true, m.monitor.output_device.as_deref(), endpoint.as_ref());
+                        self.monitor_apply(true, m.monitor.output_device.as_deref());
                     }
                 } else {
                     self.monitor_endpoint = None;
@@ -736,16 +748,21 @@ impl EngineBridge {
             calibration,
             autotune: self.autotune_ui.clone(),
             first_run: self.first_run(),
+            status_banner: None,
         }
     }
 
     /// Dispatches one user intent (the in-process `IntentSink` mapping).
     pub fn dispatch(&mut self, intent: Intent) {
         match intent {
-            Intent::SelectEndpoint(idx) => match self.endpoints.get(idx).map(|e| e.id.clone()) {
-                Some(id) => self.send(Command::SelectEndpoint(EndpointId::new(id))),
-                None => self.surface("Selected microphone disappeared before switching"),
-            },
+            Intent::SelectEndpoint(id) => {
+                if self.endpoints.iter().any(|e| e.id == id) {
+                    self.send(Command::SelectEndpoint(EndpointId::new(id)));
+                } else {
+                    tracing::warn!(target: "tine::bridge", endpoint_id = %id, "selected microphone not found in endpoints");
+                    self.surface("Selected microphone disappeared before switching");
+                }
+            }
             Intent::SetArchetype(a) => self.send(Command::SetArchetype(a)),
             Intent::SetMacro(m, v) => self.send(Command::SetMacro(engine_macro(m), v)),
             Intent::SetParam(id, v) => self.send(Command::SetParam(id, v)),
@@ -790,9 +807,16 @@ impl EngineBridge {
                     self.surface("Tine needs a virtual audio cable: install VB-Audio Virtual Cable, then use Repair.");
                 }
             }
-            Intent::OpenSettings | Intent::SetProDrawerOpen(_) => {
-                // tine-ui applied the local state already; the engine
-                // persists Pro drawer state with its next settings flush.
+            Intent::SetProDrawerOpen(open) => {
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                if settings.pro_drawer_open != open {
+                    settings.pro_drawer_open = open;
+                    if let Err(e) = persist::save_settings(&settings, &self.paths) {
+                        self.surface(&format!("Failed to save Pro drawer state: {e}"));
+                    }
+                }
+            }
+            Intent::OpenSettings => {
                 tracing::debug!(target: "tine::bridge", intent = ?intent, "local-only intent");
             }
             Intent::CloseWindow => {
@@ -817,8 +841,10 @@ impl EngineBridge {
     /// Applies monitor state: drives the [`MonitorHost`] and persists the
     /// setting through the controller (single source of truth).
     fn monitor_set(&mut self, enabled: bool, device: Option<String>) {
-        let endpoint = self.model.as_ref().and_then(|m| m.endpoint.clone());
-        self.monitor_apply(enabled, device.as_deref(), endpoint.as_ref());
+        self.monitor_apply(enabled, device.as_deref());
+        self.monitor_endpoint = enabled
+            .then(|| self.model.as_ref().and_then(|m| m.endpoint.clone()))
+            .flatten();
         self.send(Command::SetMonitor(MonitorSettings {
             enabled,
             output_device: device,
@@ -826,13 +852,12 @@ impl EngineBridge {
     }
 
     /// Drives the [`MonitorHost`] and records the latency badge.
-    fn monitor_apply(&mut self, enabled: bool, device: Option<&str>, endpoint: Option<&EndpointId>) {
-        let endpoint_ref = endpoint.map_or_else(DeviceRef::default, |e| DeviceRef::Id(e.as_str().to_owned()));
+    fn monitor_apply(&mut self, enabled: bool, device: Option<&str>) {
         let mut host = match self.monitor.lock() {
             Ok(h) => h,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match host.apply(enabled, &endpoint_ref, device) {
+        match host.apply(enabled, device) {
             Ok(latency) => self.monitor_latency_ms = if enabled { latency } else { 0.0 },
             Err(msg) => {
                 tracing::error!(target: "tine::bridge", "{msg}");
@@ -841,7 +866,9 @@ impl EngineBridge {
             }
         }
         drop(host);
-        self.monitor_endpoint = enabled.then(|| endpoint.cloned()).flatten();
+        if !enabled {
+            self.monitor_endpoint = None;
+        }
     }
 
     /// Starts the 8-second wizard through the T16 runner.
@@ -914,18 +941,65 @@ static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
 /// an update in flight drops the older frame).
 static METERS_QUEUED: AtomicBool = AtomicBool::new(false);
 
-/// Rune visibility hook (minimized/covered/hidden ⇄ shown).
-pub fn on_visibility(_s: &mut AppState, visible: bool, _tx: &mut rune::Tx) {
-    WINDOW_VISIBLE.store(visible, Ordering::Release);
+/// Whether onboarding completion/dismissal has already been persisted to
+/// `settings.json` for this child session.
+static ONBOARDING_PERSISTED: AtomicBool = AtomicBool::new(false);
+
+/// Persists onboarding dismissal/completion to the parent so `settings.json`
+/// exists on disk and `first_run` is `false` on future opens.
+fn persist_onboarding_async() {
+    if ONBOARDING_PERSISTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("tine-ui-onboarding".to_owned())
+        .spawn(|| {
+            let pipe = single_instance::pipe_name_for_user();
+            match single_instance::send_request(&pipe, &PipeRequest::OnboardingDone) {
+                Ok(PipeResponse { ok: true, .. }) => {
+                    tracing::debug!(target: "tine::ui", "onboarding dismissal persisted");
+                }
+                Ok(resp) => {
+                    ONBOARDING_PERSISTED.store(false, Ordering::Release);
+                    let msg = resp.error.unwrap_or_else(|| "onboarding persist failed".to_owned());
+                    tracing::warn!(target: "tine::ui", "{msg}");
+                }
+                Err(e) => {
+                    ONBOARDING_PERSISTED.store(false, Ordering::Release);
+                    tracing::warn!(target: "tine::ui", "onboarding persist unreachable: {e}");
+                }
+            }
+        })
+        .is_err()
+    {
+        ONBOARDING_PERSISTED.store(false, Ordering::Release);
+        tracing::error!(target: "tine::ui", "onboarding persist worker spawn failed");
+    }
 }
 
-/// Window key handler: delegate to `tine-ui` (A/B `Space`), then close on
-/// `Escape` / `⌘W` / `⌘Q` (tray app: closing hides, audio continues).
+/// Rune visibility hook (minimized/covered/hidden ⇄ shown).
+pub fn on_visibility(s: &mut AppState, visible: bool, _tx: &mut rune::Tx) {
+    WINDOW_VISIBLE.store(visible, Ordering::Release);
+    if !visible && s.model.first_run && s.ui.onboarding_dismissed {
+        s.model.first_run = false;
+        persist_onboarding_async();
+    }
+}
+
+/// Window key handler: delegate to `tine-ui` (A/B `Space`), dismiss
+/// onboarding on `Escape` when active, or close on `Escape` / `⌘W` / `⌘Q`
+/// (tray app: closing hides, audio continues).
 fn child_on_key(s: &mut AppState, ev: &rune::KeyEvent, tx: &mut rune::Tx) -> bool {
     if tine_ui::on_key(s, ev, tx) {
         return true;
     }
     match ev.key {
+        rune::Key::Escape if s.model.first_run && !s.ui.onboarding_dismissed => {
+            s.ui.onboarding_dismissed = true;
+            s.model.first_run = false;
+            persist_onboarding_async();
+            true
+        }
         rune::Key::Command('w' | 'q') | rune::Key::Escape => {
             tx.close_window();
             true
@@ -940,6 +1014,11 @@ const METERS_PERIOD: Duration = Duration::from_millis(16);
 /// Model-refresh period (the pipe equivalent of the model-event stream;
 /// the parent reacts to control changes well within this window).
 const STATUS_PERIOD: Duration = Duration::from_millis(2_000);
+
+/// Cooldown after a local UI edit before `child_refresh_model` overwrites
+/// profile-derived fields from disk (exceeds the controller's 500 ms
+/// trailing debounce so optimistic edits are never reverted).
+const EDIT_COOLDOWN: Duration = Duration::from_millis(1_500);
 
 /// Intent sink of the child process: forwards intents to the parent's
 /// command pipe (the authoritative controller lives there, D-017).
@@ -963,6 +1042,7 @@ struct ChildModel {
     monitor_on: bool,
     endpoint_id: String,
     endpoints: Vec<String>,
+    last_local_edit: Option<Instant>,
 }
 
 impl ChildModel {
@@ -974,6 +1054,7 @@ impl ChildModel {
             endpoints: apo_admin::list_capture_endpoints()
                 .map(|list| list.into_iter().map(|e| e.id).collect::<Vec<_>>())
                 .unwrap_or_default(),
+            last_local_edit: None,
         }
     }
 }
@@ -1008,9 +1089,8 @@ fn initial_ui_model() -> UiModel {
     let mut monitor = MonitorUi::default();
     let mut endpoint_id = String::new();
     if let Ok(paths) = EnginePaths::system() {
-        let settings = persist::load_settings(&paths);
-        first_run = matches!(settings, Loaded::Missing(_));
-        let settings = settings.into_value();
+        let settings = persist::load_settings(&paths).into_value();
+        first_run = !settings.onboarding_completed;
         endpoint_id = settings.selected_endpoint_id.unwrap_or_default();
         monitor.enabled = settings.monitor_enabled;
         monitor.device_name = settings.monitor_device_id;
@@ -1069,6 +1149,7 @@ fn initial_ui_model() -> UiModel {
         calibration: None,
         autotune: AutoTuneUi::default(),
         first_run,
+        status_banner: None,
     }
 }
 
@@ -1083,6 +1164,7 @@ pub fn run_ui_child() {
     tracing::info!(target: "tine::ui", "UI child starting");
 
     let model = initial_ui_model();
+    ONBOARDING_PERSISTED.store(!model.first_run, Ordering::Release);
     if model.first_run {
         tracing::info!(target: "tine::ui", "first run detected: onboarding overlay shown");
     }
@@ -1185,8 +1267,8 @@ fn child_worker(handle: &rune::AppHandle<AppState>, rx_intents: &Receiver<Intent
                 });
             }
         }
-        // 4. Model refresh at a slow snapshot cadence.
-        if now.duration_since(last_status) >= STATUS_PERIOD {
+        // 4. Model refresh at a slow snapshot cadence (only while visible).
+        if WINDOW_VISIBLE.load(Ordering::Acquire) && now.duration_since(last_status) >= STATUS_PERIOD {
             last_status = now;
             child_refresh_model(handle, &mut model);
         }
@@ -1224,14 +1306,14 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
         close_wizard(handle);
     }
     let req = match intent {
-        Intent::SelectEndpoint(idx) => model
-            .endpoints
-            .get(*idx)
-            .map(|id| PipeRequest::Endpoint { id: id.clone() })
-            .or_else(|| {
-                tracing::warn!(target: "tine::ui", idx, "endpoint index has no picker row; not routed");
+        Intent::SelectEndpoint(id) => {
+            if model.endpoints.iter().any(|e| e == id) {
+                Some(PipeRequest::Endpoint { id: id.clone() })
+            } else {
+                tracing::warn!(target: "tine::ui", endpoint_id = %id, "endpoint id not in picker rows; not routed");
                 None
-            }),
+            }
+        }
         Intent::SetArchetype(a) => Some(PipeRequest::Archetype {
             name: a.id().to_owned(),
         }),
@@ -1258,12 +1340,24 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
         Intent::CancelAutoTune => Some(PipeRequest::CalibrateCancel),
         Intent::ApplyCalibration { keep_pins } => Some(PipeRequest::CalibrateApply { keep_pins: *keep_pins }),
         Intent::DiscardCalibration => Some(PipeRequest::CalibrateDiscard),
-        Intent::OpenSettings
-        | Intent::SetProDrawerOpen(_)
-        | Intent::CloseWindow
-        | Intent::InstallApo
-        | Intent::RepairApo => None,
+        Intent::SetProDrawerOpen(open) => Some(PipeRequest::SetProDrawerOpen { open: *open }),
+        Intent::OpenSettings | Intent::CloseWindow | Intent::InstallApo | Intent::RepairApo => None,
     };
+    if matches!(
+        intent,
+        Intent::SelectEndpoint(_)
+            | Intent::SetArchetype(_)
+            | Intent::SetMacro(..)
+            | Intent::SetParam(..)
+            | Intent::Unpin(_)
+            | Intent::UnpinAll
+            | Intent::ToggleBypass
+            | Intent::ToggleMonitor
+            | Intent::PickMonitorDevice(_)
+            | Intent::ApplyCalibration { .. }
+    ) {
+        model.last_local_edit = Some(Instant::now());
+    }
     let started_calibrate = matches!(req, Some(PipeRequest::Calibrate));
     let Some(req) = req else {
         tracing::debug!(target: "tine::ui", intent = ?intent, "local-only intent (no pipe request)");
@@ -1304,33 +1398,53 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
 }
 
 /// Spawns the admin worker (D-018 "install"/"repair" = a virtual-cable
-/// presence re-check + refreshed badge + onboarding remedy text).
+/// presence re-check + refreshed badge + router follow + onboarding remedy).
 fn spawn_admin_check(handle: rune::AppHandle<AppState>) {
+    let fallback = handle.clone();
     if std::thread::Builder::new()
         .name("tine-ui-admin".to_owned())
         .spawn(move || {
             let badge = badge_from_health(&apo_admin::health(""));
             if matches!(badge, ApoBadge::Active) {
-                tracing::info!(target: "tine::ui", "virtual cable healthy — nothing to repair");
+                tracing::info!(target: "tine::ui", "virtual cable healthy — starting audio routing");
+                let pipe = single_instance::pipe_name_for_user();
+                match single_instance::send_request(&pipe, &PipeRequest::RouterFollow) {
+                    Ok(PipeResponse { ok: true, .. }) => {}
+                    Ok(resp) => {
+                        let msg = resp.error.unwrap_or_else(|| "router follow failed".to_owned());
+                        tracing::warn!(target: "tine::ui", "{msg}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "tine::ui", "router follow unreachable: {e}");
+                    }
+                }
             } else {
                 tracing::warn!(target: "tine::ui",
                     "Tine needs a virtual audio cable: install VB-Audio Virtual Cable, then use Repair");
             }
             handle.update_if(move |s, _| {
                 s.model.apo = badge;
+                s.ui.apo_installing = false;
                 true
             });
         })
         .is_err()
     {
         tracing::error!(target: "tine::ui", "admin worker spawn failed");
+        fallback.update_if(move |s, _| {
+            s.ui.apo_installing = false;
+            true
+        });
     }
 }
 
 /// One status snapshot into the Rune state: macros, bypass, monitor, and
 /// profile-derived Pro params / pins (the profile file is the parent
-/// controller's single-writer output, read here).
+/// controller's single-writer output, read here outside the edit cooldown).
 fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildModel) {
+    if !WINDOW_VISIBLE.load(Ordering::Acquire) {
+        return;
+    }
     let Ok(status) = fetch_status() else {
         tracing::debug!(target: "tine::ui", "status unavailable (parent starting?)");
         return;
@@ -1343,25 +1457,36 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
         },
         |list| list.into_iter().map(|e| e.id).collect::<Vec<_>>(),
     );
+    let mut note_banner: Option<String> = None;
     if let Some(notes) = status.get("notes").and_then(Value::as_array)
         && !notes.is_empty()
     {
         for note in notes {
-            tracing::warn!(target: "tine::ui", "{note}");
+            if let Some(text) = note.as_str() {
+                tracing::warn!(target: "tine::ui", "{text}");
+                if note_banner.is_none() && !text.is_empty() {
+                    note_banner = Some(text.to_owned());
+                }
+            } else {
+                tracing::warn!(target: "tine::ui", "{note}");
+            }
         }
     }
-    model.bypass = status.get("bypass").and_then(Value::as_bool).unwrap_or(model.bypass);
-    model.monitor_on = status
-        .get("monitor")
-        .and_then(Value::as_bool)
-        .unwrap_or(model.monitor_on);
-    let next_id = status
-        .get("endpoint_id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned);
-    if let Some(next_id) = next_id {
-        model.endpoint_id = next_id;
+    let in_edit_cooldown = model.last_local_edit.is_some_and(|t| t.elapsed() < EDIT_COOLDOWN);
+    if !in_edit_cooldown {
+        model.bypass = status.get("bypass").and_then(Value::as_bool).unwrap_or(model.bypass);
+        model.monitor_on = status
+            .get("monitor")
+            .and_then(Value::as_bool)
+            .unwrap_or(model.monitor_on);
+        let next_id = status
+            .get("endpoint_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        if let Some(next_id) = next_id {
+            model.endpoint_id = next_id;
+        }
     }
     let bypass = model.bypass;
     let monitor_on = model.monitor_on;
@@ -1370,56 +1495,73 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
     let devices = list_outputs()
         .map(|list| list.into_iter().map(|d| d.name).collect::<Vec<_>>())
         .unwrap_or_default();
-    let mut macros = model_default_macros();
-    if let Some(m) = status.get("macros").and_then(Value::as_object) {
-        let get = |k: &str| m.get(k).and_then(Value::as_f64).map(|v| v as f32);
-        macros = MacroPositions {
-            purity: get("purity").unwrap_or(macros.purity).clamp(0.0, 1.0),
-            body: get("body").unwrap_or(macros.body).clamp(0.0, 1.0),
-            presence: get("presence").unwrap_or(macros.presence).clamp(0.0, 1.0),
-            leveler: get("leveler").unwrap_or(macros.leveler).clamp(0.0, 1.0),
-        };
-    }
-    // Pro rack state: resolve the persisted profile (single writer is the
-    // parent controller, 500 ms trailing debounce + flush-on-exit).
-    let (params, pins, archetype) = match EnginePaths::system() {
-        Ok(paths) => {
-            let profile = persist::load_profile(&model.endpoint_id, &paths).into_value();
-            let app_model = AppModel {
-                endpoint: (!model.endpoint_id.is_empty()).then(|| EndpointId::new(model.endpoint_id.clone())),
-                bypass,
-                monitor: MonitorSettings {
-                    enabled: monitor_on,
-                    output_device: monitor_device.clone(),
-                },
-                profile,
+    let profile_update = if in_edit_cooldown {
+        None
+    } else {
+        let mut macros = model_default_macros();
+        if let Some(m) = status.get("macros").and_then(Value::as_object) {
+            let get = |k: &str| m.get(k).and_then(Value::as_f64).map(|v| v as f32);
+            macros = MacroPositions {
+                purity: get("purity").unwrap_or(macros.purity).clamp(0.0, 1.0),
+                body: get("body").unwrap_or(macros.body).clamp(0.0, 1.0),
+                presence: get("presence").unwrap_or(macros.presence).clamp(0.0, 1.0),
+                leveler: get("leveler").unwrap_or(macros.leveler).clamp(0.0, 1.0),
             };
-            (resolve(&app_model), app_model.profile.pins, app_model.profile.archetype)
         }
-        Err(e) => {
-            tracing::warn!(target: "tine::ui", "paths unavailable: {e}");
-            (
-                DspParams::DEFAULT,
-                tine_protocol::presets::PinSet::default(),
-                Archetype::default(),
-            )
-        }
+        // Pro rack state: resolve the persisted profile (single writer is the
+        // parent controller, 500 ms trailing debounce + flush-on-exit).
+        let (params, pins, archetype) = match EnginePaths::system() {
+            Ok(paths) => {
+                let profile = persist::load_profile(&model.endpoint_id, &paths).into_value();
+                let app_model = AppModel {
+                    endpoint: (!model.endpoint_id.is_empty()).then(|| EndpointId::new(model.endpoint_id.clone())),
+                    bypass,
+                    monitor: MonitorSettings {
+                        enabled: monitor_on,
+                        output_device: monitor_device.clone(),
+                    },
+                    profile,
+                };
+                (resolve(&app_model), app_model.profile.pins, app_model.profile.archetype)
+            }
+            Err(e) => {
+                tracing::warn!(target: "tine::ui", "paths unavailable: {e}");
+                (
+                    DspParams::DEFAULT,
+                    tine_protocol::presets::PinSet::default(),
+                    Archetype::default(),
+                )
+            }
+        };
+        Some((macros, params, pins, archetype))
     };
     let selected_id = model.endpoint_id.clone();
+    let badge = badge_from_health(&apo_admin::health(&selected_id));
     handle.update_if(move |s, _| {
-        s.model.macros = macros;
-        s.model.bypass = bypass;
-        s.model.archetype = archetype;
-        s.model.params = params;
-        s.model.pins = pins;
-        s.model.monitor.enabled = monitor_on;
-        s.model.monitor.device_name = monitor_device;
-        s.model.monitor.estimated_latency_ms = latency;
-        s.model.monitor.available_devices = devices;
-        if let Some(idx) = s.model.endpoints.iter().position(|e| e.id == selected_id) {
-            s.model.selected = Some(idx);
+        if s.model.first_run && s.ui.onboarding_dismissed {
+            s.model.first_run = false;
+            persist_onboarding_async();
         }
-        s.model.apo = badge_from_health(&apo_admin::health(&selected_id));
+        if let Some((macros, params, pins, archetype)) = profile_update {
+            s.model.macros = macros;
+            s.model.bypass = bypass;
+            s.model.archetype = archetype;
+            s.model.params = params;
+            s.model.pins = pins;
+            s.model.monitor.enabled = monitor_on;
+            s.model.monitor.device_name = monitor_device;
+            s.model.monitor.estimated_latency_ms = latency;
+            if let Some(idx) = s.model.endpoints.iter().position(|e| e.id == selected_id) {
+                s.model.selected = Some(idx);
+            }
+        }
+        s.model.monitor.available_devices = devices;
+        s.model.apo = badge;
+        if let Some(msg) = note_banner
+            && s.model.status_banner.is_none()
+        {
+            s.model.status_banner = Some(msg);
+        }
         true
     });
 }
@@ -1432,7 +1574,7 @@ fn model_default_macros() -> MacroPositions {
 /// Watches device events (hot-plug, removal, default change) and refreshes
 /// the endpoint list and badge into the Rune state.
 fn spawn_device_watcher(handle: &rune::AppHandle<AppState>) {
-    let Ok((_, rx)) = apo_admin::DeviceWatcher::new() else {
+    let Ok((watcher, rx)) = apo_admin::DeviceWatcher::new() else {
         tracing::warn!(target: "tine::ui", "device watcher unavailable");
         return;
     };
@@ -1440,6 +1582,7 @@ fn spawn_device_watcher(handle: &rune::AppHandle<AppState>) {
     if std::thread::Builder::new()
         .name("tine-ui-watcher".to_owned())
         .spawn(move || {
+            let watcher = watcher;
             while let Ok(_event) = rx.recv() {
                 match apo_admin::list_capture_endpoints() {
                     Ok(list) => {
@@ -1455,6 +1598,7 @@ fn spawn_device_watcher(handle: &rune::AppHandle<AppState>) {
                     Err(e) => tracing::warn!(target: "tine::ui", "re-enumeration failed: {e}"),
                 }
             }
+            drop(watcher);
         })
         .is_err()
     {

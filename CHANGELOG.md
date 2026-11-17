@@ -26,7 +26,8 @@ First public beta. The complete engineering history lives in
   (privacy-safe stored-ZIP diagnostics: logs, device/format state; no audio,
   hashed device ids), `--version`.
 - **Autostart**: registry-based (`HKCU\…\Run`), toggleable from the tray.
-- **"Hear Myself" monitoring** of the processed signal on your headphones.
+- **"Hear Myself" monitoring** of your microphone input on your headphones
+  (v0.1 monitors the input signal; D-029).
 
 ### Added — audio & DSP
 
@@ -35,8 +36,8 @@ First public beta. The complete engineering history lives in
   high-pass → EQ/archetype curve → de-esser/harmonic control → compressor
   with makeup → true-peak limiter; bypass path time-aligned bit-exactly with
   the wet path.
-- **Hardware archetypes** (dynamic, condenser, headset, laptop, webcam,
-  ribbon) as base curves, refined per- mic and per-room by Auto-Tune.
+- **Hardware archetypes** (dynamic, condenser, headset, laptop/webcam) as base
+  curves, refined per-mic and per-room by Auto-Tune.
 - **Virtual-cable output routing** (decision D-018): after measuring that
   stock Windows 11 will not load a third-party unsigned audio processing
   object (APO), v0.1 instead plays the processed mic into a virtual audio
@@ -53,7 +54,7 @@ First public beta. The complete engineering history lives in
 - **MSI installer** (WiX v5, per-machine): installs `tine.exe` + license
   texts, creates `C:\ProgramData\Tine\endpoints` (`Users`-modify ACL) for
   per-endpoint boot parameters, Start-menu shortcut, autostart value, and a
-  ""Run Tine now"" exit option; upgrades replace files in place; uninstall
+  "Run Tine now" exit option; upgrades replace files in place; uninstall
   keeps user data by default (`REMOVESAVEDDATA=1` removes it explicitly).
 - **Release pipeline** (`.github/workflows/release.yml`): tag `v*` → clippy,
   full test suite, headless UI checks, release build, MSI, portable zip and
@@ -66,8 +67,8 @@ First public beta. The complete engineering history lives in
 ### Known limitations (by design, beta)
 
 - ~22 ms added DSP latency at 48 kHz (the denoise stage's STFT framing —
-  D-019); ""Hear Myself"" therefore trails by ~30+ ms. A low-latency mode
-  (denoiser bypassed, < 2 ms added) is planned.
+  D-019); "Hear Myself" monitors the input signal with endpoint buffering
+  latency. A low-latency mode (denoiser bypassed, < 2 ms added) is planned.
 - Apps that open the microphone in exclusive mode bypass the shared capture
   path; they must use the virtual cable like everything else.
 - No in-app update check (D-031) and beta binaries are unsigned (SmartScreen

@@ -89,13 +89,51 @@ pub fn list_capture_endpoints() -> Result<Vec<CaptureEndpoint>, ApoError> {
         .collect())
 }
 
-/// Scans Windows render endpoints for a supported virtual audio cable sink
-/// (`CABLE Input`, `VB-Audio`, or `Virtual Audio`).
+/// Scans Windows render endpoints for a true VB-Audio Virtual Cable sink
+/// (`CABLE Input` or `VB-Audio`), never matching `SteelSeries Sonar` or
+/// generic `Virtual Audio` playback devices.
 ///
 /// Prefers active (`is_available == true`) endpoints and `CABLE Input` matches.
 pub fn find_virtual_cable_sink() -> Result<Option<VirtualSinkInfo>, ApoError> {
     let records = enumerate_endpoints(DataFlow::Render, false)?;
     Ok(select_virtual_cable_sink(&records))
+}
+
+/// Returns `true` if `name` identifies a virtual audio cable or virtual mixer
+/// capture endpoint (such as `CABLE Output`, `VB-Audio`, or `Sonar - Microphone`)
+/// that must not be chosen as Tine's default physical microphone input.
+#[must_use]
+pub fn is_virtual_cable_capture(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("cable output") || lower.contains("vb-audio") || lower.contains("sonar - microphone")
+}
+
+/// Returns the preferred physical capture endpoint ID, preferring the Windows
+/// default input device if it is not a virtual cable, otherwise the first
+/// physical microphone found.
+#[must_use]
+pub fn default_physical_capture_endpoint() -> Option<String> {
+    let captures = list_capture_endpoints().ok()?;
+    let default_input = crate::audio_io::list_inputs()
+        .ok()
+        .and_then(|inputs| inputs.into_iter().find(|d| d.is_default));
+
+    if let Some(def) = default_input
+        && !is_virtual_cable_capture(&def.name)
+    {
+        if let Some(ep) = captures
+            .iter()
+            .find(|ep| ep.id == def.id || def.id.ends_with(&ep.id) || ep.name == def.name)
+        {
+            return Some(ep.id.clone());
+        }
+        return Some(def.id);
+    }
+
+    captures
+        .into_iter()
+        .find(|ep| !is_virtual_cable_capture(&ep.name))
+        .map(|ep| ep.id)
 }
 
 fn select_virtual_cable_sink(records: &[EndpointRecord]) -> Option<VirtualSinkInfo> {
@@ -121,12 +159,13 @@ fn select_virtual_cable_sink(records: &[EndpointRecord]) -> Option<VirtualSinkIn
 /// Lower score = higher preference.
 fn virtual_cable_priority(name: &str, is_active: bool) -> Option<u8> {
     let lower = name.to_ascii_lowercase();
+    if lower.contains("steelseries") || lower.contains("sonar") {
+        return None;
+    }
     let base = if lower.contains("cable input") {
         0
     } else if lower.contains("vb-audio") {
         2
-    } else if lower.contains("virtual audio") {
-        4
     } else {
         return None;
     };
@@ -247,6 +286,31 @@ mod tests {
             rec("2", "NVIDIA High Definition Audio", true),
         ];
         assert_eq!(select_virtual_cable_sink(&records), None);
+    }
+
+    #[test]
+    fn select_virtual_cable_ignores_sonar_and_generic_virtual_audio() {
+        let records = vec![
+            rec(
+                "1",
+                "SteelSeries Sonar - Gaming (SteelSeries Sonar Virtual Audio Device)",
+                true,
+            ),
+            rec("2", "Generic Virtual Audio Device", true),
+            rec("3", "Speakers (Realtek High Definition Audio)", true),
+        ];
+        assert_eq!(select_virtual_cable_sink(&records), None);
+    }
+
+    #[test]
+    fn is_virtual_cable_capture_detects_virtual_and_allows_physical() {
+        assert!(is_virtual_cable_capture("CABLE Output (VB-Audio Virtual Cable)"));
+        assert!(is_virtual_cable_capture("Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)"));
+        assert!(is_virtual_cable_capture(
+            "SteelSeries Sonar - Microphone (SteelSeries Sonar Virtual Audio Device)"
+        ));
+        assert!(!is_virtual_cable_capture("Microphone (FIFINE USB Microphone)"));
+        assert!(!is_virtual_cable_capture("Headset Microphone (HyperX Cloud II)"));
     }
 
     #[test]

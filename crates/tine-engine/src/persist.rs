@@ -13,7 +13,6 @@
 //! validated. A file that cannot be parsed, migrated, or validated is moved
 //! aside as `<file>.corrupt-<unix_ts>` and defaults are used.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,7 +21,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 use tine_protocol::ids::SCHEMA_VERSION;
-use tine_protocol::params::{DspParams, PARAM_COUNT};
 use tine_protocol::presets::{EndpointProfile, ValidationError};
 use tine_protocol::settings::AppSettings;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_WRITE};
@@ -358,97 +356,4 @@ pub fn load_profile(endpoint_id: &str, paths: &EnginePaths) -> Loaded<EndpointPr
     let default = EndpointProfile::new(endpoint_id, tine_protocol::presets::Archetype::default());
     let path = paths.profile_file(endpoint_id);
     load_with(&path, default, EndpointProfile::validate)
-}
-
-// ---------------------------------------------------------------------------
-// APO boot params
-// ---------------------------------------------------------------------------
-
-/// JSON document stored at `%ProgramData%\Tine\endpoints\<endpoint>.json`.
-///
-/// This is the format the APO reads at `LockForProcess` (D-004): the
-/// last-written resolved parameters, so processing is correct even when
-/// `tine.exe` is not running. `params` maps stable [`SPECS`] keys to values.
-#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
-pub struct BootParamsFile {
-    /// Schema version (`1..=SCHEMA_VERSION`).
-    pub schema: u32,
-    /// Windows `MMDevice` endpoint ID this file belongs to.
-    pub endpoint_id: String,
-    /// Resolved parameters keyed by stable [`SPECS`] key.
-    pub params: BTreeMap<String, f32>,
-}
-
-fn boot_params_file(endpoint_id: &str, params: &DspParams) -> BootParamsFile {
-    let mut map = BTreeMap::new();
-    for i in 0..PARAM_COUNT {
-        if let Some(id) = tine_protocol::params::ParamId::from_index(i) {
-            map.insert(id.spec().key.to_owned(), params.get(id));
-        }
-    }
-    BootParamsFile {
-        schema: tine_protocol::ids::SCHEMA_VERSION,
-        endpoint_id: endpoint_id.to_owned(),
-        params: map,
-    }
-}
-
-/// Persists the APO boot params for `endpoint_id`.
-pub fn save_boot_params(endpoint_id: &str, params: &DspParams, paths: &EnginePaths) -> Result<(), PersistError> {
-    atomic_write_json(
-        &paths.boot_params_file(endpoint_id),
-        &boot_params_file(endpoint_id, params),
-    )
-}
-
-/// Loads the APO boot params for `endpoint_id` ([`DspParams::DEFAULT`] when
-/// missing or corrupt).
-pub fn load_boot_params(endpoint_id: &str, paths: &EnginePaths) -> Loaded<DspParams> {
-    let path = paths.boot_params_file(endpoint_id);
-    match load_with(&path, BootParamsFile::default(), boot_params_is_well_formed) {
-        Loaded::Fresh(file) => Loaded::Fresh(boot_params_into(&file)),
-        Loaded::Missing(_) => Loaded::Missing(DspParams::DEFAULT),
-        Loaded::Restored(_) => Loaded::Restored(DspParams::DEFAULT),
-        Loaded::Failed(_, error) => Loaded::Failed(DspParams::DEFAULT, error),
-    }
-}
-
-impl Default for BootParamsFile {
-    fn default() -> Self {
-        Self {
-            schema: tine_protocol::ids::SCHEMA_VERSION,
-            endpoint_id: String::new(),
-            params: BTreeMap::new(),
-        }
-    }
-}
-
-fn boot_params_is_well_formed(file: &BootParamsFile) -> Result<(), ValidationError> {
-    if file.schema == 0 || file.schema > SCHEMA_VERSION {
-        return Err(ValidationError::UnsupportedSchema {
-            actual: file.schema,
-            max_supported: SCHEMA_VERSION,
-        });
-    }
-    if file.endpoint_id.trim().is_empty() {
-        return Err(ValidationError::EmptyField { field: "endpoint_id" });
-    }
-    Ok(())
-}
-
-/// Applies a boot-params document onto a [`DspParams`] snapshot.
-///
-/// Unknown keys are ignored; known keys are clamped by `DspParams::set`, so a
-/// hand-edited file can never push a parameter out of range.
-fn boot_params_into(file: &BootParamsFile) -> DspParams {
-    let mut params = DspParams::DEFAULT;
-    for i in 0..PARAM_COUNT {
-        if let Some(id) = tine_protocol::params::ParamId::from_index(i)
-            && let Some(v) = file.params.get(id.spec().key)
-        {
-            let raw = *v;
-            params.set(id, raw);
-        }
-    }
-    params
 }

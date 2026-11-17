@@ -84,6 +84,15 @@ pub enum PipeRequest {
     },
     /// Discard the pending Auto-Tune results.
     CalibrateDiscard,
+    /// Persist whether the Surgical Pro Rack drawer is expanded.
+    SetProDrawerOpen {
+        /// `true` when the Pro drawer is open.
+        open: bool,
+    },
+    /// Persist that first-run onboarding was completed or dismissed.
+    OnboardingDone,
+    /// Re-run the D-018 virtual-cable routing loop against the active endpoint.
+    RouterFollow,
 }
 
 /// Server reply. `code` doubles as the CLI exit code: 0 ok, 1 failure,
@@ -211,6 +220,9 @@ mod tests {
             PipeRequest::CalibrateCancel,
             PipeRequest::CalibrateApply { keep_pins: true },
             PipeRequest::CalibrateDiscard,
+            PipeRequest::SetProDrawerOpen { open: true },
+            PipeRequest::OnboardingDone,
+            PipeRequest::RouterFollow,
         ];
         for req in &cases {
             let json = serde_json::to_string(req).unwrap_or_default();

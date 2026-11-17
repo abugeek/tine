@@ -9,18 +9,13 @@
     clippy::arithmetic_side_effects
 )]
 
-/// Jitter-buffer headroom: how many playback callbacks the adaptive resampler
-/// centers its local buffer at (in source samples, scaled by `base_ratio`).
+/// Default jitter-buffer headroom: how many playback callbacks the adaptive
+/// resampler centers its local buffer at (in source samples, scaled by `base_ratio`).
 ///
-/// T16's 30-min monitor soak measured that the old 2-callback (≈ 20 ms)
-/// center admits rare WASAPI capture hiccups as audible underruns (2 in
-/// 30 min on a quiet machine, max callback 283 µs; the RT work was fine —
-/// the scheduler simply delivered capture late; see T16 `## Requests`).
-/// 6 callbacks (≈ 60 ms at the ~10 ms WASAPI shared-mode period) absorbs
-/// hiccups up to ~5 callbacks deep without starving the Catmull-Rom reader.
-/// The trade is ~40 ms of extra buffered monitor latency, on top of the
-/// latency badge (badge accuracy is tracked as R-18).
-pub(crate) const HEADROOM_CALLBACKS: f64 = 6.0;
+/// `2.0` callbacks (≈ 20 ms at the ~10 ms WASAPI shared-mode period) is the
+/// low-latency default for `VirtualCableRouter`; `Monitor` can configure `3.0`
+/// callbacks (≈ 30 ms) via [`AdaptiveResampler::with_headroom`].
+pub(crate) const HEADROOM_CALLBACKS: f64 = 2.0;
 
 /// Nominal WASAPI shared-mode callback size in frames at 48 kHz, used for the
 /// pre-`render` center estimate (each `render` recomputes the target from the
@@ -104,29 +99,42 @@ pub(crate) struct AdaptiveResampler {
     src_rate: u32,
     dst_rate: u32,
     base_ratio: f64,
+    headroom_callbacks: f64,
     frac_pos: f64,
     err_filtered: f64,
+    err_integral: f64,
     primed: bool,
     target_fill: usize,
     last_ratio: f64,
 }
 
 impl AdaptiveResampler {
-    /// Creates a new [`AdaptiveResampler`] preallocated for `ring_capacity` samples.
+    /// Creates a new [`AdaptiveResampler`] with the default [`HEADROOM_CALLBACKS`]
+    /// preallocated for `ring_capacity` samples.
+    #[allow(dead_code)]
     pub(crate) fn new(src_rate: u32, dst_rate: u32, ring_capacity: usize) -> Self {
+        Self::with_headroom(src_rate, dst_rate, ring_capacity, HEADROOM_CALLBACKS)
+    }
+
+    /// Creates a new [`AdaptiveResampler`] with a custom `headroom_callbacks`
+    /// target (clamped to `1.0..=12.0`), preallocated for `ring_capacity` samples.
+    pub(crate) fn with_headroom(src_rate: u32, dst_rate: u32, ring_capacity: usize, headroom_callbacks: f64) -> Self {
         let s_rate = src_rate.max(1);
         let d_rate = dst_rate.max(1);
         let base_ratio = f64::from(s_rate) / f64::from(d_rate);
+        let headroom = headroom_callbacks.clamp(1.0, 12.0);
         let ring = LocalRing::new(ring_capacity);
         let default_target =
-            ((HEADROOM_CALLBACKS * NOMINAL_CALLBACK_FRAMES * base_ratio) as usize).clamp(128, ring.capacity() / 2);
+            ((headroom * NOMINAL_CALLBACK_FRAMES * base_ratio) as usize).clamp(128, ring.capacity() / 2);
         Self {
             ring,
             src_rate: s_rate,
             dst_rate: d_rate,
             base_ratio,
+            headroom_callbacks: headroom,
             frac_pos: 0.0,
             err_filtered: 0.0,
+            err_integral: 0.0,
             primed: false,
             target_fill: default_target,
             last_ratio: base_ratio,
@@ -144,8 +152,33 @@ impl AdaptiveResampler {
     }
 
     #[inline]
+    pub(crate) const fn is_primed(&self) -> bool {
+        self.primed
+    }
+
+    #[inline]
     pub(crate) const fn last_ratio(&self) -> f64 {
         self.last_ratio
+    }
+
+    /// Computes the target fill level in source samples for an output block of `out_frames`.
+    #[inline]
+    #[allow(clippy::arithmetic_side_effects)]
+    pub(crate) fn desired_target_for(&self, out_frames: usize) -> usize {
+        let frames = if out_frames > 0 {
+            out_frames as f64
+        } else {
+            NOMINAL_CALLBACK_FRAMES
+        };
+        ((self.headroom_callbacks * frames * self.base_ratio) as usize).clamp(128, self.ring.capacity() / 2)
+    }
+
+    /// Drops oldest queued samples so the ring fill level does not exceed `target`.
+    #[inline]
+    pub(crate) fn trim_to_target(&mut self, target: usize) {
+        if self.ring.len() > target {
+            self.ring.advance(self.ring.len().saturating_sub(target));
+        }
     }
 
     #[inline]
@@ -162,11 +195,9 @@ impl AdaptiveResampler {
             return false;
         }
 
-        // Target fill = HEADROOM_CALLBACKS × callback size (scaled to source
+        // Target fill = headroom_callbacks × callback size (scaled to source
         // sample rate), bounded safely inside the ring.
-        let desired_target =
-            ((HEADROOM_CALLBACKS * (out.len() as f64) * self.base_ratio) as usize).clamp(128, self.ring.capacity() / 2);
-        self.target_fill = desired_target;
+        self.target_fill = self.desired_target_for(out.len());
 
         if !self.primed {
             if self.ring.len() >= self.target_fill {
@@ -177,12 +208,25 @@ impl AdaptiveResampler {
             }
         }
 
-        // Smooth fill-level error and clamp drift adjustment to ±0.1 % (±0.001).
+        // Hard-resync if fill diverges from target by more than 2× target_fill,
+        // so large startup/scheduler spikes recover immediately instead of
+        // taking minutes at ±0.1%.
+        if self.ring.len().abs_diff(self.target_fill) > self.target_fill.saturating_mul(2)
+            && self.ring.len() > self.target_fill
+        {
+            self.ring.advance(self.ring.len().saturating_sub(self.target_fill));
+            self.err_filtered = 0.0;
+            self.err_integral = 0.0;
+            self.frac_pos = 0.0;
+        }
+
+        // Smooth fill-level error (PI controller) and clamp drift adjustment to ±0.1 % (±0.001).
         let fill = self.ring.len() as f64;
         let target = (self.target_fill as f64).max(1.0);
         let err = (fill - target) / target;
         self.err_filtered += 0.02 * (err - self.err_filtered);
-        let drift_adj = (self.err_filtered * 0.001).clamp(-0.001, 0.001);
+        self.err_integral = (self.err_integral + err * 0.002).clamp(-1.0, 1.0);
+        let drift_adj = (self.err_filtered * 0.001 + self.err_integral * 0.0005).clamp(-0.001, 0.001);
         let step = self.base_ratio * (1.0 + drift_adj);
         self.last_ratio = step;
 
@@ -243,12 +287,12 @@ mod tests {
         AdaptiveResampler::new(48_000, 48_000, 16_384)
     }
 
-    /// The headroom stays inside the orchestrator-approved 4–6 callback band.
+    /// The default headroom is 2.0 callbacks (~20 ms at 48 kHz).
     #[test]
     fn headroom_is_in_the_approved_band() {
         assert!(
-            (4.0..=6.0).contains(&HEADROOM_CALLBACKS),
-            "headroom out of the approved 4-6 callbacks: {HEADROOM_CALLBACKS}"
+            (HEADROOM_CALLBACKS - 2.0).abs() < f64::EPSILON,
+            "default headroom should be 2.0 callbacks: {HEADROOM_CALLBACKS}"
         );
     }
 
@@ -260,14 +304,12 @@ mod tests {
         let block = [0.5_f32; 480];
         let mut out = [0.0_f32; 480];
 
-        // 5 callbacks of input: short of the (default 6-callback) target.
-        for _ in 0..5 {
-            assert_eq!(r.push_input(&block), 480);
-        }
+        // 1 callback of input: short of the (default 2-callback) target.
+        assert_eq!(r.push_input(&block), 480);
         let underrun = r.render(&mut out);
         assert!(!underrun, "priming silence must not count as an underrun");
         assert!(out.iter().all(|s| *s == 0.0), "pre-prime render must be silent");
-        assert_eq!(r.fill_level(), 2_400, "pre-prime render consumes nothing");
+        assert_eq!(r.fill_level(), 480, "pre-prime render consumes nothing");
 
         // One more callback homes the buffer; audio flows.
         assert_eq!(r.push_input(&block), 480);
@@ -276,15 +318,15 @@ mod tests {
             out.iter().any(|s| *s > 0.1),
             "primed render must emit the buffered signal"
         );
-        assert_eq!(r.fill_level(), 2_400);
+        assert_eq!(r.fill_level(), 480);
     }
 
-    /// The steady-state fill is deep enough that a 4-callback (≈ 40 ms)
-    /// capture hiccup is absorbed with no underrun and no dropped audio,
-    /// while a hiccup that genuinely drains the buffer is still reported.
+    /// The steady-state fill with `with_headroom(6.0)` absorbs a 4-callback
+    /// (≈ 40 ms) capture hiccup with no underrun, while a gap that genuinely
+    /// drains the buffer is still reported.
     #[test]
     fn hiccup_absorption_and_honest_underrun_semantics() {
-        let mut r = resampler_48k();
+        let mut r = AdaptiveResampler::with_headroom(48_000, 48_000, 16_384, 6.0);
         let block = [0.5_f32; 480];
         let mut out = [0.0_f32; 480];
 
@@ -315,16 +357,16 @@ mod tests {
         assert!(out.contains(&0.0), "starved render must contain silence");
     }
 
-    /// Playback-side overfill is absorbed by the ±0.1 % drift clamp, never
-    /// by dropping samples on the floor.
+    /// Moderate playback-side overfill (within the hard-resync threshold) is
+    /// absorbed by the ±0.1 % drift clamp, never by dropping samples.
     #[test]
     fn drift_ratio_stays_within_the_plus_minus_one_permille_clamp() {
         let mut r = resampler_48k();
         let block = [0.25_f32; 480];
         let mut out = [0.0_f32; 480];
 
-        // Overfill hard (10 callbacks at once), then keep feeding.
-        for _ in 0..10 {
+        // Overfill moderately (4 callbacks = 1920 < 3 * 960 = 2880 hard-resync threshold).
+        for _ in 0..4 {
             assert_eq!(r.push_input(&block), 480);
         }
         for _ in 0..200 {
@@ -334,6 +376,33 @@ mod tests {
         let step = r.last_ratio();
         assert!((step - 1.0).abs() <= 1.001e-3, "ratio must stay within ±0.1 %: {step}");
         assert!(step > 1.0, "overfilled buffer must drain faster than 1.0");
+    }
+
+    /// Large overfill (`|fill - target_fill| > target_fill * 2`) triggers an
+    /// immediate hard-resync back down to `target_fill`.
+    #[test]
+    fn hard_resync_drops_excess_when_error_exceeds_twice_target() {
+        let mut r = resampler_48k();
+        let block = [0.25_f32; 480];
+        let mut out = [0.0_f32; 480];
+
+        // Prime normally at 2 callbacks (960).
+        for _ in 0..2 {
+            assert_eq!(r.push_input(&block), 480);
+        }
+        assert!(!r.render(&mut out));
+
+        // Inject a huge spike (10 callbacks = 4800 > 3 * 960 = 2880).
+        for _ in 0..10 {
+            assert_eq!(r.push_input(&block), 480);
+        }
+        assert!(!r.render(&mut out));
+        // After hard-resync to target_fill (960) and rendering 480 samples, fill is ~480.
+        assert!(
+            r.fill_level() <= 960,
+            "hard resync should snap fill back near target_fill, got {}",
+            r.fill_level()
+        );
     }
 
     /// No allocation after construction: the RT paths (`push_input`, `render`)

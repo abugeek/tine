@@ -14,15 +14,15 @@ use crate::params::{DspParams, PARAM_COUNT, ParamId};
 
 #[cfg(all(test, loom))]
 mod atomic {
-    pub(crate) use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    pub(crate) use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 }
 
 #[cfg(not(all(test, loom)))]
 mod atomic {
-    pub(crate) use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    pub(crate) use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 }
 
-use atomic::{AtomicU32, AtomicU64, Ordering};
+use atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 #[repr(transparent)]
 pub(crate) struct SyncCell<T>(core::cell::UnsafeCell<T>);
@@ -85,12 +85,12 @@ pub struct CachePadded<T>(pub T);
 // ParamBlock
 // ---------------------------------------------------------------------------
 
-/// Generation-stamped parameter block for lock-free single-writer -> single/multi-reader updates.
+/// Seqlock-stamped parameter block for lock-free single-writer -> single/multi-reader updates.
 ///
 /// Every parameter is stored as a single 32-bit atomic (`f32::to_bits` for floats/bools,
-/// `u32` discriminant for [`FilterType`]). The writer writes all fields (`Relaxed`) and then
-/// increments `generation` (`Release`). Readers load `generation` (`Acquire`) and only
-/// reload the array when `generation != *last_gen`.
+/// `u32` discriminant for [`FilterType`]). Even `generation` values denote a quiescent
+/// snapshot; odd values denote an in-progress write. Readers verify `g1 == g2` (and even)
+/// around field reads so a torn cross-parameter snapshot is never returned.
 #[repr(C)]
 pub struct ParamBlock {
     generation: AtomicU64,
@@ -109,18 +109,18 @@ impl Default for ParamBlock {
 }
 
 impl ParamBlock {
-    /// Creates a [`ParamBlock`] initialized with [`DspParams::DEFAULT`] and `generation = 1`.
+    /// Creates a [`ParamBlock`] initialized with [`DspParams::DEFAULT`] and `generation = 2`.
     #[must_use]
     pub fn new() -> Self {
         let block = Self {
-            generation: AtomicU64::new(1),
+            generation: AtomicU64::new(2),
             values: core::array::from_fn(|_| AtomicU32::new(0)),
         };
         block.write_fields(&DspParams::DEFAULT);
         block
     }
 
-    /// Initializes a [`ParamBlock`] in-place at `ptr` with `initial` parameters and `generation = 1`.
+    /// Initializes a [`ParamBlock`] in-place at `ptr` with `initial` parameters and `generation = 2`.
     ///
     /// # Safety
     /// `ptr` must be non-null, properly aligned for `ParamBlock`, and point to valid writable memory.
@@ -131,7 +131,7 @@ impl ParamBlock {
             let block = &*ptr;
             block.write_fields(initial);
             // Release pairs with reader's Acquire load of `generation`.
-            block.generation.store(1, Ordering::Release);
+            block.generation.store(2, Ordering::Release);
         }
     }
 
@@ -188,32 +188,61 @@ impl ParamBlock {
         }
     }
 
-    /// Publishes a new [`DspParams`] snapshot and bumps the generation counter.
+    /// Publishes a new [`DspParams`] snapshot using a seqlock-style generation protocol.
     ///
     /// Single-writer precondition.
     pub fn store(&self, p: &DspParams) {
+        let prev = self.generation.load(Ordering::Relaxed);
+        let odd = prev.wrapping_add(1) | 1;
+        self.generation.store(odd, Ordering::Relaxed);
+        // Release fence pairs with `load_if_changed`'s Acquire fence so `odd` is
+        // ordered before all field writes.
+        fence(Ordering::Release);
         self.write_fields(p);
-        let next = self.generation.load(Ordering::Relaxed).wrapping_add(1);
+        let even = odd.wrapping_add(1);
         // Release pairs with `load_if_changed`'s Acquire load of `generation`.
-        self.generation.store(next, Ordering::Release);
+        self.generation.store(even, Ordering::Release);
     }
 
     /// Loads parameters into `out` (clamped) if `generation != *last_gen`.
     ///
-    /// Returns `true` if `out` was updated, `false` on the fast unchanged path.
+    /// Uses a bounded seqlock retry loop so a torn cross-parameter snapshot is never
+    /// written to `out` and a stalled writer cannot block a real-time reader.
+    /// Returns `true` if `out` was updated, `false` on the fast unchanged path or if
+    /// a concurrent write did not settle within the bounded retry budget.
     #[inline]
     pub fn load_if_changed(&self, last_gen: &mut u64, out: &mut DspParams) -> bool {
-        // Acquire pairs with `store`'s Release store to `generation`.
-        let g = self.generation.load(Ordering::Acquire);
-        if g == *last_gen {
-            return false;
+        #[cfg(all(test, loom))]
+        const MAX_RETRIES: usize = 4;
+        #[cfg(not(all(test, loom)))]
+        const MAX_RETRIES: usize = 8;
+
+        for _ in 0..MAX_RETRIES {
+            // Acquire pairs with `store`'s Release store to `generation`.
+            let g1 = self.generation.load(Ordering::Acquire);
+            if g1 == *last_gen {
+                return false;
+            }
+            if (g1 & 1) != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let candidate = self.read_fields_clamped();
+            // Acquire fence pairs with `store`'s Release fence so field loads
+            // cannot be reordered after the post-read `generation` check.
+            fence(Ordering::Acquire);
+            let g2 = self.generation.load(Ordering::Relaxed);
+            if g1 == g2 {
+                *out = candidate;
+                *last_gen = g1;
+                return true;
+            }
+            core::hint::spin_loop();
         }
-        self.read_fields_clamped(out);
-        *last_gen = g;
-        true
+        false
     }
 
-    fn read_fields_clamped(&self, out: &mut DspParams) {
+    fn read_fields_clamped(&self) -> DspParams {
         let get_u32 = |id: ParamId| -> u32 { self.values.get(id.index()).map_or(0, |a| a.load(Ordering::Relaxed)) };
         let get_bool = |id: ParamId| -> bool { f32::from_bits(get_u32(id)) >= 0.5 };
         let get_f32 = |id: ParamId| -> f32 { f32::from_bits(get_u32(id)) };
@@ -276,7 +305,7 @@ impl ParamBlock {
             }
         }
 
-        *out = loaded.clamped();
+        loaded.clamped()
     }
 }
 
@@ -639,9 +668,11 @@ mod loom {
 
             let mut last_gen = 0u64;
             let mut out = DspParams::DEFAULT;
-            let _ = block.load_if_changed(&mut last_gen, &mut out);
+            if block.load_if_changed(&mut last_gen, &mut out) && out.bypass {
+                assert!((out.input_gain_db - 12.0).abs() < f32::EPSILON);
+            }
 
-            writer.join().unwrap();
+            assert!(writer.join().is_ok());
 
             // After writer finishes, a subsequent load must observe the final values.
             let _ = block.load_if_changed(&mut last_gen, &mut out);
@@ -681,7 +712,7 @@ mod loom {
                 }
             }
 
-            writer.join().unwrap();
+            assert!(writer.join().is_ok());
 
             if triple.latest(&mut out) {
                 assert!(out.sequence >= last_seq);
@@ -724,5 +755,83 @@ mod loom {
             }
             assert_eq!(received, [1.0, 2.0, 3.0]);
         });
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    extern crate std;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as StdOrdering};
+    use std::thread;
+
+    use super::{Ordering, ParamBlock};
+    use crate::params::DspParams;
+
+    #[test]
+    fn param_block_never_returns_torn_snapshot() {
+        let mut a = DspParams::DEFAULT;
+        a.bypass = false;
+        a.input_gain_db = -12.0;
+        a.comp_thresh_db = -30.0;
+        a.limiter_ceiling_db = -3.0;
+
+        let mut b = DspParams::DEFAULT;
+        b.bypass = true;
+        b.input_gain_db = 12.0;
+        b.comp_thresh_db = -6.0;
+        b.limiter_ceiling_db = -0.5;
+
+        let block = Arc::new(ParamBlock::new());
+        block.store(&a);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let b_writer = Arc::clone(&block);
+        let done_writer = Arc::clone(&done);
+
+        let writer = thread::spawn(move || {
+            for i in 0..50_000u32 {
+                if i % 2 == 0 {
+                    b_writer.store(&b);
+                } else {
+                    b_writer.store(&a);
+                }
+            }
+            done_writer.store(true, StdOrdering::Release);
+        });
+
+        let mut last_gen = 0u64;
+        let mut out = DspParams::DEFAULT;
+        while !done.load(StdOrdering::Acquire) {
+            if block.load_if_changed(&mut last_gen, &mut out) {
+                let is_a = !out.bypass
+                    && (out.input_gain_db - (-12.0)).abs() < f32::EPSILON
+                    && (out.comp_thresh_db - (-30.0)).abs() < f32::EPSILON
+                    && (out.limiter_ceiling_db - (-3.0)).abs() < f32::EPSILON;
+                let is_b = out.bypass
+                    && (out.input_gain_db - 12.0).abs() < f32::EPSILON
+                    && (out.comp_thresh_db - (-6.0)).abs() < f32::EPSILON
+                    && (out.limiter_ceiling_db - (-0.5)).abs() < f32::EPSILON;
+                assert!(is_a || is_b, "observed torn ParamBlock snapshot: {out:?}");
+            }
+        }
+
+        assert!(writer.join().is_ok());
+    }
+
+    #[test]
+    fn param_block_odd_generation_is_non_blocking() {
+        let block = ParamBlock::new();
+        let mut last_gen = 0u64;
+        let mut out = DspParams::DEFAULT;
+        assert!(block.load_if_changed(&mut last_gen, &mut out));
+
+        // Simulate a stalled writer holding an odd seqlock sequence.
+        block.generation.store(last_gen.wrapping_add(1), Ordering::Release);
+        let sentinel = 7.5f32;
+        out.input_gain_db = sentinel;
+        assert!(!block.load_if_changed(&mut last_gen, &mut out));
+        assert!((out.input_gain_db - sentinel).abs() < f32::EPSILON);
     }
 }

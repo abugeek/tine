@@ -1,4 +1,4 @@
-//! Windows `%APPDATA%`, `%LOCALAPPDATA%`, and `%ProgramData%` paths.
+//! Windows `%APPDATA%` and `%LOCALAPPDATA%` paths.
 //!
 //! All known-folder look-ups go through `SHGetKnownFolderPath` (no `dirs`
 //! crate, D-013). File names embed the sanitized endpoint ID from
@@ -12,7 +12,7 @@ use thiserror::Error;
 use tine_protocol::ids::SanitizedId;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
+    FOLDERID_LocalAppData, FOLDERID_RoamingAppData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath,
 };
 use windows::core::PWSTR;
 
@@ -92,33 +92,31 @@ fn known_folder(guid: &windows::core::GUID, folder: &'static str) -> Result<Path
 pub struct EnginePaths {
     /// Roaming user data root (`%APPDATA%`); holds `Tine\settings.json`.
     pub app_data: PathBuf,
-    /// Machine-wide data root (`%ProgramData%`); holds `Tine\endpoints\<id>.json`.
-    pub program_data: PathBuf,
     /// Local (non-roaming) user data root (`%LOCALAPPDATA%`); holds logs.
     pub local_data: PathBuf,
 }
 
 impl EnginePaths {
-    /// Resolves the real Windows known folders for roaming app data, local app
-    /// data, and program data.
+    /// Resolves the real Windows known folders for roaming app data and local
+    /// app data.
     pub fn system() -> Result<Self, PathsError> {
         Ok(Self {
             app_data: known_folder(&FOLDERID_RoamingAppData, "FOLDERID_RoamingAppData")?,
             local_data: known_folder(&FOLDERID_LocalAppData, "FOLDERID_LocalAppData")?,
-            program_data: known_folder(&FOLDERID_ProgramData, "FOLDERID_ProgramData")?,
         })
     }
 
     /// Builds explicit roots (tests, `devhost`, diagnostics).
+    ///
+    /// `_program_data` is retained for caller compatibility and is unused.
     #[must_use]
     pub fn from_roots(
         app_data: impl Into<PathBuf>,
-        program_data: impl Into<PathBuf>,
+        _program_data: impl Into<PathBuf>,
         local_data: impl Into<PathBuf>,
     ) -> Self {
         Self {
             app_data: app_data.into(),
-            program_data: program_data.into(),
             local_data: local_data.into(),
         }
     }
@@ -140,19 +138,6 @@ impl EnginePaths {
     #[must_use]
     pub fn profiles_dir(&self) -> PathBuf {
         self.app_data.join("Tine").join("profiles")
-    }
-
-    /// `$program_data\Tine\endpoints\<sanitized endpoint>.json` (APO boot params).
-    #[must_use]
-    pub fn boot_params_file(&self, endpoint_id: &str) -> PathBuf {
-        self.boot_params_dir()
-            .join(format!("{}.json", SanitizedId::from_raw(endpoint_id)))
-    }
-
-    /// `$program_data\Tine\endpoints`.
-    #[must_use]
-    pub fn boot_params_dir(&self) -> PathBuf {
-        self.program_data.join("Tine").join("endpoints")
     }
 
     /// `$local_data\Tine\logs`.
@@ -182,10 +167,6 @@ mod tests {
         assert_eq!(
             paths.profile_file("Wave:{bad chars}"),
             Path::new("/app/Tine/profiles/Wave_{bad_chars}.json")
-        );
-        assert_eq!(
-            paths.boot_params_file("Wave:{bad chars}"),
-            Path::new("/prog/Tine/endpoints/Wave_{bad_chars}.json")
         );
         assert_eq!(paths.logs_dir(), Path::new("/local/Tine/logs"));
     }

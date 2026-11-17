@@ -65,6 +65,10 @@ pub const VOICED_ABOVE_NOISE_DB: f32 = 10.0;
 pub const GATE_OFFSET_DB: f32 = 6.0;
 /// Noise RMS above which the aggressive `RNNoise` mix is selected (dBFS).
 pub const NOISY_RMS_DB: f32 = -48.0;
+/// Speech-to-noise ratio below which the aggressive `RNNoise` mix is selected (dB).
+pub const NOISY_SNR_DB: f32 = 26.0;
+/// Post-gain noise RMS above which the aggressive `RNNoise` mix is selected (dBFS).
+pub const NOISY_POST_GAIN_RMS_DB: f32 = -42.0;
 /// `denoise_mix` selected for noisy rooms.
 pub const NOISY_DENOISE_MIX: f32 = 0.85;
 /// `denoise_mix` selected for quiet rooms.
@@ -630,13 +634,20 @@ impl AutoCalibrator {
         pins: PinSet,
         current: &DspParams,
     ) -> CalibrationReport {
-        let gate = clamp_param(ParamId::GateThresholdDb, self.noise_rms_db + GATE_OFFSET_DB);
-        let denoise = if self.noise_rms_db > NOISY_RMS_DB {
+        let gain = clamp_param(ParamId::InputGainDb, TARGET_SPEECH_RMS_DB - m.speech_rms_db);
+        let snr_db = m.speech_rms_db - self.noise_rms_db;
+        let denoise = if snr_db < NOISY_SNR_DB || (self.noise_rms_db + gain) > NOISY_POST_GAIN_RMS_DB {
             NOISY_DENOISE_MIX
         } else {
             QUIET_DENOISE_MIX
         };
-        let gain = clamp_param(ParamId::InputGainDb, TARGET_SPEECH_RMS_DB - m.speech_rms_db);
+        // Stage 1 input gain runs before Stage 2 expander, so the expander sees
+        // `noise_rms_db + gain`. Also account for RNNoise attenuation before the
+        // expander so quiet speech syllables aren't chopped when AI denoising is active.
+        let gate = clamp_param(
+            ParamId::GateThresholdDb,
+            self.noise_rms_db + gain + GATE_OFFSET_DB - 4.0 * denoise,
+        );
         let thresh = clamp_param(ParamId::CompThreshDb, m.speech_rms_db + gain + COMP_THRESH_OFFSET_DB);
 
         let mut cal = Calibration {

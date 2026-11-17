@@ -111,6 +111,7 @@ fn step1_mic(s: &AppState, t: TineTheme) -> El {
 
     for (idx, endpoint) in s.model.endpoints.iter().enumerate() {
         let selected = s.model.selected == Some(idx);
+        let id = endpoint.id.clone();
         let name = endpoint.name.clone();
         list = list.child(
             row()
@@ -128,7 +129,7 @@ fn step1_mic(s: &AppState, t: TineTheme) -> El {
                 .border(1.0, if selected { t.accent } else { t.border })
                 .on_press(move |s: &mut AppState| {
                     s.model.selected = Some(idx);
-                    s.emit(Intent::SelectEndpoint(idx));
+                    s.emit(Intent::SelectEndpoint(id.clone()));
                 })
                 .child(
                     text(if selected { "(•)" } else { "( )" })
@@ -214,21 +215,20 @@ fn archetype_id(a: Archetype) -> &'static str {
     }
 }
 
-// --- Step 2: install the APO --------------------------------------------------
+// --- Step 2: set up Virtual Cable routing -----------------------------------
 
-/// What step 2 shows, derived from the model's APO badge + local install progress.
+/// What step 2 shows, derived from the model's Virtual Cable badge + local check progress.
 fn step2_apo(s: &AppState, t: TineTheme) -> El {
     let mut body = col()
         .key("onboarding/step-2")
         .w_full()
         .gap(spacing::MD)
-        .child(title("Install the audio driver (APO)", t.text))
+        .child(title("Set up Virtual Cable routing", t.text))
         .child(
             text(
-                "Tine attaches to your microphone through a Windows Audio Processing Object. \
-                 Windows will show one UAC prompt; accepting it registers Tine for your \
-                 microphone. Nothing else on your system changes, and you can uninstall it \
-                 any time from Settings \u{2192} Apps.",
+                "Tine processes your microphone in real time and outputs to VB-Audio Virtual Cable. \
+                 Install VB-Cable if it isn't present on your system, then click Check Setup below \
+                 so Discord, OBS, and games can receive your processed voice.",
             )
             .font(typography::BODY)
             .color(t.text_dim),
@@ -238,7 +238,7 @@ fn step2_apo(s: &AppState, t: TineTheme) -> El {
         (ApoBadge::Active, _) => {
             body = body.child(status_line(
                 "onboarding/apo-success",
-                "Installed — your microphone is processed now",
+                "Virtual Cable detected — your microphone is ready to route",
                 t.meter_green,
                 t,
             ));
@@ -247,22 +247,31 @@ fn step2_apo(s: &AppState, t: TineTheme) -> El {
             body = body
                 .child(status_line(
                     "onboarding/apo-error",
-                    format!("Install failed: {msg}"),
+                    format!("Virtual Cable check failed: {msg}"),
                     t.danger,
                     t,
                 ))
-                .child(remedies(t));
+                .child(remedies(t))
+                .child(button("onboarding/recheck", "Recheck", true, t, |s| {
+                    s.ui.apo_installing = true;
+                    s.emit(Intent::InstallApo);
+                }));
         }
         (_, true) => {
-            body = body.child(status_line(
-                "onboarding/apo-progress",
-                "Installing… accept the Windows UAC prompt",
-                t.meter_amber,
-                t,
-            ));
+            body = body
+                .child(status_line(
+                    "onboarding/apo-progress",
+                    "Checking Virtual Cable setup…",
+                    t.meter_amber,
+                    t,
+                ))
+                .child(button("onboarding/recheck", "Recheck", false, t, |s| {
+                    s.ui.apo_installing = true;
+                    s.emit(Intent::InstallApo);
+                }));
         }
         (_, false) => {
-            body = body.child(button("onboarding/install", "Install APO", true, t, |s| {
+            body = body.child(button("onboarding/install", "Check Setup", true, t, |s| {
                 s.ui.apo_installing = true;
                 s.emit(Intent::InstallApo);
             }));
@@ -283,13 +292,13 @@ fn step2_apo(s: &AppState, t: TineTheme) -> El {
     body
 }
 
-/// Concrete fixes for the typed APO install error.
+/// Concrete fixes for the Virtual Cable setup check error.
 fn remedies(t: TineTheme) -> El {
     let mut r = col().key("onboarding/apo-remedies").w_full().gap(spacing::XS);
     for (i, tip_text) in [
-        "Run Tine as the same user you installed it with (the APO is per-user registered).",
-        "Re-run the install: from Settings \u{2192} Apps \u{2192} Tine, choose Repair.",
-        "Reboot once if the endpoint was in use; Windows holds a lock on audio endpoints.",
+        "Download and install VB-Audio Virtual Cable (vb-audio.com/Cable), then click Recheck.",
+        "In Windows Sound Settings, ensure \"CABLE Input (VB-Audio Virtual Cable)\" is enabled.",
+        "Reboot once if VB-Cable was just installed so Windows registers the virtual device.",
     ]
     .iter()
     .enumerate()
@@ -350,8 +359,8 @@ fn step4_finish(s: &AppState, t: TineTheme) -> El {
         .child(title("You're set — go be heard", t.text))
         .child(
             text(
-                "Open Discord or OBS and pick your normal microphone: it is processed now, \
-                 for every app. Try it with Hear Myself, and mind the ~30 ms monitoring delay.",
+                "Open Discord or OBS and pick \"CABLE Output (VB-Audio Virtual Cable)\" as your \
+                 microphone. Try it with Hear Myself, and mind the ~30 ms monitoring delay.",
             )
             .font(typography::BODY)
             .color(t.text_dim),

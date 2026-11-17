@@ -27,7 +27,7 @@ Preset JSON shape (versioned):
 
 ## Layer B — Auto-Tune (8 seconds)
 
-State machine `AutoCalibrator` (pure, in `tine-dsp`; fed audio by `tine.exe`). The APO is put in **bypass** for the
+State machine `AutoCalibrator` (pure, in `tine-dsp`; fed audio by `tine.exe`). The DSP pipeline is put in **bypass** (via the session-local Auto-Tune lease, D-029) for the
 duration so measurements see the raw mic.
 
 | Phase | Duration | Measures | Sets |

@@ -7,17 +7,12 @@ Tine is in beta: only the latest release from
 
 ## Reporting a vulnerability
 
-**Please don't open a public issue.** Use the private contact:
+**Please don't open a public issue.** Use GitHub Security Advisories:
 
-<!-- security.txt-style contact (RFC 9116). Maintainer: replace the
-     placeholders before the first public release. -->
-- **Contact:** `mailto:security PLACEHOLDER @ example.invalid` *(placeholder — replace with the maintainer's monitored inbox, or switch to GitHub's private vulnerability reporting for this repo)*
+- **Report privately:** Open a draft advisory via the repository's **Security** tab (*Report a vulnerability* / GitHub Security Advisories).
 - **Preferred languages:** English.
 - **Response target:** within 7 days; fixes or mitigations announced with the
   release that contains them.
-
-Until the placeholder above is replaced, GitHub's *Report a vulnerability*
-(private, on the repository's Security tab) is the working channel.
 
 ## Scope & architecture notes (what reviewers should know)
 

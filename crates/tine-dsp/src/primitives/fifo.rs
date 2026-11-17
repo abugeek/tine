@@ -70,12 +70,20 @@ impl FrameFifo {
     pub fn push_zeros(&mut self, count: usize) {
         let cap = self.mask + 1;
         let to_push = count.min(cap.saturating_sub(self.len));
-        for _ in 0..to_push {
-            if let Some(slot) = self.buf.get_mut(self.write_pos) {
-                *slot = 0.0;
-            }
-            self.write_pos = self.write_pos.wrapping_add(1) & self.mask;
+        if to_push == 0 {
+            return;
         }
+        let first = to_push.min(cap - self.write_pos);
+        let second = to_push - first;
+        if let Some(dst) = self.buf.get_mut(self.write_pos..self.write_pos + first) {
+            dst.fill(0.0);
+        }
+        if second > 0
+            && let Some(dst) = self.buf.get_mut(..second)
+        {
+            dst.fill(0.0);
+        }
+        self.write_pos = self.write_pos.wrapping_add(to_push) & self.mask;
         self.len += to_push;
     }
 
@@ -85,23 +93,51 @@ impl FrameFifo {
         let cap = self.mask + 1;
         let free = cap.saturating_sub(self.len);
         let to_push = samples.len().min(free);
-        for &x in samples.iter().take(to_push) {
-            if let Some(slot) = self.buf.get_mut(self.write_pos) {
-                *slot = x;
-            }
-            self.write_pos = self.write_pos.wrapping_add(1) & self.mask;
+        if to_push == 0 {
+            return 0;
         }
+
+        let first = to_push.min(cap - self.write_pos);
+        let second = to_push - first;
+
+        if let (Some(dst), Some(src)) = (
+            self.buf.get_mut(self.write_pos..self.write_pos + first),
+            samples.get(..first),
+        ) {
+            dst.copy_from_slice(src);
+        }
+        if second > 0
+            && let (Some(dst), Some(src)) = (self.buf.get_mut(..second), samples.get(first..to_push))
+        {
+            dst.copy_from_slice(src);
+        }
+
+        self.write_pos = self.write_pos.wrapping_add(to_push) & self.mask;
         self.len += to_push;
         to_push
     }
 
     /// Pops `dst.len()` samples into `dst`, returning the number of samples popped.
     pub fn pop_slice(&mut self, dst: &mut [f32]) -> usize {
+        let cap = self.mask + 1;
         let to_pop = dst.len().min(self.len);
-        for slot in dst.iter_mut().take(to_pop) {
-            *slot = self.buf.get(self.read_pos).copied().unwrap_or(0.0);
-            self.read_pos = self.read_pos.wrapping_add(1) & self.mask;
+        if to_pop == 0 {
+            return 0;
         }
+
+        let first = to_pop.min(cap - self.read_pos);
+        let second = to_pop - first;
+
+        if let (Some(out), Some(src)) = (dst.get_mut(..first), self.buf.get(self.read_pos..self.read_pos + first)) {
+            out.copy_from_slice(src);
+        }
+        if second > 0
+            && let (Some(out), Some(src)) = (dst.get_mut(first..to_pop), self.buf.get(..second))
+        {
+            out.copy_from_slice(src);
+        }
+
+        self.read_pos = self.read_pos.wrapping_add(to_pop) & self.mask;
         self.len -= to_pop;
         to_pop
     }
@@ -114,12 +150,12 @@ impl FrameFifo {
         if !self.can_pop_frame() || out.len() < self.frame_len {
             return false;
         }
-        for slot in out.iter_mut().take(self.frame_len) {
-            *slot = self.buf.get(self.read_pos).copied().unwrap_or(0.0);
-            self.read_pos = self.read_pos.wrapping_add(1) & self.mask;
+        if let Some(frame_out) = out.get_mut(..self.frame_len) {
+            self.pop_slice(frame_out);
+            true
+        } else {
+            false
         }
-        self.len -= self.frame_len;
-        true
     }
 }
 

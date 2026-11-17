@@ -528,13 +528,14 @@ fn gr_row(s: &AppState, t: TineTheme) -> El {
                 .border(1.0, t.border)
                 .child(
                     canvas(with_tick(
-                        track_fill(90.0, 8.0, out_norm, meter_color(tel.output_peak_db, t)),
-                        90.0,
+                        track_fill(150.0, 8.0, out_norm, meter_color(tel.output_peak_db, t)),
+                        150.0,
                         8.0,
                         ceil_norm,
                         t.accent,
                     ))
-                    .key("pro/out-fill"),
+                    .key("pro/out-fill")
+                    .size(150.0, 8.0),
                 ),
         )
         .child(
@@ -602,6 +603,17 @@ fn rack_scroll(s: &AppState, cx: &mut Cx<AppState>, t: TineTheme) -> El {
         .child(body)
 }
 
+/// Unpins every pinned parameter in `stage` and emits `Intent::Unpin(id)` for each.
+fn unpin_section(s: &mut AppState, stage: Stage) {
+    for id in section_params(stage) {
+        if s.model.pins.is_pinned(id) {
+            s.model.pins.unpin(id);
+            s.emit(Intent::Unpin(id));
+        }
+    }
+    s.ui.pro_field.close();
+}
+
 /// One stage section: header (title, optional enable switch, optional section
 /// "Unpin all") and a two-column body of generated control rows.
 fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> El {
@@ -655,12 +667,7 @@ fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> E
             false,
             t,
             move |s| {
-                let ids = section_params(stage);
-                for id in ids {
-                    s.model.pins.unpin(id);
-                }
-                s.ui.pro_field.close();
-                s.emit(Intent::UnpinAll);
+                unpin_section(s, stage);
             },
         ));
     }
@@ -1156,5 +1163,44 @@ mod tests {
         assert!(section_params(s1).contains(&ParamId::HpfEnabled));
         assert!(section_params(s3).contains(&ParamId::EqType(Band::B2)));
         assert!(!section_params(s1).contains(&ParamId::CompRatio));
+    }
+
+    #[test]
+    fn unpin_section_emits_per_param_intents_and_preserves_other_stages() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::intent::IntentSink;
+
+        struct VecSink(Rc<RefCell<Vec<Intent>>>);
+        impl IntentSink for VecSink {
+            fn send(&self, intent: Intent) {
+                self.0.borrow_mut().push(intent);
+            }
+        }
+
+        let recorded = Rc::new(RefCell::new(Vec::<Intent>::new()));
+        let mut s = AppState::default();
+        s.set_sink(VecSink(Rc::clone(&recorded)));
+
+        // Pin two params in Stage 1 and one in Stage 5 (Compressor).
+        s.model.pins.pin(ParamId::InputGainDb);
+        s.model.pins.pin(ParamId::HpfFreqHz);
+        s.model.pins.pin(ParamId::CompRatio);
+
+        unpin_section(&mut s, STAGES[0]);
+
+        assert!(!s.model.pins.is_pinned(ParamId::InputGainDb));
+        assert!(!s.model.pins.is_pinned(ParamId::HpfFreqHz));
+        assert!(
+            s.model.pins.is_pinned(ParamId::CompRatio),
+            "other stage pins must be preserved"
+        );
+
+        let intents = recorded.borrow();
+        assert!(!intents.contains(&Intent::UnpinAll), "must not emit Intent::UnpinAll");
+        assert!(intents.contains(&Intent::Unpin(ParamId::InputGainDb)));
+        assert!(intents.contains(&Intent::Unpin(ParamId::HpfFreqHz)));
+        assert_eq!(intents.len(), 2);
     }
 }

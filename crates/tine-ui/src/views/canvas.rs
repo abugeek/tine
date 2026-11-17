@@ -19,9 +19,10 @@ use tine_dsp::curve::response_curve;
 use tine_dsp::macros::{ExplainBuf, ExplainRow, Macro as DspMacro, MacroMapper};
 use tine_dsp::presets;
 use tine_protocol::params::{DspParams, EQ_BAND_COUNT, ParamId, Unit};
+use tine_protocol::presets::{Calibration, CalibrationOverrides};
 use tine_protocol::telemetry::AudioTelemetryFrame;
 
-use crate::model::{Macro, UiModel};
+use crate::model::{CalibrationUi, Macro, UiModel};
 use crate::state::AppState;
 use crate::theme::{TineTheme, radii, spacing, typography};
 
@@ -83,9 +84,33 @@ pub fn macro_x(m: Macro, plot_w: f32) -> f32 {
 #[must_use]
 pub fn macro_explanation_rows(m: Macro, model: &UiModel) -> Vec<String> {
     let preset = presets::builtin(model.archetype);
+    let cal = model.calibration.as_ref().map(|c| calibration_from_ui(c, &preset.base));
     let mut buf = ExplainBuf::new();
-    MacroMapper::explain(preset, None, model.macros, model.pins, dsp_macro(m), &mut buf);
+    MacroMapper::explain(preset, cal.as_ref(), model.macros, model.pins, dsp_macro(m), &mut buf);
     buf.rows().iter().map(|row| explain_row_string(row, model)).collect()
+}
+
+fn calibration_from_ui(cal: &CalibrationUi, base: &DspParams) -> Calibration {
+    let find = |target: ParamId, fallback: f32| {
+        cal.changes
+            .iter()
+            .find(|d| d.param == target)
+            .map_or(fallback, |d| d.after)
+    };
+    Calibration {
+        noise_rms_db: cal.noise_rms_db,
+        noise_peak_db: cal.noise_rms_db,
+        speech_rms_db: cal.speech_rms_db,
+        crest_db: 12.0,
+        tilt_db: 0.0,
+        derived: CalibrationOverrides {
+            input_gain_db: find(ParamId::InputGainDb, base.input_gain_db),
+            gate_threshold_db: find(ParamId::GateThresholdDb, base.gate_threshold_db),
+            denoise_mix: find(ParamId::DenoiseMix, base.denoise_mix),
+            comp_thresh_db: find(ParamId::CompThreshDb, base.comp_thresh_db),
+            comp_makeup_db: find(ParamId::CompMakeupDb, base.comp_makeup_db),
+        },
+    }
 }
 
 /// Maps `tine-ui`'s macro node onto the DSP macro enum of the same node.

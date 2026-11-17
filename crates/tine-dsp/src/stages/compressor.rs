@@ -12,13 +12,9 @@ use crate::primitives::smoother::Smoother;
 /// `10^(-6/20)` for `peak - 6 dB` comparison in linear domain.
 const MINUS_6_DB_LIN: f32 = 0.501_187_2;
 
-/// Fast `lin_to_db` in `f32` (max error < 0.001 dB over `[-120, +48] dB`).
+/// Fast `20 * log10(abs)` in `f32` for positive finite `abs` (no floor check).
 #[inline]
-fn fast_lin_to_db(lin: f32) -> f32 {
-    let abs = lin.abs();
-    if !abs.is_finite() || abs <= LIN_FLOOR {
-        return DB_FLOOR;
-    }
+fn fast_lin_to_db_raw(abs: f32) -> f32 {
     let bits = abs.to_bits();
     let exp = (bits >> 23).cast_signed() - 127;
     let m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
@@ -27,6 +23,27 @@ fn fast_lin_to_db(lin: f32) -> f32 {
     let ln_m = 2.0 * u * (1.0 + u2 * (1.0 / 3.0 + u2 * (1.0 / 5.0 + u2 * (1.0 / 7.0))));
     // 20 / ln(10) = 8.68589, 20 * log10(2) = 6.0206
     (exp as f32) * 6.020_6 + ln_m * 8.685_89
+}
+
+/// Fast `10 * log10(sq)` in `f32` for squared linear amplitude, floored at [`DB_FLOOR`].
+#[inline]
+fn fast_sq_to_db(sq: f32) -> f32 {
+    const LIN_FLOOR_SQ: f32 = LIN_FLOOR * LIN_FLOOR;
+    if !sq.is_finite() || sq <= LIN_FLOOR_SQ {
+        return DB_FLOOR;
+    }
+    0.5 * fast_lin_to_db_raw(sq)
+}
+
+/// Fast `lin_to_db` in `f32` (max error < 0.001 dB over `[-120, +48] dB`).
+#[cfg(test)]
+#[inline]
+fn fast_lin_to_db(lin: f32) -> f32 {
+    let abs = lin.abs();
+    if !abs.is_finite() || abs <= LIN_FLOOR {
+        return DB_FLOOR;
+    }
+    fast_lin_to_db_raw(abs)
 }
 
 /// Fast `db_to_lin` in `f32` (max error < 0.001 dB over `[-120, +48] dB`).
@@ -255,16 +272,17 @@ impl Stage for CompressorStage {
         let mut max_gr_db = 0.0f32;
 
         // Cache program-dependent release coefficient for this block if releasing.
-        let mut cached_rel_samples = usize::MAX;
+        let mut cached_rel_bucket = usize::MAX;
         let mut cached_rel_coeff = base_rel_coeff;
 
         for sample in buf.iter_mut() {
             let x = *sample;
-            let rms = self.rms_env.process_sample(x);
+            let mean_sq = self.rms_env.process_sample_sq(x);
             let peak = self.peak_env.process_sample(x);
 
-            let det_lin = rms.max(peak * MINUS_6_DB_LIN);
-            let level_db = fast_lin_to_db(det_lin);
+            let peak_scaled = peak * MINUS_6_DB_LIN;
+            let det_sq = mean_sq.max(peak_scaled * peak_scaled);
+            let level_db = fast_sq_to_db(det_sq);
 
             let curve_out_db = Self::static_curve_db(p, level_db);
             let target_gr_db = (level_db - curve_out_db).max(0.0);
@@ -283,11 +301,13 @@ impl Stage for CompressorStage {
                 let rel_coeff = if over_samples >= prog_win {
                     base_rel_coeff
                 } else {
-                    if cached_rel_samples != over_samples {
-                        let frac = (over_samples as f32) / (prog_win as f32);
+                    let bucket = over_samples >> 5;
+                    if cached_rel_bucket != bucket {
+                        let quantized_samples = bucket << 5;
+                        let frac = (quantized_samples as f32) / (prog_win as f32);
                         let eff_rel_ms = release_ms * (0.5 + 0.5 * frac);
                         cached_rel_coeff = time_coeff(eff_rel_ms, self.fs);
-                        cached_rel_samples = over_samples;
+                        cached_rel_bucket = bucket;
                     }
                     cached_rel_coeff
                 };

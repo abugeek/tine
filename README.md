@@ -12,10 +12,7 @@ or a studio mixer's complexity.
 > [D-018](docs/project/06-decisions.md)). The app runs in your user session,
 > without elevation.
 
-<!-- TODO(maintainer): GIF of install → onboarding → Discord hearing the
-     processed mic. Screen capture is a maintainer action: record 1280×800
-     (~15 s, < 5 MB), drop it at assets/demo.gif and replace this note. -->
-![Tine demo — placeholder until capture](assets/demo.gif)
+<!-- Demo GIF: to be added once a 1280x800 (~15 s, < 5 MB) screen capture is recorded at assets/demo.gif. -->
 
 ## Why
 
@@ -85,9 +82,9 @@ sums above let you verify exactly what you downloaded; public code signing
   without leaving GPU memory behind.
 - **Golden Line mode** — one slider for the overall body/purity feel.
   **Pro mode** — every stage's parameters, pin any of them against Auto-Tune.
-- **Hear Myself**: monitor the processed mic on your headphones. Expect
-  ~30+ ms of audible delay (≈22 ms DSP + endpoint buffering); that is a known
-  limitation of the noise-reduction stage, not a bug.
+- **Hear Myself**: monitor your microphone input on your headphones (in v0.1,
+  Hear Myself monitors the input signal rather than the post-cable processed
+  stream; see [D-029](docs/project/06-decisions.md)).
 - **CLI** (from a terminal):
 
   ```text
@@ -175,3 +172,7 @@ Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0
 license, shall be dual-licensed as above, without any additional terms or
 conditions.
+
+## Code Signing
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).

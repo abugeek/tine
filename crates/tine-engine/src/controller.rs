@@ -436,13 +436,10 @@ fn flush_persistence(state: &mut Loop, tx: &Sender<Event>, paths: &EnginePaths) 
     state.settings.monitor_device_id = state.model.monitor.output_device.clone();
     state.settings.monitor_enabled = state.model.monitor.enabled;
 
-    if let Some(endpoint) = &state.model.endpoint.clone() {
-        if let Err(e) = persist::save_profile(&state.model.profile, paths) {
-            let _ = tx.send(Event::Error(EngineError::from(e)));
-        }
-        if let Err(e) = persist::save_boot_params(endpoint.as_str(), &state.current, paths) {
-            let _ = tx.send(Event::Error(EngineError::from(e)));
-        }
+    if state.model.endpoint.is_some()
+        && let Err(e) = persist::save_profile(&state.model.profile, paths)
+    {
+        let _ = tx.send(Event::Error(EngineError::from(e)));
     }
     if let Err(e) = persist::save_settings(&state.settings, paths) {
         let _ = tx.send(Event::Error(EngineError::from(e)));

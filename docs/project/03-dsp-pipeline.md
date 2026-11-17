@@ -18,8 +18,8 @@ in ─► [1 Gain · DC block · HPF] ─► [2 RNNoise mix · Expander] ─► 
 - HPF: 2nd-order Butterworth (Q = 0.7071) from `tine-dsp::primitives::biquad` (in-house RBJ designs, D-010), cutoff 20–200 Hz.
 
 ### 2. Denoiser + expander
-- `nnnoiseless::DenoiseState` on 480-sample frames via input/output FIFOs. Scale: RNNoise expects 16-bit range, so multiply by 32768 in / divide out.
-- Output = `dry_delayed * (1 - mix) + wet * mix` — dry path delayed by the same 480 samples so the blend is phase-aligned.
+- `nnnoiseless::DenoiseState` on 480-sample frames via input/output FIFOs (480-sample FIFO framing + 480-sample OLA synthesis delay = 960 samples / 20 ms at 48 kHz, D-019). Scale: RNNoise expects 16-bit range, so multiply by 32768 in / divide out.
+- Output = `dry_delayed * (1 - mix) + wet * mix` — dry path delayed by the same 960 samples so the blend is phase-aligned.
 - Downward expander (soft knee 6 dB, hysteresis): detector = peak envelope (attack 1 ms, release from param).
   Opens at `threshold`, closes at `threshold - hysteresis`. Gain below threshold: `(ratio - 1) * (level - threshold)`, floor −80 dB.
   Reported as `gate_attenuation_db`.
@@ -50,14 +50,14 @@ Bands at 0 dB gain (peak/shelf) are skipped to save CPU.
 - Reported as `comp_gain_reduction_db`.
 
 ### 6. Brickwall lookahead limiter
-- 1.5 ms (72 samples @ 48 kHz) delay line; gain computed on a sliding-window max of |x| over the lookahead window
+- 1.5 ms (72 samples @ 48 kHz) delay line + 4-sample true-peak FIR group delay (76 samples total; FIR delay is always in-path so toggling true-peak keeps latency constant, D-019); gain computed on a sliding-window max of |x| over the lookahead window
   (monotone deque on a fixed ring, O(1) amortised), attack ramp across the lookahead, release 50 ms.
 - Ceiling −1.0 dBFS default (range −12 … −0.1). Sample-peak by default; optional 4× oversampled true-peak detection (Pro).
 - Guarantee: no output sample exceeds the ceiling (tested with full-scale square waves and impulses).
 
 ### 7. Metering tap
 - Per block: input/output peak & RMS (dBFS), the three GR values. Published ~60 Hz via the telemetry triple buffer.
-- Post-limiter mono samples pushed to the tap ring; **spectrum (32 log bands, 20 Hz–20 kHz) is computed in tine.exe**, not in audiodg.
+- Post-limiter mono samples pushed to the tap ring; **spectrum (32 log bands, 20 Hz–20 kHz) is computed outside the RT audio callback** by the visualizer service.
 
 ## Parameter table (`DspParams`)
 

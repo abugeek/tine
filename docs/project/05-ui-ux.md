@@ -6,8 +6,8 @@ element tree for automated checks.
 
 ## Window lifecycle
 
-- Opened from tray (left-click or "Open Tine"), on first run, or by launching `tine.exe` while it is already running (single-instance; second launch signals the first).
-- Closing the window drops the Rune window **and** the wgpu device/surface. The tray and audio continue.
+- Opened from tray (left-click or "Open Tine"), on first run, or by launching `tine.exe` while it is already running (single-instance; second launch signals the first via `\\.\pipe\tine-<user-sid>`).
+- Per **D-017**, the parent `tine.exe` hosts the tray (`rune::Tray`), control plane, and virtual-cable audio router; opening the window spawns `tine.exe --ui` as a short-lived child process, and closing the window exits `tine.exe --ui` so all GPU/DX12 memory is released.
 - Tray (`rune::Tray`; flat menu, so checked state is shown in the label): Open Tine · ✓ Processing / Bypassed · ✓ Hear Myself · — · Dynamic · Condenser · Headset · Laptop (current marked ✓) · — · Start with Windows ✓ · Quit. Left-click opens the window.
 
 ## Layout
@@ -27,9 +27,8 @@ element tree for automated checks.
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Note: the header has **no output-target selector** (the spec's "Output Target" is replaced by the APO model). It shows
-the APO state for the selected mic instead: `Active` · `Not installed` · `Inactive (enhancements off)` · `Error`.
-The "Hear Myself" device picker lives in a small settings popover.
+Note: the header has **no output-target selector** — under **D-018**, `tine-engine` automatically routes processed audio to the virtual audio cable (`CABLE Input`). It shows the routing status badge for the selected mic instead: `Active` · `Cable missing` · `Inactive` · `Error`.
+The "Hear Myself" device picker lives in a small settings popover (in v0.1, "Hear Myself" monitors the microphone *input* signal per D-029).
 
 ## Interaction
 

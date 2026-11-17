@@ -9,7 +9,7 @@
       {},
       { "type": "peaking", "freq_hz": 950.0, "gain_db": -3.5, "q": 1.2 },
       {},
-      { "type": "high_shelf", "freq_hz": 4500.0, "gain_db": 2.0, "q": 0.707 }
+      { "type": "high_shelf", "freq_hz": 8000.0, "gain_db": 2.0, "q": 0.707 }
     ]
   },
   "macro_defaults": { "purity": 0.5, "body": 0.5, "presence": 0.5, "leveler": 0.5 }

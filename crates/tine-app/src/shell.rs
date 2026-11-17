@@ -8,8 +8,8 @@
 //! and exits.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
-use std::time::Instant;
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
 
 use rune::{Tray, TrayEvent};
 use serde_json::{Value, json};
@@ -37,6 +37,7 @@ enum Msg {
 /// Everything the app loop needs; lives on the loop thread.
 struct Shell {
     handle: tine_engine::controller::ControllerHandle,
+    paths: EnginePaths,
     model: Option<Arc<tine_engine::model::AppModel>>,
     link: LinkState,
     endpoint_names: Option<Vec<(String, String)>>,
@@ -123,6 +124,7 @@ impl Shell {
 
 /// Runs the app. Returns the process exit code.
 pub fn run_app(background: bool, metrics: bool) -> i32 {
+    const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(350);
     let entered = Instant::now();
 
     // 1. Single instance: forward `open` (or exit quietly for --background).
@@ -166,7 +168,7 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     tracing::info!(target: "tine::shell", endpoint = endpoint.as_str(), "controller starting");
     let (handle, rx_events) = Controller::spawn(EngineConfig::block(
         endpoint.clone(),
-        services::param_block(),
+        Arc::new(tine_protocol::sync::ParamBlock::new()),
         paths.clone(),
     ));
 
@@ -185,6 +187,7 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
 
     let mut shell = Shell {
         handle: handle.clone(),
+        paths,
         model: None,
         link: LinkState::Unlinked,
         endpoint_names: None,
@@ -232,48 +235,68 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
 
     // 7. Event loop.
     let mut code = exit_code::OK;
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            Msg::Engine(Event::ModelChanged(model)) => {
-                shell.ensure_endpoint_names();
-                shell.model = Some(model);
-                if let Some(endpoint) = shell.model.as_ref().and_then(|m| m.endpoint.as_ref()) {
-                    let routed = services::router_follow(endpoint.as_str());
-                    shell.link = link_from_router(routed);
+    let mut last_health_check = Instant::now();
+    loop {
+        match rx.recv_timeout(HEALTH_CHECK_INTERVAL) {
+            Ok(msg) => match msg {
+                Msg::Engine(Event::ModelChanged(model)) => {
+                    shell.ensure_endpoint_names();
+                    shell.model = Some(model);
+                    if let Some(endpoint) = shell.model.as_ref().and_then(|m| m.endpoint.as_ref()) {
+                        let routed = services::router_follow(endpoint.as_str());
+                        shell.link = link_from_router(routed);
+                    }
+                    shell.sync_tray(&tx);
                 }
-                shell.sync_tray(&tx);
-            }
-            Msg::Engine(Event::ApoLink(link)) => {
-                tracing::info!(target: "tine::shell", link = ?link, "link state changed");
-                shell.link = link;
-                shell.sync_tray(&tx);
-            }
-            Msg::Engine(Event::Error(e)) => {
-                tracing::error!(target: "tine::shell", error = ?e, "engine error");
-                // Persist failures (e.g. a full disk rejects the settings
-                // save) must reach the user, not only the log (T22 QA).
-                services::surface_message(format!("Tine couldn't apply or save a change: {e}"));
-            }
-            Msg::Tray(TrayEvent::Activate { .. }) => shell.open_ui(),
-            Msg::Tray(TrayEvent::Menu(id)) if id == menu_id::OPEN => shell.open_ui(),
-            Msg::Tray(TrayEvent::Menu(id)) if id == menu_id::QUIT => {
-                tracing::info!(target: "tine::shell", "quit requested from tray");
-                code = exit_code::OK;
-                break;
-            }
-            Msg::Tray(TrayEvent::Menu(id)) => shell.on_tray_menu(&id),
-            Msg::Pipe(job) => {
-                if matches!(job.request, PipeRequest::Quit) {
-                    tracing::info!(target: "tine::shell", "quit requested via pipe");
-                    let _ = job.reply.send(PipeResponse::empty());
+                Msg::Engine(Event::ApoLink(link)) => {
+                    tracing::info!(target: "tine::shell", link = ?link, "link state changed");
+                    shell.link = link;
+                    shell.sync_tray(&tx);
+                }
+                Msg::Engine(Event::Error(e)) => {
+                    tracing::error!(target: "tine::shell", error = ?e, "engine error");
+                    // Persist failures (e.g. a full disk rejects the settings
+                    // save) must reach the user, not only the log (T22 QA).
+                    services::surface_message(format!("Tine couldn't apply or save a change: {e}"));
+                }
+                Msg::Tray(TrayEvent::Activate { .. }) => shell.open_ui(),
+                Msg::Tray(TrayEvent::Menu(id)) if id == menu_id::OPEN => shell.open_ui(),
+                Msg::Tray(TrayEvent::Menu(id)) if id == menu_id::QUIT => {
+                    tracing::info!(target: "tine::shell", "quit requested from tray");
                     code = exit_code::OK;
                     break;
                 }
-                shell.on_pipe(job);
+                Msg::Tray(TrayEvent::Menu(id)) => shell.on_tray_menu(&id),
+                Msg::Pipe(job) => {
+                    if matches!(job.request, PipeRequest::Quit) {
+                        tracing::info!(target: "tine::shell", "quit requested via pipe");
+                        let _ = job.reply.send(PipeResponse::empty());
+                        code = exit_code::OK;
+                        break;
+                    }
+                    shell.on_pipe(job, &tx);
+                }
+                Msg::Engine(Event::ParamsResolved(params)) => {
+                    services::publish_params(&params);
+                }
+                Msg::Tray(_) => {}
+            },
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if last_health_check.elapsed() >= HEALTH_CHECK_INTERVAL {
+            last_health_check = Instant::now();
+            if services::router_has_error() {
+                let ep = shell
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.endpoint.as_ref())
+                    .map_or_else(|| endpoint.as_str().to_owned(), |e| e.as_str().to_owned());
+                tracing::warn!(target: "tine::shell", endpoint = %ep, "router stream error detected; rebuilding");
+                let routed = services::router_follow(&ep);
+                shell.link = link_from_router(routed);
+                shell.sync_tray(&tx);
             }
-            // `ParamsResolved` and unknown future tray events need no work:
-            // resolved params already reached the shared-memory target.
-            Msg::Engine(Event::ParamsResolved(_)) | Msg::Tray(_) => {}
         }
     }
 
@@ -300,12 +323,35 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     code
 }
 
-/// Best-effort default capture endpoint (first active mic). COM; used only
-/// when nothing is persisted yet.
+fn is_virtual_capture_device(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("cable output") || lower.contains("vb-audio") || lower.contains("sonar - microphone")
+}
+
+/// Best-effort default capture endpoint: prefers the Windows default
+/// physical mic (excluding virtual cables like VB-Audio / Sonar), then
+/// any physical mic, falling back to the first active device only if
+/// nothing else exists. COM; used only when nothing is persisted yet.
 fn default_capture_endpoint() -> Option<EndpointId> {
-    tine_engine::apo_admin::list_capture_endpoints()
-        .ok()
-        .and_then(|list| list.first().map(|ep| EndpointId::new(ep.id.clone())))
+    if let Ok(inputs) = tine_engine::audio_io::list_inputs()
+        && !inputs.is_empty()
+    {
+        let chosen = inputs
+            .iter()
+            .find(|d| d.is_default && !is_virtual_capture_device(&d.name))
+            .or_else(|| inputs.iter().find(|d| !is_virtual_capture_device(&d.name)))
+            .or_else(|| inputs.iter().find(|d| d.is_default))
+            .or_else(|| inputs.first());
+        if let Some(dev) = chosen {
+            return Some(EndpointId::new(dev.id.clone()));
+        }
+    }
+    tine_engine::apo_admin::list_capture_endpoints().ok().and_then(|list| {
+        list.iter()
+            .find(|ep| !is_virtual_capture_device(&ep.name))
+            .or_else(|| list.first())
+            .map(|ep| EndpointId::new(ep.id.clone()))
+    })
 }
 
 impl Shell {
@@ -384,12 +430,12 @@ impl Shell {
         let _ = self.handle.send(Command::SetMonitor(settings));
     }
 
-    fn on_pipe(&mut self, job: PipeJob) {
-        let response = self.execute_pipe(job.request);
+    fn on_pipe(&mut self, job: PipeJob, tx: &Sender<Msg>) {
+        let response = self.execute_pipe(job.request, tx);
         let _ = job.reply.send(response);
     }
 
-    fn execute_pipe(&mut self, req: PipeRequest) -> PipeResponse {
+    fn execute_pipe(&mut self, req: PipeRequest, tx: &Sender<Msg>) -> PipeResponse {
         match req {
             PipeRequest::Open => {
                 self.open_ui();
@@ -509,6 +555,45 @@ impl Shell {
                     .ok();
                 self.soaks.extend(join);
                 PipeResponse::ok(json!({ "soak": "started", "minutes": minutes, "report": report }))
+            }
+            PipeRequest::SetProDrawerOpen { open } => {
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                settings.pro_drawer_open = open;
+                match persist::save_settings(&settings, &self.paths) {
+                    Ok(()) => PipeResponse::ok(json!({ "pro_drawer_open": open })),
+                    Err(e) => {
+                        tracing::error!(target: "tine::shell", error = %e, "failed to save pro_drawer_open");
+                        PipeResponse::err(exit_code::FAILURE, format!("Failed to save settings: {e}"))
+                    }
+                }
+            }
+            PipeRequest::OnboardingDone => {
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                settings.onboarding_completed = true;
+                match persist::save_settings(&settings, &self.paths) {
+                    Ok(()) => PipeResponse::ok(json!({ "onboarding_done": true })),
+                    Err(e) => {
+                        tracing::error!(target: "tine::shell", error = %e, "failed to persist onboarding completion");
+                        PipeResponse::err(exit_code::FAILURE, format!("Failed to save settings: {e}"))
+                    }
+                }
+            }
+            PipeRequest::RouterFollow => {
+                let endpoint_id = self
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.endpoint.as_ref())
+                    .map(|e| e.as_str().to_owned())
+                    .or_else(|| persist::load_settings(&self.paths).into_value().selected_endpoint_id)
+                    .or_else(|| default_capture_endpoint().map(|e| e.as_str().to_owned()));
+                if let Some(ep) = endpoint_id {
+                    let routed = services::router_follow(&ep);
+                    self.link = link_from_router(routed);
+                    self.sync_tray(tx);
+                    PipeResponse::ok(json!({ "routed": routed, "endpoint": ep }))
+                } else {
+                    PipeResponse::err(exit_code::NOT_RUNNING, "no capture endpoint selected")
+                }
             }
         }
     }

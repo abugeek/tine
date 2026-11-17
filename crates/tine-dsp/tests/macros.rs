@@ -141,7 +141,7 @@ fn golden_archetypes_at_macro_defaults() {
     assert_eq!(out.eq_freq_hz[1], 340.0);
     assert_eq!(out.eq_gain_db[1], -3.0);
     assert_eq!(out.eq_q[1], 1.4);
-    assert_eq!(out.eq_freq_hz[4], 5500.0);
+    assert_eq!(out.eq_freq_hz[4], 8000.0);
     assert_eq!(out.eq_gain_db[4], 3.5);
     // Purity-driven moves at 0.4: centered offsets.
     assert!((out.denoise_mix - 0.4).abs() < f32::EPSILON);
@@ -182,7 +182,7 @@ fn golden_archetypes_at_macro_defaults() {
     assert_eq!(out.eq_freq_hz[2], 950.0);
     assert_eq!(out.eq_gain_db[2], -3.5);
     assert_eq!(out.eq_q[2], 1.2);
-    assert_eq!(out.eq_freq_hz[4], 4500.0);
+    assert_eq!(out.eq_freq_hz[4], 8000.0);
     assert_eq!(out.eq_gain_db[4], 2.0);
 
     // Laptop: out == base at centre macros (mix 0.90 preserved through the

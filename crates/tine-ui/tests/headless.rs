@@ -367,7 +367,35 @@ fn mic_selector_opens_native_dropdown_and_picks_endpoint() {
     rt.resolve_popup(Some(second_id)).expect("pick resolves");
     rt.frame(1.0 / 60.0);
     assert_eq!(rt.state.model.selected, Some(1));
-    assert!(sink.0.borrow().contains(&Intent::SelectEndpoint(1)));
+    assert!(sink.0.borrow().contains(&Intent::SelectEndpoint(second_id.to_owned())));
+}
+
+#[test]
+fn mic_selector_ignores_unknown_or_missing_endpoint_id() {
+    let sink = RecordingSink::default();
+    let mut rt = runtime_with(sink.clone());
+    rt.frame(0.0);
+    assert_eq!(rt.state.model.selected, Some(0));
+
+    let (mx, my) = rt.find("header/mic-selector").expect("header/mic-selector");
+    rt.pointer_down(mx, my);
+    rt.pointer_up(mx, my);
+    rt.frame(1.0 / 60.0);
+
+    // An ID not present in the popup menu is rejected by Rune itself.
+    assert!(rt.resolve_popup(Some("{0.0.1.00000000}.{unknown-mic}")).is_err());
+
+    // Simulate the second endpoint unplugging before the popup callback fires.
+    let unplugged_id = "{0.0.1.00000000}.{headset-boom}";
+    rt.state.model.endpoints.retain(|e| e.id != unplugged_id);
+    rt.resolve_popup(Some(unplugged_id))
+        .expect("missing endpoint pick resolves cleanly");
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.model.selected, Some(0));
+    assert!(
+        !sink.0.borrow().iter().any(|i| matches!(i, Intent::SelectEndpoint(_))),
+        "missing endpoint ID must not emit SelectEndpoint"
+    );
 }
 
 #[test]
@@ -968,7 +996,11 @@ fn onboarding_flow_walks_every_step() {
     rt.pointer_up(mx, my);
     rt.frame(1.0 / 60.0);
     assert_eq!(rt.state.model.selected, Some(1));
-    assert!(sink.0.borrow().contains(&Intent::SelectEndpoint(1)));
+    assert!(
+        sink.0
+            .borrow()
+            .contains(&Intent::SelectEndpoint(String::from("{0.0.1.00000000}.{headset-boom}")))
+    );
 
     let (nx, ny) = rt.find("onboarding/next-1").expect("continue");
     rt.pointer_down(nx, ny);

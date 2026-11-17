@@ -2,10 +2,11 @@
 
 | Term | Meaning |
 | :--- | :--- |
-| **APO** | Audio Processing Object. A COM DLL loaded by the Windows audio engine (`audiodg.exe`) that processes an endpoint's stream. |
-| **SFX / MFX / EFX** | Stream / Mode / Endpoint effect slots for APOs. Tine inserts as SFX (or EFX) on a capture endpoint. |
-| **FxProperties** | Registry key under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{endpoint}` listing an endpoint's APO CLSIDs. |
-| **audiodg.exe** | Windows Audio Device Graph Isolation process; runs APOs in Session 0 as LocalService. |
+| **APO** | Audio Processing Object. A COM DLL loaded by the Windows audio engine (`audiodg.exe`). *(Tested in T02 and deferred post-v0.1 by D-018; v0.1 uses virtual-cable routing.)* |
+| **Virtual cable** | A WASAPI virtual audio device (e.g. VB-Audio Virtual Cable: `CABLE Input` → `CABLE Output`) used by Tine v0.1 to deliver processed microphone audio to apps (D-018). |
+| **SFX / MFX / EFX** | Stream / Mode / Endpoint effect slots for Windows APOs (unused in v0.1 under D-018). |
+| **FxProperties** | Registry key under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{endpoint}` listing an endpoint's APO CLSIDs (unused in v0.1 under D-018). |
+| **audiodg.exe** | Windows Audio Device Graph Isolation process; runs Windows APOs in Session 0 as LocalService (Tine v0.1 does not run inside `audiodg.exe`, D-018). |
 | **Endpoint** | A Windows audio device as seen by apps (e.g. "Microphone (Shure MV7)"), identified by a GUID-based ID. |
 | **RAW mode** | A capture stream option that asks Windows to skip APO processing. |
 | **WASAPI** | Windows Audio Session API; what cpal uses on Windows. |

@@ -391,37 +391,6 @@ fn wait_flushed(file: &std::path::Path, pred: impl Fn(&str) -> bool) -> bool {
 }
 
 #[test]
-fn boot_params_survive_controller_exit_for_the_apo() {
-    let (handle, rx, paths) = spawn_block("mic-boot", "boot");
-    let ready = wait_model(&rx, |_| true, "startup ModelChanged");
-    assert!(ready.is_some());
-
-    let sent = handle.send(Command::SetMacro(Macro::Purity, 0.7));
-    assert!(sent.is_ok());
-    let sent = handle.send(Command::SetParam(ParamId::InputGainDb, 3.5));
-    assert!(sent.is_ok());
-    wait_params(
-        &rx,
-        |p| (p.denoise_mix - 0.7).abs() < 1e-6 && (p.input_gain_db - 3.5).abs() < 1e-6,
-        "state",
-    );
-
-    // "tine.exe dies" — the APO later reads the boot params at LockForProcess.
-    drop(handle);
-    drop(rx);
-
-    let written = wait_flushed(&paths.boot_params_file("mic-boot"), |_| true);
-    assert!(written, "boot params flushed on exit");
-    match persist::load_boot_params("mic-boot", &paths) {
-        persist::Loaded::Fresh(p) => {
-            assert!((p.denoise_mix - 0.7).abs() < f32::EPSILON, "macro survives restart");
-            assert_eq!(p.input_gain_db, 3.5, "pinned override survives restart");
-        }
-        other => panic!("expected Fresh boot params, got {other:?}"),
-    }
-}
-
-#[test]
 fn select_endpoint_loads_or_creates_the_profile_and_retargets() {
     let (handle, rx, paths) = spawn_block("mic-first", "select");
     let ready = wait_model(&rx, |_| true, "startup ModelChanged");

@@ -137,7 +137,8 @@ pub struct PlaybackProcessor<const N: usize> {
 }
 
 impl<const N: usize> PlaybackProcessor<N> {
-    /// Allocates jitter buffer and scratch buffers once outside the RT thread.
+    /// Allocates jitter buffer and scratch buffers once outside the RT thread,
+    /// using the default [`super::drift::HEADROOM_CALLBACKS`] (`2.0` ≈ 20 ms).
     pub(crate) fn new(
         channels: usize,
         src_rate: u32,
@@ -146,12 +147,36 @@ impl<const N: usize> PlaybackProcessor<N> {
         ring: Arc<SpscRing<N>>,
         stats: Arc<AtomicStreamStats>,
     ) -> Self {
+        Self::with_headroom(
+            channels,
+            src_rate,
+            dst_rate,
+            max_frames,
+            ring,
+            stats,
+            super::drift::HEADROOM_CALLBACKS as f32,
+        )
+    }
+
+    /// Allocates jitter buffer and scratch buffers once outside the RT thread
+    /// with a configurable `headroom_callbacks` target (e.g. `2.0` for virtual
+    /// cable routing, `3.0` for monitor).
+    #[must_use]
+    pub(crate) fn with_headroom(
+        channels: usize,
+        src_rate: u32,
+        dst_rate: u32,
+        max_frames: usize,
+        ring: Arc<SpscRing<N>>,
+        stats: Arc<AtomicStreamStats>,
+        headroom_callbacks: f32,
+    ) -> Self {
         let cap = max_frames.max(256);
         let jitter_cap = N.clamp(2048, 16384);
         Self {
             channels: channels.max(1),
             ring,
-            resampler: AdaptiveResampler::new(src_rate, dst_rate, jitter_cap),
+            resampler: AdaptiveResampler::with_headroom(src_rate, dst_rate, jitter_cap, f64::from(headroom_callbacks)),
             pop_scratch: vec![0.0; 1024].into_boxed_slice(),
             mono_scratch: vec![0.0; cap].into_boxed_slice(),
             stats,
@@ -161,9 +186,17 @@ impl<const N: usize> PlaybackProcessor<N> {
     /// Renders one `cpal::Data` output buffer in real time (zero allocations).
     pub fn process_data(&mut self, data: &mut Data) {
         let start = Instant::now();
+        let total_frames = data.len().checked_div(self.channels).unwrap_or(0);
+        let desired_target = self.resampler.desired_target_for(total_frames);
+        let was_primed = self.resampler.is_primed();
 
         // Drain available samples from SpscRing into the local jitter buffer.
+        // While unprimed, drop any excess backlog down to `desired_target` so
+        // startup queuing before playback's first callback does not inflate latency.
         loop {
+            if !was_primed && self.resampler.fill_level() > desired_target {
+                self.resampler.trim_to_target(desired_target);
+            }
             let free = self.resampler.free();
             if free == 0 {
                 break;
@@ -183,9 +216,11 @@ impl<const N: usize> PlaybackProcessor<N> {
                 break;
             }
         }
+        if !was_primed && self.resampler.fill_level() > desired_target {
+            self.resampler.trim_to_target(desired_target);
+        }
 
         // Render in chunks bounded by mono_scratch (in case cpal sends a larger buffer).
-        let total_frames = data.len().checked_div(self.channels).unwrap_or(0);
         let mut any_underrun = false;
 
         if total_frames <= self.mono_scratch.len() {
@@ -220,5 +255,32 @@ impl<const N: usize> PlaybackProcessor<N> {
     #[must_use]
     pub fn last_ratio(&self) -> f64 {
         self.resampler.last_ratio()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampler_trim_before_priming_drops_startup_backlog() {
+        let mut resampler = AdaptiveResampler::with_headroom(48_000, 48_000, 16_384, 2.0);
+        let desired_target = resampler.desired_target_for(480);
+        assert_eq!(desired_target, 960);
+
+        // Simulate 120 ms of startup backlog (5760 samples).
+        let chunk = [0.25_f32; 480];
+        for _ in 0..12 {
+            resampler.push_input(&chunk);
+            if !resampler.is_primed() && resampler.fill_level() > desired_target {
+                resampler.trim_to_target(desired_target);
+            }
+        }
+        assert_eq!(resampler.fill_level(), desired_target);
+
+        let mut out = [0.0_f32; 480];
+        assert!(!resampler.render(&mut out));
+        assert!(resampler.is_primed());
+        assert_eq!(resampler.fill_level(), 480);
     }
 }

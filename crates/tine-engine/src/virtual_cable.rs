@@ -18,6 +18,7 @@ use tine_protocol::telemetry::AudioTelemetryFrame;
 use crate::audio_io::{
     AudioIoError, CaptureStream, DeviceRef, PlaybackStream, StreamStats, list_inputs, open_capture, open_playback,
 };
+use crate::monitor::MonitorFeed;
 
 /// Inter-stream ring capacity between capture+DSP and playback (32,768 samples ≈ 682 ms @ 48 kHz).
 const AUDIO_RING_CAP: usize = 32_768;
@@ -42,11 +43,14 @@ pub mod rt {
     )]
 
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use tine_dsp::{DspPipeline, MeterSink, TapSink};
     use tine_protocol::params::DspParams;
     use tine_protocol::sync::{ParamBlock, SpscRing, Triple};
     use tine_protocol::telemetry::AudioTelemetryFrame;
+
+    use crate::monitor::{MONITOR_RING_CAP, MonitorFeed};
 
     /// `MeterSink` publishing ~60 Hz telemetry frames into a lock-free [`Triple`].
     struct TripleMeterSink {
@@ -80,6 +84,9 @@ pub mod rt {
         last_gen: u64,
         meters: TripleMeterSink,
         tap: RingTapSink<TAP_N>,
+        monitor_ring: Arc<SpscRing<MONITOR_RING_CAP>>,
+        monitor_on: Arc<AtomicBool>,
+        block_frames: Arc<AtomicU32>,
     }
 
     impl<const TAP_N: usize> VirtualCableProcessor<TAP_N> {
@@ -92,6 +99,20 @@ pub mod rt {
             telemetry: Arc<Triple<AudioTelemetryFrame>>,
             tap: Arc<SpscRing<TAP_N>>,
         ) -> Self {
+            Self::with_monitor(sample_rate, max_block, params, telemetry, tap, &MonitorFeed::new(0, 0))
+        }
+
+        /// Allocates and prepares the [`DspPipeline`] once outside the real-time thread,
+        /// wiring the post-DSP monitor tap to `monitor_feed`.
+        #[must_use]
+        pub fn with_monitor(
+            sample_rate: f32,
+            max_block: usize,
+            params: Arc<ParamBlock>,
+            telemetry: Arc<Triple<AudioTelemetryFrame>>,
+            tap: Arc<SpscRing<TAP_N>>,
+            monitor_feed: &MonitorFeed,
+        ) -> Self {
             let mut cached_params = DspParams::DEFAULT;
             let mut last_gen = 0u64;
             params.load_if_changed(&mut last_gen, &mut cached_params);
@@ -103,7 +124,28 @@ pub mod rt {
                 last_gen,
                 meters: TripleMeterSink { triple: telemetry },
                 tap: RingTapSink { ring: tap },
+                monitor_ring: Arc::clone(&monitor_feed.ring),
+                monitor_on: Arc::clone(&monitor_feed.enabled),
+                block_frames: Arc::clone(&monitor_feed.block_frames),
             }
+        }
+
+        /// Total added DSP pipeline latency in samples at the negotiated sample rate.
+        #[must_use]
+        pub const fn latency_samples(&self) -> u32 {
+            self.pipeline.latency_samples()
+        }
+
+        /// Builds a [`MonitorFeed`] sharing this processor's post-DSP monitor tap.
+        #[must_use]
+        pub(crate) fn monitor_feed(&self, rate_hz: u32) -> MonitorFeed {
+            MonitorFeed::with_parts(
+                rate_hz,
+                self.latency_samples(),
+                Arc::clone(&self.monitor_ring),
+                Arc::clone(&self.monitor_on),
+                Arc::clone(&self.block_frames),
+            )
         }
 
         /// Processes one mono `f32` capture block in-place (zero allocations, zero locks).
@@ -112,6 +154,52 @@ pub mod rt {
             self.params.load_if_changed(&mut self.last_gen, &mut self.cached_params);
             self.pipeline
                 .process(block, &self.cached_params, &mut self.meters, &mut self.tap);
+            if self.monitor_on.load(Ordering::Relaxed) {
+                let _ = self.monitor_ring.push_slice(block);
+                let frames = u32::try_from(block.len()).unwrap_or(u32::MAX);
+                self.block_frames.store(frames, Ordering::Relaxed);
+            }
+        }
+    }
+    /// Allocation-free, lock-free handoff slot for publishing a [`VirtualCableProcessor`]
+    /// to the capture callback once the hardware sample rate has been negotiated.
+    pub(super) struct ProcessorSlot<const TAP_N: usize>(std::sync::atomic::AtomicPtr<VirtualCableProcessor<TAP_N>>);
+
+    impl<const TAP_N: usize> ProcessorSlot<TAP_N> {
+        pub(super) const fn new() -> Self {
+            Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+        }
+
+        /// Publishes `proc` for the real-time capture callback to claim once.
+        pub(super) fn publish(&self, proc: Box<VirtualCableProcessor<TAP_N>>) {
+            self.0.store(Box::into_raw(proc), std::sync::atomic::Ordering::Release);
+        }
+
+        /// Claims the published processor on the RT thread (zero allocations, zero locks).
+        #[inline]
+        pub(super) fn try_claim(&self) -> Option<Box<VirtualCableProcessor<TAP_N>>> {
+            let ptr = self.0.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Acquire);
+            if ptr.is_null() {
+                None
+            } else {
+                // SAFETY: `ptr` was produced by `Box::into_raw` in `publish` and is
+                // claimed at most once via atomic `swap(null_mut())`.
+                Some(unsafe { Box::from_raw(ptr) })
+            }
+        }
+    }
+
+    impl<const TAP_N: usize> Drop for ProcessorSlot<TAP_N> {
+        fn drop(&mut self) {
+            let ptr = *self.0.get_mut();
+            if !ptr.is_null() {
+                // SAFETY: Any non-null pointer still in the slot was produced by
+                // `Box::into_raw` in `publish` and never claimed; `&mut self`
+                // guarantees exclusive access on drop.
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
         }
     }
 }
@@ -122,6 +210,7 @@ pub use rt::VirtualCableProcessor;
 pub struct VirtualCableRouter {
     capture: CaptureStream,
     playback: PlaybackStream,
+    monitor_feed: MonitorFeed,
 }
 
 impl VirtualCableRouter {
@@ -136,18 +225,50 @@ impl VirtualCableRouter {
         tap: Arc<SpscRing<TAP_N>>,
     ) -> Result<Self, AudioIoError> {
         let target_rate = resolve_input_rate(input_id).unwrap_or(FALLBACK_SAMPLE_RATE);
-        let mut processor =
-            VirtualCableProcessor::new(target_rate as f32, DEFAULT_DSP_MAX_BLOCK, params, telemetry, tap);
+        let slot = Arc::new(rt::ProcessorSlot::<TAP_N>::new());
+        let cb_slot = Arc::clone(&slot);
+        let mut active: Option<Box<VirtualCableProcessor<TAP_N>>> = None;
 
         let audio_ring = Arc::new(SpscRing::<AUDIO_RING_CAP>::new());
         let capture = open_capture(input_id, Some(target_rate), Arc::clone(&audio_ring), move |block| {
-            processor.process_block(block);
+            if active.is_none() {
+                active = cb_slot.try_claim();
+            }
+            if let Some(processor) = active.as_mut() {
+                processor.process_block(block);
+            } else {
+                // Silence until `ProcessorSlot` is published so unprocessed raw
+                // microphone audio never leaks into the virtual cable on startup.
+                block.fill(0.0);
+            }
         })?;
 
+        // Construct `DspPipeline` with the actual hardware capture rate negotiated by
+        // `open_capture`, then publish it lock-free to the capture callback.
         let actual_in_rate = capture.sample_rate();
+        let processor = Box::new(VirtualCableProcessor::new(
+            actual_in_rate as f32,
+            DEFAULT_DSP_MAX_BLOCK,
+            params,
+            telemetry,
+            tap,
+        ));
+        let monitor_feed = processor.monitor_feed(actual_in_rate);
+        slot.publish(processor);
+
         let playback = open_playback(output_id, audio_ring, actual_in_rate)?;
 
-        Ok(Self { capture, playback })
+        Ok(Self {
+            capture,
+            playback,
+            monitor_feed,
+        })
+    }
+
+    /// Returns a [`MonitorFeed`] handle wired to this router's post-DSP output.
+    #[must_use]
+    pub fn monitor_feed(&self) -> MonitorFeed {
+        self.monitor_feed.clone()
     }
 
     /// Stops both capture and playback streams and releases audio resources.
@@ -238,5 +359,76 @@ mod tests {
             panic!("expected DeviceNotFound error")
         };
         assert!(matches!(err, AudioIoError::DeviceNotFound(_)));
+    }
+
+    #[test]
+    fn processor_slot_claims_once_and_cleans_up_unclaimed() {
+        let params = Arc::new(ParamBlock::new());
+        let telemetry = Arc::new(Triple::new(AudioTelemetryFrame::default()));
+        let tap = Arc::new(SpscRing::<1024>::new());
+
+        let slot = rt::ProcessorSlot::<1024>::new();
+        assert!(slot.try_claim().is_none());
+
+        slot.publish(Box::new(VirtualCableProcessor::new(
+            44_100.0,
+            512,
+            Arc::clone(&params),
+            Arc::clone(&telemetry),
+            Arc::clone(&tap),
+        )));
+        let mut claimed = slot.try_claim().expect("published processor should be claimed");
+        assert!(slot.try_claim().is_none());
+
+        let mut block = [0.0f32; 64];
+        claimed.process_block(&mut block);
+
+        // Dropping a populated slot without claiming must not leak or panic.
+        let unclaimed_slot = rt::ProcessorSlot::<1024>::new();
+        unclaimed_slot.publish(Box::new(VirtualCableProcessor::new(
+            48_000.0, 512, params, telemetry, tap,
+        )));
+        drop(unclaimed_slot);
+    }
+
+    #[test]
+    fn monitor_ring_receives_samples_only_when_enabled_zero_alloc() {
+        use std::sync::atomic::Ordering;
+
+        let params = Arc::new(ParamBlock::new());
+        let telemetry = Arc::new(Triple::new(AudioTelemetryFrame::default()));
+        let tap = Arc::new(SpscRing::<4096>::new());
+        let feed = MonitorFeed::new(48_000, 1036);
+
+        let mut proc = VirtualCableProcessor::with_monitor(48_000.0, 512, params, telemetry, tap, &feed);
+        assert_eq!(proc.latency_samples(), 1036);
+
+        let mut block = [0.25_f32; 480];
+        let mut drained = [0.0_f32; 1024];
+
+        // While monitor_on is false, process_block must not push to monitor_ring.
+        assert_no_alloc::assert_no_alloc(|| {
+            proc.process_block(&mut block);
+        });
+        assert_eq!(feed.ring.pop_slice(&mut drained), 0);
+        assert_eq!(feed.block_frames.load(Ordering::Relaxed), 0);
+
+        // Enable monitor_on and verify post-DSP samples + block_frames are recorded with zero allocs.
+        feed.enabled.store(true, Ordering::Release);
+        block.fill(0.25);
+        assert_no_alloc::assert_no_alloc(|| {
+            proc.process_block(&mut block);
+        });
+        let got = feed.ring.pop_slice(&mut drained);
+        assert_eq!(got, 480);
+        assert_eq!(feed.block_frames.load(Ordering::Relaxed), 480);
+        assert_eq!(drained[..480], block[..]);
+
+        // Disable monitor_on again and verify no further samples enter monitor_ring.
+        feed.enabled.store(false, Ordering::Release);
+        assert_no_alloc::assert_no_alloc(|| {
+            proc.process_block(&mut block);
+        });
+        assert_eq!(feed.ring.pop_slice(&mut drained), 0);
     }
 }

@@ -127,9 +127,9 @@ impl RmsEnvelope {
         self.mean_sq = 0.0;
     }
 
-    /// Processes a single sample and returns the updated RMS level.
+    /// Processes a single sample and returns the updated mean-square level (`rms^2`).
     #[inline]
-    pub fn process_sample(&mut self, x: f32) -> f32 {
+    pub fn process_sample_sq(&mut self, x: f32) -> f32 {
         let sq = x * x;
         let coeff = if sq > self.mean_sq {
             self.attack_coeff
@@ -137,7 +137,13 @@ impl RmsEnvelope {
             self.release_coeff
         };
         self.mean_sq = sq + coeff * (self.mean_sq - sq);
-        sqrt_f32(self.mean_sq)
+        self.mean_sq
+    }
+
+    /// Processes a single sample and returns the updated RMS level.
+    #[inline]
+    pub fn process_sample(&mut self, x: f32) -> f32 {
+        sqrt_f32(self.process_sample_sq(x))
     }
 
     /// Processes `input` and writes the RMS envelope for each sample into `env_out`.

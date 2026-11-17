@@ -8,8 +8,8 @@ use crate::model::Macro;
 /// Discrete user intent emitted by `tine-ui` controls.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Intent {
-    /// Select a microphone endpoint by index in `UiModel::endpoints`.
-    SelectEndpoint(usize),
+    /// Select a microphone endpoint by its identifier (`EndpointRow::id`).
+    SelectEndpoint(String),
     /// Switch the microphone hardware archetype preset.
     SetArchetype(Archetype),
     /// Move a Golden Line macro node (`0.0..=1.0`).

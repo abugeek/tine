@@ -5,6 +5,10 @@ mod serde_settings {
     use crate::ids::SCHEMA_VERSION;
     use crate::presets::{FieldError, ValidationError};
 
+    const fn legacy_onboarded() -> bool {
+        true
+    }
+
     /// Global user settings persisted in `%APPDATA%\Tine\settings.json`.
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(default)]
@@ -25,6 +29,9 @@ mod serde_settings {
         pub autostart: bool,
         /// Whether Tine starts minimized to the system tray.
         pub start_minimized: bool,
+        /// Whether the first-run onboarding flow has been completed.
+        #[serde(default = "legacy_onboarded")]
+        pub onboarding_completed: bool,
         /// Last window width in logical pixels.
         pub window_width: u32,
         /// Last window height in logical pixels.
@@ -41,6 +48,7 @@ mod serde_settings {
                 pro_drawer_open: false,
                 autostart: false,
                 start_minimized: false,
+                onboarding_completed: false,
                 window_width: 1280,
                 window_height: 800,
             }
@@ -78,6 +86,28 @@ mod serde_settings {
             } else {
                 Err(ValidationError::OutOfRange(errors))
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn onboarding_completed_defaults_and_legacy_deserialization() -> Result<(), serde_json::Error> {
+            let defaults = AppSettings::default();
+            assert!(!defaults.onboarding_completed);
+
+            let legacy_json = r#"{"schema":1,"pro_drawer_open":true}"#;
+            let legacy: AppSettings = serde_json::from_str(legacy_json)?;
+            assert!(legacy.onboarding_completed);
+            assert!(legacy.pro_drawer_open);
+
+            let serialized = serde_json::to_string(&defaults)?;
+            let round_tripped: AppSettings = serde_json::from_str(&serialized)?;
+            assert!(!round_tripped.onboarding_completed);
+
+            Ok(())
         }
     }
 }

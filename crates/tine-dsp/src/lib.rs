@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod calibrator;
 pub mod curve;
+pub mod denoise;
 pub mod macros;
 pub mod meter;
 pub mod pipeline;

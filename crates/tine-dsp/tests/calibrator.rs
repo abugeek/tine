@@ -24,7 +24,7 @@ use tine_dsp::calibrator::{
 use tine_dsp::macros::MacroMapper;
 use tine_dsp::presets::{PresetDef, builtin};
 use tine_dsp::{DspPipeline, NoMeters, NoTap};
-use tine_protocol::params::DspParams;
+use tine_protocol::params::{DspParams, ParamId};
 use tine_protocol::presets::PinSet;
 
 /// Asserting allocation-freedom selectively: the global allocator denies
@@ -204,14 +204,17 @@ fn noisy_quiet_fixture_meets_acceptance() {
     let cal = &report.calibration;
     let noise_region = stream.get(FS..4 * FS).expect("noise region");
 
-    // Gate threshold = measured noise RMS + 6 dB (± 0.5 dB), independently
-    // measured as the median of 100 ms window RMS values.
+    // Gate threshold = measured noise RMS + input gain + 6 dB - 4 * denoise_mix
+    // (clamped to SPECS, ± 0.5 dB), with noise_rms independently measured as
+    // the median of 100 ms window RMS values.
     let noise_rms = median_window_rms_db(noise_region, FS / 10);
     assert!(
         (noise_rms - (-45.0)).abs() < 3.0,
         "fixture noise level sanity: {noise_rms:.2} dBFS"
     );
-    let expected_gate = noise_rms + 6.0;
+    let gate_spec = ParamId::GateThresholdDb.spec();
+    let expected_gate = (noise_rms + cal.derived.input_gain_db + 6.0 - 4.0 * cal.derived.denoise_mix)
+        .clamp(gate_spec.min, gate_spec.max);
     assert!(
         (cal.derived.gate_threshold_db - expected_gate).abs() <= 0.5,
         "gate {} dB vs expected {expected_gate:.2} dB",
@@ -498,6 +501,38 @@ fn capture_is_rate_agnostic_44_1khz() {
         report.simulated_peak_db
     );
     assert_eq!(cal.push(&[0.0; 480]).phase, CalPhase::Done);
+}
+
+#[test]
+fn hot_preamp_quiet_room_uses_gentle_denoise_and_gain_shifted_gate() {
+    // Hot preamp: raw noise is -46 dBFS (above -48 dBFS), but speech is -14 dBFS
+    // (SNR = 32 dB >= 26 dB, gain = -4 dB, post-gain noise = -50 dBFS <= -42 dBFS).
+    // Must NOT be misclassified as noisy (D4), and gate must include gain (D3).
+    let noise_amp = 10f32.powf(-46.0 / 20.0) * 3f32.sqrt();
+    let speech_amp = 10f32.powf(-14.0 / 20.0) * 2f32.sqrt();
+    let mut stream = vec![0.0f32; FS];
+    stream.extend(white_noise(3 * FS, noise_amp, 0x2201));
+    stream.extend(sine(220.0, FS as f32, 5 * FS, speech_amp));
+
+    let report = calibrate(&stream, 480).expect("hot preamp calibration must succeed");
+    let cal = &report.calibration;
+    assert_eq!(
+        cal.derived.denoise_mix, 0.50,
+        "hot preamp with high SNR must select gentle denoise_mix"
+    );
+    assert!(
+        cal.derived.input_gain_db < 0.0,
+        "hot preamp needs negative gain, got {}",
+        cal.derived.input_gain_db
+    );
+    let gate_spec = ParamId::GateThresholdDb.spec();
+    let expected_gate = (cal.noise_rms_db + cal.derived.input_gain_db + 6.0 - 4.0 * cal.derived.denoise_mix)
+        .clamp(gate_spec.min, gate_spec.max);
+    assert!(
+        (cal.derived.gate_threshold_db - expected_gate).abs() <= 0.1,
+        "gate {} dB vs expected {expected_gate:.2} dB",
+        cal.derived.gate_threshold_db
+    );
 }
 
 #[test]

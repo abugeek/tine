@@ -198,16 +198,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb5dfbc6d8d2675589ccbe4d0fd61df2419075625f8c1a62325e718e2b0049f9"
 
 [[package]]
-name = "apo-spike"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "windows",
- "windows-core 0.62.2",
-]
-
-[[package]]
 name = "arboard"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3077,14 +3067,6 @@ version = "0.1.0"
 source = "git+https://github.com/anomalyco/rune?rev=631e8a67cb3c40225efa3f6c4f57b80e7b18f190#631e8a67cb3c40225efa3f6c4f57b80e7b18f190"
 
 [[package]]
-name = "rune-spike"
-version = "0.1.0"
-dependencies = [
- "rune",
- "windows",
-]
-
-[[package]]
 name = "rune-staging"
 version = "0.0.1"
 source = "git+https://github.com/anomalyco/rune?rev=631e8a67cb3c40225efa3f6c4f57b80e7b18f190#631e8a67cb3c40225efa3f6c4f57b80e7b18f190"
@@ -3564,17 +3546,6 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
-]
-
-[[package]]
-name = "tine-apo"
-version = "0.1.0"
-dependencies = [
- "assert_no_alloc",
- "proptest",
- "tine-dsp",
- "tine-protocol",
- "windows",
 ]
 
 [[package]]

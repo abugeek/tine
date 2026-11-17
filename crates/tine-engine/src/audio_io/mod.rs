@@ -386,11 +386,25 @@ pub fn open_capture<const N: usize>(
 }
 
 /// Opens a playback stream on `id`, pulling mono `f32` from `ring` (at `src_rate`),
-/// applying adaptive clock-drift resampling, and upmixing to all output channels.
+/// applying adaptive clock-drift resampling with the default headroom (`2.0` callbacks),
+/// and upmixing to all output channels.
 pub fn open_playback<const N: usize>(
     id: &DeviceRef,
     ring: Arc<SpscRing<N>>,
     src_rate: u32,
+) -> Result<PlaybackStream, AudioIoError> {
+    open_playback_with_headroom(id, ring, src_rate, 2.0)
+}
+
+/// Opens a playback stream on `id`, pulling mono `f32` from `ring` (at `src_rate`),
+/// applying adaptive clock-drift resampling with a custom `headroom_callbacks` target
+/// (e.g., `2.0` for virtual-cable routing, `3.0` for "Hear Myself" monitoring),
+/// and upmixing to all output channels.
+pub fn open_playback_with_headroom<const N: usize>(
+    id: &DeviceRef,
+    ring: Arc<SpscRing<N>>,
+    src_rate: u32,
+    headroom_callbacks: f32,
 ) -> Result<PlaybackStream, AudioIoError> {
     let dev = resolve_device(id, false)?;
     let supported = dev.default_output_config()?;
@@ -406,13 +420,14 @@ pub fn open_playback<const N: usize>(
     };
 
     let stats = Arc::new(AtomicStreamStats::new());
-    let mut processor = PlaybackProcessor::new(
+    let mut processor = PlaybackProcessor::with_headroom(
         channels as usize,
         src_rate,
         dst_rate,
         max_frames,
         ring,
         Arc::clone(&stats),
+        headroom_callbacks,
     );
 
     let err_stats = Arc::clone(&stats);

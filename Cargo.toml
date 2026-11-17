@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "spikes/*"]
+members = ["crates/*"]
 default-members = ["crates/*"]
 
 [workspace.package]
@@ -14,7 +14,6 @@ repository = "https://github.com/abugeek/tine"
 # Workspace crates
 tine-protocol = { path = "crates/tine-protocol", default-features = false }
 tine-dsp      = { path = "crates/tine-dsp", default-features = false }
-tine-apo      = { path = "crates/tine-apo" }
 tine-engine   = { path = "crates/tine-engine" }
 tine-ui       = { path = "crates/tine-ui" }
 

@@ -13,7 +13,7 @@ Reviewers (human or agent) check against this file.
 | CPU baseline | `-C target-cpu=x86-64-v2` (`.cargo/config.toml`) | SSE4.2/POPCNT: every Windows 11 machine has it, and it unlocks better auto-vectorization. No AVX runtime dispatch in v0.1. |
 | Release profile | `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `debug = "line-tables-only"`, `split-debuginfo = "packed"` (PDBs shipped as release assets, not installed) | Small, fast binaries with symbolized crash reports. |
 | `perf` profile | inherits release, `incremental = false` | Benchmarks only run on this profile. |
-| Panic strategy | `unwind` (default) everywhere | `tine-apo` must `catch_unwind` at every COM boundary; one strategy for the whole workspace keeps it simple. |
+| Panic strategy | `unwind` (default) everywhere | Standard Rust unwinding across the workspace. |
 
 ## 2. Dependency policy
 
@@ -51,15 +51,15 @@ Reviewers (human or agent) check against this file.
 
 ## 5. Unsafe policy
 
-- `unsafe` allowed only in: `tine-protocol::{sync, shm}`, `tine-apo`, `tine-engine::win` (Win32/COM), `tine-dsp::rt` (FTZ intrinsics).
+- `unsafe` allowed only in: `tine-protocol::{sync, shm}`, `tine-engine::win` (Win32/COM), `tine-dsp::rt` (FTZ intrinsics), and `tine-app` Win32 wrappers.
 - `clippy::undocumented_unsafe_blocks = "deny"`; every block has `// SAFETY:` stating the invariant.
-- FFI/COM entry points: `catch_unwind` → HRESULT; never let a panic cross into Windows.
+- FFI/COM entry points: `catch_unwind`; never let a panic cross an FFI boundary.
 
 ## 6. Error handling & logging
 
 - Libraries return typed errors (`thiserror` 2). No `anyhow` in libraries. `tine-app` maps errors to user messages.
-- `tracing` for logs in non-RT code only; `tine-app` installs a rolling file appender in `%LOCALAPPDATA%\Tine\logs` (7 files × 2 MB).
-- The APO never logs from `APOProcess`; it reports state through shm flags/counters, which `tine.exe` logs.
+- `tracing` for logs in non-RT code only; `tine-app` installs an in-house size-rotating file sink in `%LOCALAPPDATA%\Tine\logs\tine.log` (7 files × 2 MiB, D-025).
+- Audio RT callbacks never log; they report state through atomic flags/telemetry, which `tine.exe` logs.
 
 ## 7. Performance budgets (CI-enforced where marked ✓)
 
@@ -67,14 +67,12 @@ Reviewers (human or agent) check against this file.
 | :--- | :--- | :--- |
 | DSP, 480 samples, all stages, 48 kHz ✓ | < 150 µs hard, < 60 µs target | `cargo bench -p tine-dsp` (T05/T09) |
 | Allocations in any RT path ✓ | 0 | `assert_no_alloc` tests |
-| `APOProcess` CPU | < 0.3 % of one core | T13 |
-| `tine.exe` idle, window closed | < 0.5 % CPU, RSS target 8 MB (hard 20 MB), 0 GPU memory | T03, T22 |
-| `tine.exe` window open, 60 Hz | < 3 % CPU, frame build+encode < 4 ms | T19 |
+| `tine.exe` idle, window closed | < 0.5 % CPU, < 12 MB working set (< 4 MB private bytes, hard 20 MB), 0 GPU memory | T03, T22 (D-017, R-09) |
+| `tine.exe --ui` window open, 60 Hz | < 3 % CPU, frame build+encode < 4 ms | T19 |
 | Cold start to tray | < 150 ms | T17 |
 | Window open (closed → first frame) | < 250 ms | T03 |
 | Added latency | ≤ 21.6 ms at 48 kHz (1036 samples, per D-019) | T09 |
-| `tine_apo.dll` size ✓ | < 2 MB | CI artifact check |
-| `tine.exe` size | < 20 MB (release, no `tooling`) | CI artifact check |
+| `tine.exe` size ✓ | < 24 MiB (release, no `tooling`; R-23) | CI + release artifact check |
 
 ## 8. Testing pyramid
 
@@ -85,7 +83,7 @@ Reviewers (human or agent) check against this file.
 | UB check | `miri` | `tine-protocol` |
 | DSP measurement | in-repo harness (sweeps, FFT response, impulse latency) | every stage |
 | Golden audio regression | processed-fixture metrics (peak, RMS, spectrum bands) with tolerances, not byte hashes | `tine-dsp` |
-| Fuzz | `cargo fuzz` / proptest on `APOProcess` + param inputs | `tine-apo` |
+| Fuzz / property | `cargo fuzz` / `proptest` on `DspPipeline::process` + param inputs | `tine-dsp` |
 | Headless UI | Rune `--snap`/`--tree` + Rust checks | `tine-ui` |
 | Soak / system | `tine soak` | release |
 

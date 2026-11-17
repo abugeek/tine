@@ -3,14 +3,19 @@
 use alloc::boxed::Box;
 use alloc::vec;
 
-use tine_protocol::params::DspParams;
+use tine_protocol::params::{DspParams, ParamId};
 use tine_protocol::telemetry::flags;
 
+use crate::denoise::{Denoiser, RnnoiseDenoiser};
 use crate::meter::{MeterSink, MeterStage, StageMeters, TapSink};
+use crate::primitives::db::db_to_lin;
 use crate::primitives::delay::DelayLine;
 use crate::primitives::smoother::Smoother;
 use crate::rt::DenormalGuard;
 use crate::stages::{CleanupStage, CompressorStage, DeesserStage, EqStage, InputStage, LimiterStage, Stage};
+
+/// Consecutive finite input samples required to auto-recover from `PASSTHROUGH_LATCHED`.
+const RECOVERY_CLEAN_SAMPLES: usize = 48_000;
 
 /// Real-time 7-stage microphone DSP pipeline.
 ///
@@ -20,6 +25,7 @@ pub struct DspPipeline {
     max_block: usize,
     latency: u32,
     passthrough_latched: bool,
+    recovery_clean_samples: usize,
     input: InputStage,
     cleanup: CleanupStage,
     eq: EqStage,
@@ -31,23 +37,34 @@ pub struct DspPipeline {
     dry_buf: Box<[f32]>,
     in_buf: Box<[f32]>,
     bypass_smoother: Smoother,
+    dry_gain_smoother: Smoother,
 }
 
 impl DspPipeline {
-    /// Constructs and prepares a new [`DspPipeline`] for `sample_rate` and chunks up to `max_block`.
+    /// Constructs and prepares a new [`DspPipeline`] with the default [`RnnoiseDenoiser`]
+    /// for `sample_rate` and chunks up to `max_block`.
     ///
     /// All heap allocations happen here.
     #[must_use]
     pub fn new(sample_rate: f32, max_block: usize) -> Self {
+        Self::with_denoiser(sample_rate, max_block, Box::new(RnnoiseDenoiser::new()))
+    }
+
+    /// Constructs and prepares a new [`DspPipeline`] with a custom [`Denoiser`]
+    /// for `sample_rate` and chunks up to `max_block`.
+    ///
+    /// All heap allocations happen here.
+    #[must_use]
+    pub fn with_denoiser(sample_rate: f32, max_block: usize, denoiser: Box<dyn Denoiser>) -> Self {
         let max_block = max_block.max(1);
         let fs = if sample_rate.is_finite() && sample_rate > 0.0 {
-            sample_rate
+            sample_rate.clamp(8_000.0, 192_000.0)
         } else {
             48_000.0
         };
 
         let mut input = InputStage::new();
-        let mut cleanup = CleanupStage::new();
+        let mut cleanup = CleanupStage::with_denoiser(denoiser);
         let mut eq = EqStage::new();
         let mut deesser = DeesserStage::new();
         let mut compressor = CompressorStage::new();
@@ -71,6 +88,7 @@ impl DspPipeline {
             max_block,
             latency,
             passthrough_latched: false,
+            recovery_clean_samples: 0,
             input,
             cleanup,
             eq,
@@ -82,6 +100,7 @@ impl DspPipeline {
             dry_buf: vec![0.0; max_block].into_boxed_slice(),
             in_buf: vec![0.0; max_block].into_boxed_slice(),
             bypass_smoother: Smoother::new(10.0, fs, 0.0),
+            dry_gain_smoother: Smoother::new(10.0, fs, 1.0),
         }
     }
 
@@ -95,7 +114,6 @@ impl DspPipeline {
         meters: &mut impl MeterSink,
         tap: &mut impl TapSink,
     ) {
-        crate::debug_assert_rt!();
         if buf.is_empty() {
             return;
         }
@@ -103,6 +121,13 @@ impl DspPipeline {
 
         let delay = self.latency as usize;
         self.bypass_smoother.set_target(if params.bypass { 1.0 } else { 0.0 });
+        let gain_spec = ParamId::InputGainDb.spec();
+        let gain_db = if params.input_gain_db.is_finite() {
+            params.input_gain_db.clamp(gain_spec.min, gain_spec.max)
+        } else {
+            gain_spec.default
+        };
+        self.dry_gain_smoother.set_target(db_to_lin(gain_db));
 
         for chunk in buf.chunks_mut(self.max_block) {
             let n = chunk.len();
@@ -116,9 +141,13 @@ impl DspPipeline {
             {
                 *in_slot = x;
                 let safe_x = if x.is_finite() {
+                    if self.passthrough_latched {
+                        self.recovery_clean_samples = self.recovery_clean_samples.saturating_add(1);
+                    }
                     x
                 } else {
                     input_non_finite = true;
+                    self.recovery_clean_samples = 0;
                     0.0
                 };
                 *dry_slot = self.dry_delay.push_read(safe_x, delay);
@@ -127,6 +156,11 @@ impl DspPipeline {
             if input_non_finite && !self.passthrough_latched {
                 self.reset_stages();
                 self.passthrough_latched = true;
+                self.recovery_clean_samples = 0;
+            } else if self.passthrough_latched && self.recovery_clean_samples >= RECOVERY_CLEAN_SAMPLES {
+                self.reset_stages();
+                self.passthrough_latched = false;
+                self.recovery_clean_samples = 0;
             }
 
             let mut stage_meters = StageMeters::default();
@@ -147,13 +181,15 @@ impl DspPipeline {
                 if has_non_finite {
                     self.reset_stages();
                     self.passthrough_latched = true;
+                    self.recovery_clean_samples = 0;
                     if let Some(dry) = self.dry_buf.get(..n) {
                         chunk.copy_from_slice(dry);
                     }
                 } else {
                     for (wet, &dry) in chunk.iter_mut().zip(self.dry_buf.iter().take(n)) {
                         let g = self.bypass_smoother.next();
-                        *wet = *wet * (1.0 - g) + dry * g;
+                        let dry_gain = self.dry_gain_smoother.next();
+                        *wet = *wet * (1.0 - g) + (dry * dry_gain) * g;
                     }
                 }
             }
@@ -179,7 +215,9 @@ impl DspPipeline {
         self.dry_delay.reset();
         self.meter.reset();
         self.bypass_smoother.snap_to(0.0);
+        self.dry_gain_smoother.snap_to(1.0);
         self.passthrough_latched = false;
+        self.recovery_clean_samples = 0;
     }
 
     /// Returns the total pipeline latency in samples (constant for the pipeline's lifetime).

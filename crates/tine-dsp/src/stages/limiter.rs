@@ -150,13 +150,25 @@ impl LimiterStage {
 
     #[inline]
     fn eval_true_peak(&self) -> f32 {
-        let center_idx = self.fir_pos.wrapping_sub(FIR_HALF) & FIR_RING_MASK;
-        let mut peak = self.fir_hist.get(center_idx).copied().unwrap_or(0.0).abs();
+        let mut win = [0.0f32; FIR_TAPS];
+        let start = self.fir_pos.wrapping_sub(FIR_TAPS - 1) & FIR_RING_MASK;
+        let first_len = FIR_TAPS.min(FIR_RING_CAP - start);
+        if let (Some(dst), Some(src)) = (win.get_mut(..first_len), self.fir_hist.get(start..start + first_len)) {
+            dst.copy_from_slice(src);
+        }
+        let second_len = FIR_TAPS - first_len;
+        if second_len > 0
+            && let (Some(dst), Some(src)) = (win.get_mut(first_len..), self.fir_hist.get(..second_len))
+        {
+            dst.copy_from_slice(src);
+        }
+
+        let [_, _, _, _, center, _, _, _, _] = win;
+        let mut peak = center.abs();
         for coeffs in &self.fir_phases {
             let mut acc = 0.0f32;
-            for (k, &c) in coeffs.iter().enumerate() {
-                let idx = self.fir_pos.wrapping_sub(k) & FIR_RING_MASK;
-                acc += self.fir_hist.get(idx).copied().unwrap_or(0.0) * c;
+            for (&x, &c) in win.iter().rev().zip(coeffs.iter()) {
+                acc += x * c;
             }
             let abs_acc = acc.abs();
             if abs_acc > peak {

@@ -78,8 +78,6 @@ pub struct UiLocal {
     pub hovered_macro: Option<Macro>,
     /// Key of the currently focused element, if tracked locally.
     pub focused_key: Option<String>,
-    /// Whether the monitor/settings popover is open.
-    pub settings_open: bool,
     /// Whether the user dismissed the first-run onboarding overlay locally.
     pub onboarding_dismissed: bool,
     /// First-run onboarding step (`1..=4`: mic → APO install → Auto-Tune → finish).
@@ -99,7 +97,6 @@ impl core::fmt::Debug for UiLocal {
             .field("pro_drawer_open", &self.pro_drawer_open)
             .field("hovered_macro", &self.hovered_macro)
             .field("focused_key", &self.focused_key)
-            .field("settings_open", &self.settings_open)
             .field("onboarding_dismissed", &self.onboarding_dismissed)
             .field("onboarding_step", &self.onboarding_step)
             .field("apo_installing", &self.apo_installing)
@@ -114,7 +111,6 @@ impl PartialEq for UiLocal {
         self.pro_drawer_open == other.pro_drawer_open
             && self.hovered_macro == other.hovered_macro
             && self.focused_key == other.focused_key
-            && self.settings_open == other.settings_open
             && self.onboarding_dismissed == other.onboarding_dismissed
             && self.onboarding_step == other.onboarding_step
             && self.apo_installing == other.apo_installing
@@ -129,7 +125,6 @@ impl Default for UiLocal {
             pro_drawer_open: false,
             hovered_macro: None,
             focused_key: None,
-            settings_open: false,
             onboarding_dismissed: false,
             onboarding_step: 1,
             apo_installing: false,
@@ -182,6 +177,7 @@ impl AppState {
     /// Optimistically toggles bypass locally and emits [`Intent::ToggleBypass`].
     pub fn toggle_bypass_optimistic(&mut self) {
         self.model.bypass = !self.model.bypass;
+        self.model.params.bypass = self.model.bypass;
         self.emit(Intent::ToggleBypass);
     }
 }

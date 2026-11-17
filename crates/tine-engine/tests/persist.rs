@@ -5,10 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use tine_engine::paths::EnginePaths;
-use tine_engine::persist::{
-    Loaded, atomic_write, load_boot_params, load_profile, load_settings, save_boot_params, save_profile, save_settings,
-};
-use tine_protocol::params::{DspParams, ParamId};
+use tine_engine::persist::{Loaded, atomic_write, load_profile, load_settings, save_profile, save_settings};
+use tine_protocol::params::ParamId;
 use tine_protocol::presets::{Archetype, Calibration, CalibrationOverrides, EndpointProfile, MacroPositions, PinSet};
 use tine_protocol::settings::AppSettings;
 
@@ -97,10 +95,6 @@ fn missing_files_yield_defaults() {
             assert_eq!(p.archetype, Archetype::default());
             assert!(p.calibration.is_none());
         }
-        other => panic!("expected Missing, got {other:?}"),
-    }
-    match load_boot_params("never-saved", &paths) {
-        Loaded::Missing(p) => assert_eq!(p, DspParams::DEFAULT),
         other => panic!("expected Missing, got {other:?}"),
     }
 }
@@ -221,62 +215,6 @@ fn future_schema_is_rejected_as_corrupt() {
     match load_settings(&paths) {
         Loaded::Restored(s) => assert_eq!(s, AppSettings::default()),
         other => panic!("expected Restored for unsupported schema, got {other:?}"),
-    }
-}
-
-#[test]
-fn boot_params_round_trip_with_specs_keys() {
-    let paths = temp_paths("boot-rt");
-    let mut params = DspParams::DEFAULT;
-    params.input_gain_db = 6.5;
-    params.hpf_freq_hz = 95.0;
-    params.denoise_mix = 0.8;
-    params.eq_gain_db[2] = -3.5;
-    params.comp_ratio = 4.0;
-    params.limiter_ceiling_db = -1.5;
-    params.deesser_enabled = true;
-
-    let saved = save_boot_params("boot-ep", &params, &paths);
-    assert!(saved.is_ok(), "save_boot_params failed: {saved:?}");
-
-    // The file uses stable SPECS keys (the contract the APO reads at
-    // LockForProcess).
-    let text = std::fs::read_to_string(paths.boot_params_file("boot-ep")).ok();
-    let Some(text) = text else {
-        panic!("boot params file must exist");
-    };
-    for needle in ["\"input_gain_db\"", "\"hpf_freq_hz\"", "\"eq.2.gain_db\"", "\"schema\""] {
-        assert!(text.contains(needle), "boot params must contain {needle}:\n{text}");
-    }
-
-    match load_boot_params("boot-ep", &paths) {
-        Loaded::Fresh(loaded) => {
-            assert_eq!(loaded.input_gain_db, 6.5);
-            assert_eq!(loaded.hpf_freq_hz, 95.0);
-            assert!((loaded.eq_gain_db[2] - (-3.5)).abs() < 1e-6);
-            assert!((loaded.comp_ratio - 4.0).abs() < f32::EPSILON);
-            assert!(loaded.deesser_enabled);
-        }
-        other => panic!("expected Fresh, got {other:?}"),
-    }
-}
-
-#[test]
-fn boot_params_out_of_range_values_are_clamped_on_load() {
-    let paths = temp_paths("boot-clamp");
-    std::fs::create_dir_all(paths.boot_params_dir()).ok();
-    // A hand-edited boot file must not push params out of range.
-    std::fs::write(
-        paths.boot_params_file("clamp-ep"),
-        r#"{"schema":1,"endpoint_id":"clamp-ep","params":{"hpf_freq_hz":5000.0,"comp_ratio":-3.0}}"#,
-    )
-    .ok();
-    match load_boot_params("clamp-ep", &paths) {
-        Loaded::Fresh(p) => {
-            assert_eq!(p.hpf_freq_hz, 200.0, "clamped to SPECS max");
-            assert_eq!(p.comp_ratio, 1.0, "clamped to SPECS min");
-        }
-        other => panic!("expected Fresh, got {other:?}"),
     }
 }
 

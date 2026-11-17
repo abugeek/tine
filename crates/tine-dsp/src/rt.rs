@@ -1,4 +1,4 @@
-//! Real-time safety helpers (FTZ/DAZ denormal guard and RT assertions).
+//! Real-time safety helpers (FTZ/DAZ denormal guard).
 
 /// RAII guard that enables Flush-to-Zero (FTZ) and Denormals-Are-Zero (DAZ)
 /// in the `x86_64` MXCSR register and restores the previous value on drop.
@@ -69,17 +69,6 @@ impl Drop for DenormalGuard {
             }
         }
     }
-}
-
-/// Marks a real-time audio path in debug builds.
-#[macro_export]
-macro_rules! debug_assert_rt {
-    () => {
-        #[cfg(debug_assertions)]
-        {
-            // Hook point for debug-mode RT thread verification.
-        }
-    };
 }
 
 #[cfg(test)]

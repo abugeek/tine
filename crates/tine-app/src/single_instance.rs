@@ -20,8 +20,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
-    WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, FlushFileBuffers,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -142,11 +142,12 @@ fn current_user_sid_bytes() -> Option<Vec<u8>> {
     UserToken::query().map(|t| t.sid_bytes())
 }
 
-/// `\\.\pipe\tine-<user SID>` (falls back to `\\.\pipe\tine-default`).
+/// `\\.\pipe\tine-<user SID>` (falls back to a process-scoped name if the
+/// user SID cannot be queried, never a shared cross-user name).
 #[must_use]
 pub fn pipe_name_for_user() -> String {
-    let sid = current_user_sid().unwrap_or_else(|| "default".to_owned());
-    format!(r"\\.\pipe\tine-{sid}")
+    let suffix = current_user_sid().unwrap_or_else(|| format!("pid-{}", std::process::id()));
+    format!(r"\\.\pipe\tine-{suffix}")
 }
 
 /// Creates the mutex, reporting whether we are the primary instance.
@@ -214,7 +215,7 @@ pub fn send_request(pipe_name: &str, req: &PipeRequest) -> Result<PipeResponse, 
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 None,
             )
         };
@@ -301,11 +302,13 @@ pub fn spawn_server(pipe_name: String, jobs: Sender<PipeJob>) {
 
 fn server_loop(pipe_name: &str, jobs: &Sender<PipeJob>, sid: Option<&[u8]>) {
     let wide = to_wide_null(pipe_name);
+    let mut first_instance = true;
     loop {
-        let Some(pipe) = create_user_pipe(&wide, sid) else {
+        let Some(pipe) = create_user_pipe(&wide, sid, first_instance) else {
             std::thread::sleep(std::time::Duration::from_millis(100));
             continue;
         };
+        first_instance = false;
         // SAFETY: `pipe` is a valid server-side pipe handle.
         let connected = unsafe { ConnectNamedPipe(pipe, None) }.is_ok()
             // SAFETY: last-error read after `ConnectNamedPipe` (a client may
@@ -323,14 +326,19 @@ fn server_loop(pipe_name: &str, jobs: &Sender<PipeJob>, sid: Option<&[u8]>) {
 }
 
 /// Creates a named-pipe instance with a user-only DACL.
-fn create_user_pipe(wide: &[u16], sid: Option<&[u8]>) -> Option<HANDLE> {
+fn create_user_pipe(wide: &[u16], sid: Option<&[u8]>, first_instance: bool) -> Option<HANDLE> {
     let sec = crate::security::user_only_security_attributes(sid)?;
+    let open_mode = if first_instance {
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+    } else {
+        PIPE_ACCESS_DUPLEX
+    };
     // SAFETY: `wide` is NUL-terminated; `sec` holds a valid
     // `SECURITY_ATTRIBUTES`; parameters match the `CreateNamedPipeW` contract.
     let pipe = unsafe {
         CreateNamedPipeW(
             PCWSTR(wide.as_ptr()),
-            PIPE_ACCESS_DUPLEX,
+            open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
             4096,

@@ -71,7 +71,6 @@ jobs:
           Assert-NoDep "tine-dsp" @("windows", "cpal", "serde_json", "rune")
           Assert-NoDep "tine-ui"  @("tine-engine", "cpal")
           Assert-NoDep "tine-ui"  @("windows") @("--depth", "1")
-          Assert-NoDep "tine-apo" @("cpal", "rune", "tine-engine")
           Write-Host "Dependency direction checks passed."
 
       - name: Build release & check artifact sizes
@@ -81,16 +80,10 @@ jobs:
           cargo build --workspace --profile release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $apoDll = Get-Item "target/release/tine_apo.dll"
           $appExe = Get-Item "target/release/tine.exe"
-          Write-Host ("tine_apo.dll size: {0:N0} bytes ({1:N2} MB)" -f $apoDll.Length, ($apoDll.Length / 1MB))
-          Write-Host ("tine.exe size:     {0:N0} bytes ({1:N2} MB)" -f $appExe.Length, ($appExe.Length / 1MB))
+          Write-Host ("tine.exe size: {0:N0} bytes ({1:N2} MiB)" -f $appExe.Length, ($appExe.Length / 1MB))
 
-          if ($apoDll.Length -ge 2MB) {
-            Write-Error "tine_apo.dll exceeds 2 MB budget!"
-            exit 1
-          }
-          if ($appExe.Length -ge 20MB) {
-            Write-Error "tine.exe exceeds 20 MB budget!"
+          if ($appExe.Length -ge 24MB) {
+            Write-Error "tine.exe exceeds 24 MB budget!"
             exit 1
           }

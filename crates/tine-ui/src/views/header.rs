@@ -119,8 +119,11 @@ fn mic_selector(s: &AppState, t: TineTheme) -> El {
             if !popup_menu_supported() {
                 if count > 0 {
                     let next = s.model.selected.map_or(0, |i| (i + 1) % count);
-                    s.model.selected = Some(next);
-                    s.emit(Intent::SelectEndpoint(next));
+                    if let Some(ep) = s.model.endpoints.get(next) {
+                        let id = ep.id.clone();
+                        s.model.selected = Some(next);
+                        s.emit(Intent::SelectEndpoint(id));
+                    }
                 }
                 return;
             }
@@ -138,10 +141,11 @@ fn mic_selector(s: &AppState, t: TineTheme) -> El {
                 "header/mic-selector",
                 |s: &mut AppState, picked: Option<&str>, _tx| {
                     if let Some(id) = picked
-                        && let Some(idx) = s.model.endpoints.iter().position(|e| e.id == id)
+                        && let Some((idx, ep)) = s.model.endpoints.iter().enumerate().find(|(_, e)| e.id == id)
                     {
+                        let ep_id = ep.id.clone();
                         s.model.selected = Some(idx);
-                        s.emit(Intent::SelectEndpoint(idx));
+                        s.emit(Intent::SelectEndpoint(ep_id));
                     }
                 },
             );
@@ -149,7 +153,7 @@ fn mic_selector(s: &AppState, t: TineTheme) -> El {
         .child(text(label).font(typography::LABEL).color(t.text))
 }
 
-/// APO status badge with state-dependent action button.
+/// Virtual Cable routing status badge with state-dependent action button.
 fn apo_status(s: &AppState, t: TineTheme) -> El {
     let dot_color = match s.model.apo {
         ApoBadge::Active => t.meter_green,
@@ -157,8 +161,10 @@ fn apo_status(s: &AppState, t: TineTheme) -> El {
         ApoBadge::NotInstalled | ApoBadge::Error(_) => t.danger,
     };
     let status_text = match &s.model.apo {
-        ApoBadge::Error(msg) => format!("APO: {} — {msg}", s.model.apo.label()),
-        _ => format!("APO: {}", s.model.apo.label()),
+        ApoBadge::Active => String::from("Cable: Active"),
+        ApoBadge::NotInstalled => String::from("Cable: Missing"),
+        ApoBadge::Inactive => String::from("Cable: Inactive"),
+        ApoBadge::Error(msg) => format!("Cable: Error — {msg}"),
     };
 
     let mut apo_row = row()
@@ -177,12 +183,19 @@ fn apo_status(s: &AppState, t: TineTheme) -> El {
 
     match s.model.apo {
         ApoBadge::NotInstalled => {
-            apo_row = apo_row.child(pill_button("header/apo-install", "button", "Install", true, t, |s| {
-                s.emit(Intent::InstallApo);
-            }));
+            apo_row = apo_row.child(pill_button(
+                "header/apo-install",
+                "button",
+                "Check Setup",
+                true,
+                t,
+                |s| {
+                    s.emit(Intent::InstallApo);
+                },
+            ));
         }
         ApoBadge::Inactive | ApoBadge::Error(_) => {
-            apo_row = apo_row.child(pill_button("header/apo-repair", "button", "Repair", true, t, |s| {
+            apo_row = apo_row.child(pill_button("header/apo-repair", "button", "Recheck", true, t, |s| {
                 s.emit(Intent::RepairApo);
             }));
         }

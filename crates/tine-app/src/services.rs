@@ -46,7 +46,7 @@ use tine_protocol::presets::Calibration;
 use tine_protocol::shm::{ShmLayout, init_layout_in_place};
 use tine_protocol::sync::{ParamBlock, SpscRing, Triple};
 use tine_protocol::telemetry::{AudioTelemetryFrame, flags};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
 };
@@ -155,6 +155,14 @@ struct LeaseShim {
 // the process-wide `Services` mutex plus the `stop` flag on teardown.
 unsafe impl Send for LeaseShim {}
 
+/// Desired "Hear Myself" state (remembered when audio routing is not yet active).
+#[derive(Clone, Default)]
+enum MonitorWanted {
+    #[default]
+    Off,
+    On(Option<String>),
+}
+
 /// Shared, process-wide audio service state. The shell's app loop owns
 /// the conceptual lifecycle; the lazy static removes the need to plumb a
 /// services object through every shell call site.
@@ -164,6 +172,7 @@ struct Services {
     last_frame: FrameSnapshot,
     last_pull: Option<Instant>,
     monitor: Option<Monitor>,
+    monitor_wanted: MonitorWanted,
     router: Option<RouterSlot>,
     autotune: Option<AutotuneState>,
     autotune_cancel: Arc<AtomicBool>,
@@ -182,6 +191,7 @@ impl Services {
             },
             last_pull: None,
             monitor: None,
+            monitor_wanted: MonitorWanted::Off,
             router: None,
             autotune: None,
             autotune_cancel: Arc::new(AtomicBool::new(false)),
@@ -211,9 +221,72 @@ fn with<R>(f: impl FnOnce(&mut Services) -> R) -> R {
 // D-018 routing: parameter block, telemetry/tap plumbing, router
 // ---------------------------------------------------------------------------
 
+/// Guards the shared post-DSP `SpscRing` against dual readers: while
+/// Auto-Tune is active (`RouterTapSource` drains `router_tap()`), the
+/// visualizer must never start or read the tap.
+static CALIBRATING: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard that clears [`CALIBRATING`] when the Auto-Tune feed thread
+/// exits (or if spawning it fails).
+struct CalibratingGuard;
+
+impl Drop for CalibratingGuard {
+    fn drop(&mut self) {
+        CALIBRATING.store(false, Ordering::Release);
+    }
+}
+
+/// Serializes all writes to [`param_block`] so the controller and the
+/// Auto-Tune lease shim never call `ParamBlock::store` concurrently.
+struct ParamWriteState {
+    last_controller_params: DspParams,
+    lease_bypass_active: bool,
+}
+
+fn with_param_write<R>(f: impl FnOnce(&mut ParamWriteState) -> R) -> R {
+    static STATE: OnceLock<Mutex<ParamWriteState>> = OnceLock::new();
+    let lock = STATE.get_or_init(|| {
+        Mutex::new(ParamWriteState {
+            last_controller_params: DspParams::DEFAULT,
+            lease_bypass_active: false,
+        })
+    });
+    match lock.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(poisoned) => f(&mut poisoned.into_inner()),
+    }
+}
+
+/// Publishes resolved controller parameters into [`param_block`],
+/// serialized against the Auto-Tune lease shim so `ParamBlock::store`
+/// never has concurrent writers.
+pub fn publish_params(params: &DspParams) {
+    with_param_write(|st| {
+        st.last_controller_params = *params;
+        let mut effective = *params;
+        if st.lease_bypass_active {
+            effective.bypass = true;
+        }
+        param_block().store(&effective);
+    });
+}
+
+fn set_lease_bypass(active: bool) {
+    with_param_write(|st| {
+        if st.lease_bypass_active != active {
+            st.lease_bypass_active = active;
+            let mut effective = st.last_controller_params;
+            if active {
+                effective.bypass = true;
+            }
+            param_block().store(&effective);
+        }
+    });
+}
+
 /// The process-wide DSP parameter block: the controller publishes
-/// resolved parameters into it and the routing loop reads them
-/// lock-free. The shell hands [`ParamBlock`] to `EngineConfig::block`.
+/// resolved parameters into it (via [`publish_params`]) and the routing
+/// loop reads them lock-free.
 #[must_use]
 pub fn param_block() -> Arc<ParamBlock> {
     static BLOCK: OnceLock<Arc<ParamBlock>> = OnceLock::new();
@@ -255,11 +328,30 @@ fn input_rate(endpoint: &str) -> u32 {
 #[must_use]
 pub fn router_follow(endpoint: &str) -> bool {
     let wanted = endpoint.to_owned();
+    // E5: check idempotency (same endpoint AND healthy router) before
+    // calling `input_rate()` / COM device enumeration.
+    if with(|s| {
+        s.router
+            .as_ref()
+            .is_some_and(|r| r.endpoint == wanted && !r.router.has_error())
+    }) {
+        return true;
+    }
     let mut failures: Vec<String> = Vec::new();
     let rate = input_rate(&wanted);
     with(|s| {
-        if s.router.is_some() && s.router.as_ref().is_some_and(|r| r.endpoint == wanted) {
-            return;
+        if let Some(r) = s.router.as_ref() {
+            if r.endpoint == wanted && !r.router.has_error() {
+                return;
+            }
+            // E1: tear down unhealthy routers before rebuilding so stale
+            // streams are released cleanly.
+            if r.router.has_error()
+                && let Some(old) = s.router.take()
+            {
+                tracing::warn!(target: "tine::services", endpoint = %old.endpoint, "tearing down unhealthy routing loop");
+                old.router.stop();
+            }
         }
         let sink = match tine_engine::apo_admin::find_virtual_cable_sink() {
             Ok(Some(info)) => info,
@@ -281,6 +373,13 @@ pub fn router_follow(endpoint: &str) -> bool {
             ));
             return;
         }
+        // Stop the old router before starting the new one so `router_tap()`
+        // never has two concurrent writers during retargeting.
+        let old_endpoint = s.router.take().map(|old| {
+            tracing::info!(target: "tine::services", endpoint = %old.endpoint, "stopping old routing loop before retarget");
+            old.router.stop();
+            old.endpoint
+        });
         match VirtualCableRouter::start::<ROUTER_TAP_N>(
             &DeviceRef::Id(wanted.clone()),
             &DeviceRef::Id(sink.id.clone()),
@@ -289,24 +388,51 @@ pub fn router_follow(endpoint: &str) -> bool {
             router_tap(),
         ) {
             Ok(router) => {
-                let old = s.router.take();
+                let new_feed = router.monitor_feed();
                 s.router = Some(RouterSlot {
                     router,
                     endpoint: wanted.clone(),
                     sink: sink.name.clone(),
                     rate_hz: rate,
                 });
-                if let Some(old) = old {
-                    old.router.stop();
+                if let Some(prev) = old_endpoint {
                     tracing::info!(target: "tine::services",
-                        from = %old.endpoint, to = %wanted, "routing loop retargeted");
+                        from = %prev, to = %wanted, "routing loop retargeted");
                 } else {
                     tracing::info!(target: "tine::services",
                         endpoint = %wanted, sink = %sink.name, rate_hz = rate,
                         "virtual-cable routing loop started");
                 }
+                if let MonitorWanted::On(wanted_dev) = s.monitor_wanted.clone() {
+                    let out = wanted_dev.as_deref().map_or_else(DeviceRef::default, DeviceRef::parse);
+                    match &mut s.monitor {
+                        Some(m) => {
+                            if let Err(e) = m.restart(&new_feed, &out) {
+                                failures.push(format!("Hear Myself restart failed: {e}"));
+                                s.monitor = None;
+                            }
+                        }
+                        None => match Monitor::start(&new_feed, &out) {
+                            Ok(m) => {
+                                tracing::info!(target: "tine::services",
+                                    endpoint = %wanted,
+                                    latency_ms = m.latency_ms(),
+                                    "Hear Myself started");
+                                s.monitor = Some(m);
+                            }
+                            Err(e) => {
+                                failures.push(format!("Hear Myself failed to start: {e}"));
+                            }
+                        },
+                    }
+                } else if let Some(m) = s.monitor.take() {
+                    m.stop();
+                }
             }
             Err(e) => {
+                if let Some(m) = s.monitor.take() {
+                    m.stop();
+                }
                 failures.push(format!("Virtual-cable routing failed to start: {e}"));
             }
         }
@@ -315,6 +441,13 @@ pub fn router_follow(endpoint: &str) -> bool {
         with(|s| s.surface(msg.clone()));
     }
     with(|s| s.router.as_ref().is_some_and(|r| r.endpoint == endpoint))
+}
+
+/// Returns `true` when an active routing loop has latched a stream
+/// error (e.g., mic unplug, sleep/wake, or format change).
+#[must_use]
+pub fn router_has_error() -> bool {
+    with(|s| s.router.as_ref().is_some_and(|r| r.router.has_error()))
 }
 
 /// Stops the routing loop (shutdown path; releases the mic and the cable
@@ -411,9 +544,13 @@ pub fn spectrum() -> [f32; 32] {
 #[must_use]
 pub fn spectrum_on(paths: &EnginePaths) -> FrameSnapshot {
     ensure_reaper();
+    if CALIBRATING.load(Ordering::Acquire) {
+        return with(|s| s.last_frame.clone());
+    }
     with(|s| {
         s.last_pull = Some(Instant::now());
         if s.visualizer.is_none()
+            && !CALIBRATING.load(Ordering::Acquire)
             && let Some((v, frames)) = start_visualizer(paths, s.router.as_ref().map(|r| r.rate_hz))
         {
             s.visualizer = Some(v);
@@ -556,6 +693,10 @@ pub fn autotune_start_on(paths: &EnginePaths) {
     };
     // The capture is the shared tap while the router runs (single device
     // client), else a direct device open (APO-style topology).
+    // Set CALIBRATING before stopping the visualizer so no concurrent
+    // `spectrum_on` call can re-open `router_tap()` while Auto-Tune owns it.
+    CALIBRATING.store(true, Ordering::Release);
+    let cal_guard = CalibratingGuard;
     let capture = match routed_rate {
         Some(rate) => {
             with(|s| {
@@ -607,6 +748,7 @@ pub fn autotune_start_on(paths: &EnginePaths) {
     if std::thread::Builder::new()
         .name("tine-autotune-feed".to_owned())
         .spawn(move || {
+            let _cal_guard = cal_guard;
             loop {
                 if cancel.load(Ordering::Acquire) {
                     handle.cancel();
@@ -771,24 +913,40 @@ pub fn autotune_state() -> Value {
 /// Auto-Tune cannot run in this session).
 fn start_lease_shim() -> Result<(Arc<ShmClient>, LeaseShim), String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = format!("Local\\Tine.v1.autotune-shim-{}-{n}", std::process::id());
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let len = std::mem::size_of::<ShmLayout>();
-    // SAFETY: `wide` is NUL-terminated; the page file backs the mapping;
-    // the size matches `ShmLayout` exactly.
-    let mapping = match unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            None,
-            PAGE_READWRITE,
-            0,
-            len as u32,
-            windows::core::PCWSTR(wide.as_ptr()),
-        )
-    } {
-        Ok(h) => h,
-        Err(e) => return Err(format!("lease shim: CreateFileMappingW failed: {e}")),
+    let mut created: Option<(String, HANDLE)> = None;
+    for _ in 0..8 {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("Local\\Tine.v1.autotune-shim-{}-{n}", std::process::id());
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is NUL-terminated; the page file backs the mapping;
+        // the size matches `ShmLayout` exactly.
+        let mapping = match unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                windows::core::PCWSTR(wide.as_ptr()),
+            )
+        } {
+            Ok(h) => h,
+            Err(e) => return Err(format!("lease shim: CreateFileMappingW failed: {e}")),
+        };
+        // SAFETY: `GetLastError` reads the thread's last-error value set by
+        // `CreateFileMappingW`.
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // SAFETY: handle returned by `CreateFileMappingW` on collision;
+            // close and retry with a fresh counter value.
+            unsafe { CloseHandle(mapping) }.ok();
+            continue;
+        }
+        created = Some((name, mapping));
+        break;
+    }
+    let Some((name, mapping)) = created else {
+        return Err("lease shim: mapping name collision".to_owned());
     };
     // SAFETY: handle from CreateFileMappingW with a matching size.
     let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, len) };
@@ -833,34 +991,14 @@ fn start_lease_shim() -> Result<(Arc<ShmClient>, LeaseShim), String> {
     let header = unsafe { &(*(view.Value as *const ShmLayout)).header };
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
-    let block = param_block();
     let join = std::thread::Builder::new()
         .name("tine-lease-shim".to_owned())
         .spawn(move || {
-            // The bypass setting to restore when the lease ends (captured
-            // at the first hot observation, i.e. the user's pre-run A/B).
-            let mut restore_bypass: Option<bool> = None;
-            let mut last_gen = 0_u64;
-            let mut params = DspParams::DEFAULT;
             loop {
                 let stop_now = stop_thread.load(Ordering::Acquire);
                 let now = now_ms();
                 let hot = header.bypass_lease_until_ms.load(Ordering::Acquire) > now;
-                if hot {
-                    if block.load_if_changed(&mut last_gen, &mut params) || last_gen == 0 {
-                        restore_bypass.get_or_insert(params.bypass);
-                        if !params.bypass {
-                            params.bypass = true;
-                            block.store(&params);
-                        }
-                    }
-                } else if let Some(was) = restore_bypass.take() {
-                    // The local `params` is the block's current content: while
-                    // the lease was hot this thread was the last writer, so a
-                    // re-assert (controller publish mid-run) is already in it.
-                    params.bypass = was;
-                    block.store(&params);
-                }
+                set_lease_bypass(hot && !stop_now);
                 // Flag mirror: the runner's `confirm_bypass` handshake.
                 let state = header.state.load(Ordering::Relaxed);
                 let wanted = if hot { flags::BYPASS } else { 0 };
@@ -936,9 +1074,10 @@ pub fn monitor_apply(enabled: bool, device: Option<&str>) {
 }
 
 /// [`monitor_apply`] against explicit persistence roots (test seam).
-pub fn monitor_apply_on(paths: &EnginePaths, enabled: bool, device: Option<&str>) {
+pub fn monitor_apply_on(_paths: &EnginePaths, enabled: bool, device: Option<&str>) {
     if !enabled {
         with(|s| {
+            s.monitor_wanted = MonitorWanted::Off;
             if let Some(m) = s.monitor.take() {
                 m.stop();
                 tracing::info!(target: "tine::services", "Hear Myself off (streams stopped)");
@@ -946,26 +1085,33 @@ pub fn monitor_apply_on(paths: &EnginePaths, enabled: bool, device: Option<&str>
         });
         return;
     }
-    let endpoint = service_endpoint(paths);
-    let in_ref = DeviceRef::Id(endpoint.as_str().to_owned());
     let out = device.map_or_else(DeviceRef::default, DeviceRef::parse);
-    with(|s| match &mut s.monitor {
-        Some(m) => {
-            if let Err(e) = m.restart(&in_ref, &out) {
-                s.surface(format!("Hear Myself restart failed: {e}"));
-                s.monitor = None;
+    with(|s| {
+        s.monitor_wanted = MonitorWanted::On(device.map(str::to_owned));
+        let Some(feed) = s.router.as_ref().map(|r| r.router.monitor_feed()) else {
+            if let Some(m) = s.monitor.take() {
+                m.stop();
             }
+            s.surface("Hear Myself will start once audio routing is active".to_owned());
+            return;
+        };
+        match &mut s.monitor {
+            Some(m) => {
+                if let Err(e) = m.restart(&feed, &out) {
+                    s.surface(format!("Hear Myself restart failed: {e}"));
+                    s.monitor = None;
+                }
+            }
+            None => match Monitor::start(&feed, &out) {
+                Ok(m) => {
+                    tracing::info!(target: "tine::services",
+                        latency_ms = m.latency_ms(),
+                        "Hear Myself started");
+                    s.monitor = Some(m);
+                }
+                Err(e) => s.surface(format!("Hear Myself failed to start: {e}")),
+            },
         }
-        None => match Monitor::start(&in_ref, &out) {
-            Ok(m) => {
-                tracing::info!(target: "tine::services",
-                    endpoint = endpoint.as_str(),
-                    latency_ms = m.latency_ms(),
-                    "Hear Myself started");
-                s.monitor = Some(m);
-            }
-            Err(e) => s.surface(format!("Hear Myself failed to start: {e}")),
-        },
     });
 }
 
@@ -982,7 +1128,9 @@ pub fn monitor_status() -> Value {
 /// Auto-Tune mirror and lease shim, the routing loop, and the
 /// visualizer pump. Idempotent.
 pub fn shutdown() {
+    CALIBRATING.store(false, Ordering::Release);
     with(|s| {
+        s.monitor_wanted = MonitorWanted::Off;
         if let Some(m) = s.monitor.take() {
             m.stop();
         }
@@ -1061,6 +1209,9 @@ impl EngineSignals for ClientSignals {
 /// passes the router's rate from inside the services lock (this
 /// function must not re-enter it).
 fn start_visualizer(paths: &EnginePaths, router_rate: Option<u32>) -> Option<(Visualizer, Arc<Triple<UiFrame>>)> {
+    if CALIBRATING.load(Ordering::Acquire) {
+        return None;
+    }
     if let Some(rate_hz) = router_rate {
         let signals = InProcessSignals {
             telemetry: router_telemetry(),
@@ -1088,6 +1239,14 @@ fn start_visualizer(paths: &EnginePaths, router_rate: Option<u32>) -> Option<(Vi
 mod tests {
     use super::*;
 
+    // All `services::tests` share the process-global `SERVICES` / `BLOCK` state,
+    // so serialize them when `cargo test` runs tests in parallel threads.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_test() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn temp_paths() -> EnginePaths {
         // The tempdir's guard drops at test end; the paths only have to
         // outlive this function (all loads from empty dirs return
@@ -1102,6 +1261,7 @@ mod tests {
 
     #[test]
     fn spectrum_stays_on_the_floor_without_a_live_link() {
+        let _guard = lock_test();
         let paths = temp_paths();
         let snap = spectrum_on(&paths);
         assert!(
@@ -1113,6 +1273,7 @@ mod tests {
 
     #[test]
     fn autotune_without_a_link_surfaces_a_message() {
+        let _guard = lock_test();
         let paths = temp_paths();
         super::shutdown();
         autotune_start_on(&paths);
@@ -1126,6 +1287,7 @@ mod tests {
 
     #[test]
     fn autotune_retry_after_a_failed_run_is_not_wedged() {
+        let _guard = lock_test();
         // Regression (T22 QA): a terminal `Failed` state (e.g. the silent-room
         // `NotEnoughSpeech` rejection) used to block every later start as an
         // unnoticed "already running" reject. A retry must proceed: here the
@@ -1151,6 +1313,7 @@ mod tests {
 
     #[test]
     fn autotune_retry_keeps_running_and_pending_states_protected() {
+        let _guard = lock_test();
         let paths = temp_paths();
         super::shutdown();
         // In-flight run: politely rejected, untouched.
@@ -1213,6 +1376,7 @@ mod tests {
 
     #[test]
     fn surface_message_round_trips_through_take_messages() {
+        let _guard = lock_test();
         // Regression (T22 QA, FI-5): a persist failure surfaced by the shell
         // must land in the message queue the next `take_messages` drain
         // consumes (the `status` notes and the window toast), never be
@@ -1227,6 +1391,7 @@ mod tests {
 
     #[test]
     fn autotune_state_and_pending_accessors_are_idle_side_safe() {
+        let _guard = lock_test();
         super::shutdown();
         assert_eq!(autotune_state()["flow"], "idle");
         assert!(autotune_take_pending().is_none());
@@ -1237,6 +1402,7 @@ mod tests {
 
     #[test]
     fn lease_shim_confirms_bypass_and_restores_on_clear() {
+        let _guard = lock_test();
         let (client, _shim) = start_lease_shim().expect("shim standalone");
         tine_engine::autotune::renew_lease(&client, now_ms());
         let block = param_block();
@@ -1275,18 +1441,21 @@ mod tests {
 
     #[test]
     fn monitor_off_tears_down_cleanly() {
+        let _guard = lock_test();
         monitor_apply(false, None);
         assert_eq!(monitor_status()["on"], false);
     }
 
     #[test]
-    fn monitor_start_failure_surfaces_a_user_message() {
+    fn monitor_without_router_defers_and_surfaces_a_user_message() {
+        let _guard = lock_test();
+        super::shutdown();
         let paths = temp_paths();
         monitor_apply_on(&paths, true, Some("__nonexistent_tine_output_device__"));
         assert!(
             take_messages()
                 .iter()
-                .any(|m| m.contains("Hear Myself failed to start"))
+                .any(|m| m.contains("Hear Myself will start once audio routing is active"))
         );
         assert_eq!(monitor_status()["on"], false);
         monitor_apply(false, None);

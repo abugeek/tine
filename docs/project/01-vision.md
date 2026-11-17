@@ -33,16 +33,19 @@ microphone sound broadcast-ready, for *every* app at once, with almost no setup 
    removal, gain and compression automatically.
 3. **Four macro knobs on one line** (Purity, Body, Presence, Leveler) for taste. A **Pro drawer** exposes
    every real parameter for experts. Both edit the same state, so nothing is hidden or duplicated.
-4. **System-wide, no virtual cables** (native Windows APO): Discord, games, OBS and browsers just use the
-   normal microphone, which is now processed.
-5. **Invisible when closed**: the window releases all GPU memory; a tray icon remains.
+4. **System-wide via virtual audio cable (D-018)**: Tine captures your physical microphone, runs the DSP
+   pipeline, and outputs to a virtual audio cable (e.g. VB-Audio Virtual Cable `CABLE Input`). Discord, games,
+   OBS and browsers pick `CABLE Output`.
+5. **Invisible when closed**: closing the window exits the `tine.exe --ui` child process and frees all GPU
+   memory; the lightweight tray parent remains (D-017).
 
 ## Product principles (in priority order)
 
 1. **Never break the user's audio.** A crash, glitch or dropout in voice chat is worse than no processing.
    Real-time safety beats features.
 2. **Sound good with zero knowledge.** Defaults + Auto-Tune must beat the raw mic for every archetype.
-3. **Weightless.** Targets: < 8 MB RSS and < 0.5 % CPU with the UI closed; 0 VRAM when the window is closed.
+3. **Weightless.** Targets: < 12 MB working set (< 4 MB private bytes, hard 20 MB) and < 0.5 % CPU with the UI
+   closed; 0 VRAM when the window is closed (D-017).
 4. **Honest controls.** Every macro maps to real, inspectable parameters.
 5. **Open and portable.** Open-source; Windows first, with DSP kept platform-neutral so macOS/Linux can follow.
 
@@ -56,5 +59,5 @@ microphone sound broadcast-ready, for *every* app at once, with almost no setup 
 ## Success criteria for v0.1
 
 - A first-time user goes from install → better-sounding mic in Discord in **under 2 minutes**.
-- 30-minute soak with zero dropouts; processing latency ≤ 12 ms (RNNoise frame + limiter lookahead).
+- 30-minute soak with zero dropouts; added DSP latency ≤ 21.6 ms at 48 kHz (1036 samples: RNNoise 480-sample FIFO + 480-sample OLA synthesis delay + 76-sample limiter lookahead/FIR, D-019).
 - Blind A/B: listeners prefer Tine-processed audio for each of the 4 archetypes over raw.

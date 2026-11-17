@@ -61,6 +61,12 @@ pub const PROGRESS_HZ: u32 = 30;
 /// giving up (the APO publishes state at ~60 Hz while processing).
 pub const BYPASS_CONFIRM_TIMEOUT_MS: u64 = 2_000;
 
+/// Overall hard wall-clock deadline for a complete Auto-Tune run (20 s).
+pub const HARD_DEADLINE_MS: u64 = 20_000;
+
+/// Maximum time without receiving any capture samples before aborting (2.5 s).
+pub const NO_PROGRESS_TIMEOUT_MS: u64 = 2_500;
+
 /// Inter-stream ring between the capture callback (producer) and the runner
 /// thread (consumer): 16,384 samples ≈ 341 ms at 48 kHz.
 pub const CAPTURE_RING: usize = 16_384;
@@ -270,6 +276,9 @@ pub enum AutoTuneError {
     /// The report was produced but the controller channel was closed.
     #[error("controller unreachable; calibration not applied")]
     ControllerUnreachable,
+    /// Auto-Tune exceeded the hard deadline or stopped receiving audio.
+    #[error("auto-tune timed out")]
+    TimedOut,
 }
 
 /// Event stream of a running Auto-Tune wizard.
@@ -369,7 +378,7 @@ impl AutoTuneRunner {
 }
 
 // ---------------------------------------------------------------------------
-// Lease helpers (shared-memory header writes; TODO(T21): APO reader side)
+// Lease helpers (shared-memory header writes; read by `tine-app`'s `LeaseShim` under D-018)
 // ---------------------------------------------------------------------------
 
 /// Current wall-clock time in epoch milliseconds.
@@ -426,10 +435,22 @@ fn run(
 ) {
     // Lease from the very first instruction: the APO must be bypassed before
     // the capture opens, and a crash anywhere below self-heals within LEASE_MS.
+    let hard_deadline = std::time::Instant::now() + Duration::from_millis(HARD_DEADLINE_MS);
     renew_lease(&client, now_ms());
 
     let outcome: Result<CalibrationReport, AutoTuneOutcome> = match confirm_bypass(&client) {
-        Ok(()) => capture_phase(&client, capture, &factory, preset, macros, pins, current, tx, cancel),
+        Ok(()) => capture_phase(
+            &client,
+            capture,
+            &factory,
+            preset,
+            macros,
+            pins,
+            current,
+            tx,
+            cancel,
+            hard_deadline,
+        ),
         Err(err) => Err(AutoTuneOutcome::Error(err)),
     };
 
@@ -485,6 +506,7 @@ fn capture_phase(
     current: DspParams,
     tx: &Sender<AutoTuneEvent>,
     cancel: &AtomicBool,
+    hard_deadline: std::time::Instant,
 ) -> Result<CalibrationReport, AutoTuneOutcome> {
     let mut source: Box<dyn SampleSource> = match capture {
         CaptureSpec::Device { device, want_rate } => match DeviceCapture::open(&device, want_rate) {
@@ -506,6 +528,8 @@ fn capture_phase(
     let progress_period = Duration::from_nanos(1_000_000_000 / u64::from(PROGRESS_HZ));
     let mut last_progress_sent = last_progress_anchor(progress_period);
     let mut last_renew = std::time::Instant::now();
+    let mut last_audio_at = std::time::Instant::now();
+    let no_progress_timeout = Duration::from_millis(NO_PROGRESS_TIMEOUT_MS);
     let mut last_phase: Option<CalPhase> = None;
     #[allow(unused_assignments)] // the open-loop initializer exists for the (impossible) empty-read path
     let mut final_progress: Option<CalProgress> = None;
@@ -517,6 +541,9 @@ fn capture_phase(
         if source.has_error() {
             return Err(AutoTuneOutcome::Error(AutoTuneError::StreamLost));
         }
+        if std::time::Instant::now() >= hard_deadline {
+            return Err(AutoTuneOutcome::Error(AutoTuneError::TimedOut));
+        }
 
         // Lease renewal: never let the deadline drift closer than LEASE_MS -
         // RENEW_MS even when the calibrator stalls on a huge chunk.
@@ -527,11 +554,15 @@ fn capture_phase(
 
         let got = source.read(&mut buffer);
         if got == 0 {
+            if last_audio_at.elapsed() >= no_progress_timeout {
+                return Err(AutoTuneOutcome::Error(AutoTuneError::TimedOut));
+            }
             // Nothing new yet: a short poll keeps the UI latency low without
             // spinning (the RT producer runs on its own callback cadence).
             std::thread::sleep(Duration::from_millis(4));
             continue;
         }
+        last_audio_at = std::time::Instant::now();
 
         let chunk: &[f32] = buffer.get(..got).map_or(&buffer[..0], |c| c);
         let progress = calibrator.push(chunk);

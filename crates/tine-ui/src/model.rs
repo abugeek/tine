@@ -285,4 +285,6 @@ pub struct UiModel {
     pub autotune: AutoTuneUi,
     /// Whether to show the first-run onboarding overlay.
     pub first_run: bool,
+    /// Optional dismissible status or error banner shown in the main view.
+    pub status_banner: Option<String>,
 }

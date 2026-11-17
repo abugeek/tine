@@ -194,6 +194,87 @@ fn nan_injection_latches_passthrough_and_reset_clears() {
 }
 
 #[test]
+fn bypass_applies_smoothed_input_gain() {
+    let fs = 48_000.0;
+    let mut pipe = DspPipeline::new(fs, 512);
+    let latency = pipe.latency_samples() as usize;
+
+    let mut params = DspParams::DEFAULT;
+    params.bypass = true;
+    params.input_gain_db = 6.0;
+
+    // Settle both bypass_smoother and dry_gain_smoother.
+    let mut settle = vec![0.0f32; 9600];
+    for chunk in settle.chunks_mut(480) {
+        pipe.process(chunk, &params, &mut NoMeters, &mut NoTap);
+    }
+
+    let imp_len = 4096;
+    let imp_pos = 100usize;
+    let input = common::impulse(imp_len, imp_pos, 0.25);
+    let mut output = input.clone();
+    for chunk in output.chunks_mut(480) {
+        pipe.process(chunk, &params, &mut NoMeters, &mut NoTap);
+    }
+
+    let expected_gain = 10f32.powf(6.0 / 20.0);
+    let expected_peak = 0.25 * expected_gain;
+    let (peak_idx, peak_val) = output
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .expect("non-empty");
+    assert_eq!(peak_idx, imp_pos + latency);
+    assert!(
+        (peak_val - expected_peak).abs() < 1e-4,
+        "bypassed peak {peak_val} vs expected {expected_peak}"
+    );
+}
+
+#[test]
+fn nan_injection_auto_recovers_after_48000_clean_samples() {
+    let fs = 48_000.0;
+    let mut pipe = DspPipeline::new(fs, 512);
+    let params = DspParams::DEFAULT;
+
+    // Trigger PASSTHROUGH_LATCHED with a single NaN.
+    let mut nan_buf = vec![0.1f32; 480];
+    nan_buf[0] = f32::NAN;
+    pipe.process(&mut nan_buf, &params, &mut NoMeters, &mut NoTap);
+    assert!(pipe.is_passthrough_latched());
+
+    // 47,520 clean samples are not enough to auto-recover.
+    let mut almost = vec![0.1f32; 47_520];
+    for chunk in almost.chunks_mut(480) {
+        pipe.process(chunk, &params, &mut NoMeters, &mut NoTap);
+    }
+    assert!(pipe.is_passthrough_latched());
+
+    // Another Inf resets the consecutive clean counter.
+    let mut inf_buf = vec![0.1f32; 480];
+    inf_buf[479] = f32::INFINITY;
+    pipe.process(&mut inf_buf, &params, &mut NoMeters, &mut NoTap);
+    assert!(pipe.is_passthrough_latched());
+
+    // Feed 47,520 clean samples: still latched.
+    let mut almost2 = vec![0.1f32; 47_520];
+    for chunk in almost2.chunks_mut(480) {
+        pipe.process(chunk, &params, &mut NoMeters, &mut NoTap);
+    }
+    assert!(pipe.is_passthrough_latched());
+
+    // 480 more clean samples reach 48,000 consecutive clean samples -> auto-recover.
+    let mut final_chunk = vec![0.1f32; 480];
+    let mut meters = RecordingMeters::default();
+    pipe.process(&mut final_chunk, &params, &mut meters, &mut NoTap);
+    assert!(!pipe.is_passthrough_latched());
+    assert!(final_chunk.iter().all(|s| s.is_finite()));
+    if let Some(last) = meters.frames.last() {
+        assert_eq!(last.flags & flags::PASSTHROUGH_LATCHED, 0);
+    }
+}
+
+#[test]
 fn zero_allocations_over_10000_random_blocks() {
     let fs = 48_000.0;
     let max_block = 512usize;

@@ -27,7 +27,7 @@ use tine_engine::autotune::{AutoCalibratorFactory, CaptureSpec, SampleSource};
 use tine_engine::controller::{Controller, EngineConfig};
 use tine_engine::model::{EndpointId, Macro as EngineMacro, resolve};
 use tine_engine::paths::EnginePaths;
-use tine_engine::persist::{self, Loaded};
+use tine_engine::persist;
 use tine_engine::shm_client::ShmClient;
 use tine_engine::visualizer::InProcessSignals;
 use tine_protocol::params::{DspParams, ParamId};
@@ -260,12 +260,7 @@ impl RecordingMonitorHost {
 }
 
 impl MonitorHost for RecordingMonitorHost {
-    fn apply(
-        &mut self,
-        enabled: bool,
-        _endpoint: &tine_engine::audio_io::DeviceRef,
-        output: Option<&str>,
-    ) -> Result<f32, String> {
+    fn apply(&mut self, enabled: bool, output: Option<&str>) -> Result<f32, String> {
         match self.calls.lock() {
             Ok(mut c) => {
                 c.push((enabled, output.map(str::to_owned)));
@@ -503,14 +498,6 @@ fn intents_flow_to_params_and_files_and_frames_flow_to_live_state() {
     );
     assert_eq!(profile.overrides.denoise_mix, Some(0.9));
     assert_eq!(profile.macros.purity, 0.1);
-    assert!(matches!(
-        persist::load_boot_params(MIC_A, &app.paths),
-        Loaded::Fresh(_) | Loaded::Missing(_)
-    ));
-    assert!(
-        app.paths.boot_params_file(MIC_A).exists(),
-        "boot params for the APO-side file"
-    );
 
     // A/B bypass: the toggle intent flips the engine model.
     app.bridge.dispatch(Intent::ToggleBypass);
@@ -521,7 +508,11 @@ fn intents_flow_to_params_and_files_and_frames_flow_to_live_state() {
         "A/B toggle reaches the published snapshot"
     );
 
-    // Not the first run anymore: settings exist now.
+    // Saving settings before OnboardingDone keeps first_run == true.
+    assert!(app.bridge.first_run());
+    let mut settings = persist::load_settings(&app.paths).into_value();
+    settings.onboarding_completed = true;
+    persist::save_settings(&settings, &app.paths).expect("save onboarding_completed");
     assert!(!app.bridge.first_run());
 }
 
@@ -596,14 +587,15 @@ fn endpoint_selection_creates_and_persists_a_new_profile() {
         app.pump_until(Duration::from_secs(2), |app| app.bridge.app_model().is_some()),
         "controller pushes its first model"
     );
-    // Bad index: surfaced user message (no silent failure).
-    app.bridge.dispatch(Intent::SelectEndpoint(7));
+    // Unknown endpoint ID: surfaced user message (no silent failure).
+    app.bridge
+        .dispatch(Intent::SelectEndpoint("nonexistent-mic".to_owned()));
     assert!(
         app.bridge.take_messages().iter().any(|m| m.contains("disappeared")),
-        "an out-of-range pick surfaces a message, not a panic"
+        "an unknown endpoint pick surfaces a message, not a panic"
     );
 
-    app.bridge.dispatch(Intent::SelectEndpoint(1));
+    app.bridge.dispatch(Intent::SelectEndpoint(MIC_B.to_owned()));
     assert!(app.pump_until(Duration::from_secs(2), |app| {
         app.bridge
             .app_model()
@@ -710,10 +702,6 @@ fn autotune_wizard_applies_calibration_through_apply_intent() {
             .is_some(),
         "calibration persisted"
     );
-    let boot = persist::load_boot_params(MIC_A, &app.paths).into_value();
-    let live = *app.bridge.params();
-    assert_eq!(boot.gate_threshold_db, live.gate_threshold_db);
-    assert_eq!(boot.denoise_mix, live.denoise_mix);
     drop(apo);
 }
 
@@ -732,6 +720,13 @@ fn state_survives_reboot() {
             "pro edit published"
         );
         app.settle();
+        assert!(
+            app.bridge.first_run(),
+            "saving settings before OnboardingDone keeps first_run == true"
+        );
+        let mut settings = persist::load_settings(&paths).into_value();
+        settings.onboarding_completed = true;
+        persist::save_settings(&settings, &paths).expect("save onboarding_completed");
         // Scope drop: every `ControllerHandle` goes away → the controller
         // thread flushes and exits (a tine.exe reboot).
     }
@@ -739,7 +734,7 @@ fn state_survives_reboot() {
     let mut rebooted = Harness::new("reboot", &paths, MIC_A, None);
     assert!(
         !rebooted.bridge.first_run(),
-        "settings exist: not the first run anymore"
+        "onboarding_completed survived: not the first run anymore"
     );
     assert!(rebooted.pump_until(Duration::from_secs(2), |app| app.bridge.app_model().is_some()));
     rebooted.bridge.refresh_endpoints();
@@ -783,11 +778,12 @@ fn failures_surface_and_the_visualizer_follows_visibility() {
         "the missing link is surfaced to the user"
     );
 
-    // Out-of-range pick: surfaced.
-    app.bridge.dispatch(Intent::SelectEndpoint(9));
+    // Unknown endpoint ID: surfaced.
+    app.bridge
+        .dispatch(Intent::SelectEndpoint("nonexistent-mic".to_owned()));
     assert!(app.bridge.take_messages().iter().any(|m| m.contains("disappeared")));
 
-    // Parent-side service seams behave identically (no mapping here).
+    // Parent-side service seams behave identically (no mapping/router here).
     services::shutdown();
     services::autotune_start_on(&app.paths);
     assert!(
@@ -800,7 +796,7 @@ fn failures_surface_and_the_visualizer_follows_visibility() {
     assert!(
         services::take_messages()
             .iter()
-            .any(|m| m.contains("Hear Myself failed to start"))
+            .any(|m| m.contains("Hear Myself will start once audio routing is active"))
     );
     services::monitor_apply(false, None);
 

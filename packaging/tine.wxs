@@ -4,11 +4,9 @@
   Decision D-030: under the D-018 virtual-cable topology there is NO APO DLL and
   NO COM registration in this installer. It only:
     - copies tine.exe + the dual-license texts to ProgramFiles64Folder\Tine\
-    - creates ProgramData\Tine\endpoints\ with a Users-modify ACL
-      (the unelevated app persists per-endpoint boot params there, D-022)
     - adds an all-users Start-menu shortcut
     - writes the HKCU Run autostart value (D-025): quoted exe path + the
-      "-background" flag
+      background flag (see AutostartRunKey)
     - stops a running tine.exe so upgrades replace the file without a reboot
   Uninstall removes app files, the shortcut and the Run key. User data
   (APPDATA\Tine, LOCALAPPDATA\Tine, ProgramData\Tine) is KEPT by default;
@@ -46,10 +44,18 @@
 
     <SummaryInformation Description="Tine microphone conditioner $(var.Version) (virtual-cable routing)" />
 
-    <!-- Windows 10 22H2+ / Windows 11, x64 (D-001); InstallerVersion 500 ships
-         with Win7+, so the launch gate is only about the 64-bit OS floor. -->
+    <!-- Windows 10 22H2+ (build 19045) / Windows 11, x64 (D-001); VersionNT64
+         is 603 for Win8.1/10/11, so CURRENTBUILD distinguishes Win10 22H2+. -->
+    <Property Id="CURRENTBUILD">
+      <RegistrySearch Id="FindCurrentBuildNumber"
+                      Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentBuildNumber"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
     <Launch Message="Tine requires a 64-bit Windows 10 (22H2 or newer) or Windows 11."
-            Condition="Installed OR VersionNT64 &gt;= 603" />
+            Condition="Installed OR (VersionNT64 &gt;= 603 AND CURRENTBUILD &gt;= 19045)" />
 
     <MajorUpgrade Schedule="afterInstallValidate"
                  DowngradeErrorMessage="A newer version of Tine is already installed. Uninstall that version first." />
@@ -83,14 +89,6 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLDIR" Name="Tine">
         <Directory Id="LicenseDir" Name="license" />
-      </Directory>
-    </StandardDirectory>
-
-    <!-- Machine-wide data. The endpoints\ ACL is the whole point (D-022):
-         the user-session app runs unelevated and writes boot params here -->
-    <StandardDirectory Id="CommonAppDataFolder">
-      <Directory Id="TineProgramDataDir" Name="Tine">
-        <Directory Id="EndpointsDataDir" Name="endpoints" />
       </Directory>
     </StandardDirectory>
 
@@ -135,22 +133,6 @@
       </Component>
       <Component Id="LicenseApache" Directory="LicenseDir" Bitness="always64">
         <File Id="license_apache.txt" Source="$(var.RepoDir)\LICENSE-APACHE" KeyPath="yes" />
-      </Component>
-
-      <!-- ProgramData\Tine root (default inherited ACL). -->
-      <Component Id="ProgramDataRoot" Directory="TineProgramDataDir" Bitness="always64">
-        <CreateFolder />
-        <RegistryValue Root="HKLM" Key="Software\Tine" Name="ProgramDataRoot"
-                       Type="integer" Value="1" KeyPath="yes" />
-      </Component>
-
-      <!-- ProgramData\Tine\endpoints with Users: modify (D-030). -->
-      <Component Id="EndpointsData" Directory="EndpointsDataDir" Bitness="always64">
-        <CreateFolder>
-          <util:PermissionEx User="Users" GenericAll="yes" />
-        </CreateFolder>
-        <RegistryValue Root="HKLM" Key="Software\Tine" Name="EndpointsData"
-                       Type="integer" Value="1" KeyPath="yes" />
       </Component>
 
       <!-- Autostart (D-025): HKCU Run value is the source of truth; install

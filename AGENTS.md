@@ -14,11 +14,11 @@ Tine is an ultra-lightweight, native, open-source microphone DSP (Digital Signal
 ### Non-Negotiable Engineering Constraints
 
 - **Universal Microphone Adaptability**: Tine must make any microphone (Dynamic USB/XLR, Condenser, Headset/Lapel, or Webcam/Laptop mic) sound broadcast-ready using a combination of Hardware Archetype Base Curves, an 8-Second Auto-Calibration Wizard, and a Dual-Tier UI (Golden Line Macro Mode vs. Surgical Pro Mode).
-- **Never Break the User's Audio**: The DSP runs inside Windows' `audiodg.exe` (D-004). A panic, NaN or hang there silences *all* system audio. Every APO entry point is wrapped in `catch_unwind`; any fault latches the APO into pass-through.
-- **Real-Time Audio Safety**: Every real-time path (`APOProcess` in `tine-apo`, `DspPipeline::process` in `tine-dsp`, cpal callbacks in `tine-engine`/`tine-devhost`) must be 100% lock-free, allocation-free and panic-free. Zero `Mutex::lock()`, `RwLock`, `Vec::push()`, `Box::new()`, logging, or syscalls inside the audio callback. Enforced with `assert_no_alloc` in tests and `clippy::{unwrap_used, expect_used, panic, indexing_slicing}` denied in RT crates.
-- **Zero Idle GPU/UI Footprint**: One user-side process, `tine.exe` (D-002): tray + control plane always on, Rune window on demand. Closing the window must destroy the window **and** the `wgpu` device/surface and release all VRAM. With the window closed `tine.exe` targets < 8 MB RAM (hard limit 20 MB) and < 0.5 % CPU.
-- **Efficient From Day One**: Every performance budget in [`docs/project/09-engineering-standards.md` §7](docs/project/09-engineering-standards.md#7-performance-budgets-ci-enforced-where-marked-) is a requirement, not a wish. The key ones: < 150 µs per 480-sample frame for the whole DSP, zero allocations on RT paths, `tine_apo.dll` < 2 MB, and cold start to tray < 150 ms. CI enforces the measurable ones.
-- **Rate-Agnostic Pipeline, 48 kHz Native** (D-006): DSP runs on mono `f32`. 48 kHz is the native rate (matches `nnnoiseless`'s 480-sample / 10 ms frame). The APO cannot choose the endpoint rate, so every stage designs coefficients from the actual sample rate. Only the denoiser resamples to/from 48 kHz when needed.
+- **Never Break the User's Audio**: Every audio callback is panic-free; any NaN/Inf in the DSP resets state and latches pass-through so the user's mic never silences or clips. (v0.1 runs in the user session via virtual-cable routing per D-018, never inside `audiodg.exe`.)
+- **Real-Time Audio Safety**: Every real-time path (`DspPipeline::process` in `tine-dsp`, `cpal` callbacks in `tine-engine`/`tine-devhost`) must be 100% lock-free, allocation-free and panic-free. Zero `Mutex::lock()`, `RwLock`, `Vec::push()`, `Box::new()`, logging, or syscalls inside the audio callback. Enforced with `assert_no_alloc` in tests and `clippy::{unwrap_used, expect_used, panic, indexing_slicing}` denied in RT crates.
+- **Zero Idle GPU/UI Footprint**: `tine.exe` (D-017) keeps a lightweight tray + control plane + audio router parent always on, and spawns `tine.exe --ui` as a short-lived child process when the window opens. Closing the window exits `tine.exe --ui` and releases all `wgpu`/DX12 VRAM. With the window closed `tine.exe` targets < 12 MB Working Set (< 4 MB Private Bytes, hard limit 20 MB) and < 0.5 % CPU.
+- **Efficient From Day One**: Every performance budget in [`docs/project/09-engineering-standards.md` §7](docs/project/09-engineering-standards.md#7-performance-budgets-ci-enforced-where-marked-) is a requirement, not a wish. Key budgets: < 150 µs per 480-sample frame for the whole DSP, zero allocations on RT paths, `tine.exe` < 24 MiB (R-23), added DSP latency ≤ 21.6 ms at 48 kHz (1036 samples, D-019), and cold start to tray < 150 ms. CI enforces the measurable ones.
+- **Rate-Agnostic Pipeline, 48 kHz Native** (D-006): DSP runs on mono `f32`. 48 kHz is the native rate (matches `nnnoiseless`'s 480-sample / 10 ms frame). Every stage designs coefficients from the actual sample rate; only the denoiser resamples to/from 48 kHz when needed.
 
 ---
 
@@ -27,11 +27,11 @@ Tine is an ultra-lightweight, native, open-source microphone DSP (Digital Signal
 Full detail: [`docs/project/02-architecture.md`](docs/project/02-architecture.md).
 
 ```text
-audiodg.exe (Windows, LocalService)            tine.exe (user session, single process)
-  mic driver ─► [vendor APO, wrapped]            tray + control plane (always on)
-            ─► [tine_apo.dll = tine-dsp] ◄──────► Global\ shared memory: params ►, ◄ telemetry + audio tap
-            ─► every app using the mic            Auto-Tune capture, "Hear Myself" monitor (cpal)
-                                                  Rune window (created on open, dropped on close)
+tine.exe (user session, always-on parent)                 tine.exe --ui (child, on-demand)
+  mic (cpal) ─► [VirtualCableRouter = tine-dsp]            Rune window + wgpu DX12 surface
+             ─► "CABLE Input" (virtual cable)              exits on close (0 VRAM when closed)
+             ─► apps pick "CABLE Output" (D-018)             ▲
+  tray + controller + visualizer + monitor (cpal) ───────────┴── \\.\pipe\tine-<user-sid>
 ```
 
 ```text
@@ -43,20 +43,17 @@ tine/
 ├── crates/
 │   ├── tine-protocol/         # no_std: params & ranges (single source of truth), lock-free primitives, repr(C) shm layout, telemetry, serde types
 │   ├── tine-dsp/              # no_std + alloc: DSP primitives, 7-stage pipeline, response curve, MacroMapper, presets (const), AutoCalibrator
-│   ├── tine-apo/              # cdylib → tine_apo.dll: COM APO hosting tine-dsp inside audiodg.exe
-│   ├── tine-engine/           # Control plane: shm client, controller, persistence, cpal I/O, spectrum, Auto-Tune runner, monitor, APO admin
+│   ├── tine-engine/           # Control plane + router: cpal I/O, VirtualCableRouter, controller, persistence, spectrum, Auto-Tune runner, monitor
 │   ├── tine-ui/               # Anomaly Rune views, view model, theme, headless scenes (pure; no engine dependency)
-│   ├── tine-app/              # bin `tine.exe`: Rune App (windowless, release GPU on close) + rune::Tray + CLI + elevated helper
-│   └── tine-devhost/          # bin: cpal mic → DSP → headphones harness for development without the APO
-├── spikes/                    # Throwaway spike crates (T02, T03), not default members
+│   ├── tine-app/              # bin + lib `tine.exe`: parent tray/router + `--ui` child spawner + CLI + `ui_bridge`
+│   └── tine-devhost/          # bin: cpal mic → DSP → headphones harness for development
 └── assets/
     └── presets/               # Built-in archetype JSON (mirrored by const tables in tine-dsp)
 ```
 
-Dependency direction (CI-enforced, no cycles): `protocol ← dsp ← {apo, engine, ui}`, `protocol ← ui`, `{engine, ui} ← app`, `{dsp, engine} ← devhost`.
+Dependency direction (CI-enforced, no cycles): `protocol ← dsp ← {engine, ui}`, `protocol ← ui`, `{engine, ui} ← app`, `{dsp, engine} ← devhost`.
 - `tine-dsp` never depends on `windows`, `cpal`, `serde_json`, `rune`, or anything that allocates at runtime.
 - `tine-ui` never depends on `tine-engine`, `cpal` or `windows`.
-- `tine-apo` never depends on `cpal`, `rune` or `tine-engine`.
 
 The module map (which task owns which file) and each crate's manifest are in [`docs/project/02-architecture.md` §2](docs/project/02-architecture.md#2-cargo-workspace--module-map).
 
@@ -133,7 +130,7 @@ Because every microphone capsule and room environment is different, Tine never h
 
 ### Layer B: The 8-Second Auto-Calibration Wizard ("Tune My Mic")
 
-`tine.exe` puts the APO in bypass, captures the raw mic, and feeds the pure `AutoCalibrator` state machine:
+`tine.exe` puts the DSP in bypass (via the session-local Auto-Tune lease, D-029), captures the raw mic (via the tap in D-018), and feeds the pure `AutoCalibrator` state machine:
 
 1. **Phase 1 — Room Noise Floor (3 Seconds of Silence):**
    - Measure peak and RMS dBFS of ambient room noise.
@@ -175,12 +172,12 @@ Every audio buffer passes through this deterministic chain in order. Parameter t
    │     Band 5: High-Shelf (Air ~8.5kHz)
    ├─► Stage 4: Dynamic Split-Band De-Esser (sidechain 5.5–9.5 kHz, GR on high band only)
    ├─► Stage 5: Program-Dependent Vocal Compressor (RMS/Peak, soft knee 6 dB, auto-makeup)
-   ├─► Stage 6: Brickwall Lookahead Limiter (1.5 ms lookahead, ceiling -1.0 dBFS)
+   ├─► Stage 6: Brickwall Lookahead Limiter (1.5 ms lookahead + 4-sample FIR delay = 76 samples, ceiling -1.0 dBFS)
    └─► Stage 7: Metering Tap — meters + GR to telemetry; post-limiter samples to a tap ring.
-         The 32-band spectrum is computed in tine.exe from the tap, never inside audiodg.
+         The 32-band spectrum is computed outside the RT audio callback by the visualizer service.
 ```
 
-Performance contract: 480 samples, all stages on, < 150 µs on one core, zero heap allocations after `DspPipeline::new`. Output is always finite (NaN/Inf → reset + pass-through latch).
+Added pipeline latency at 48 kHz: **1036 samples (21.58 ms)** (D-019: 960 denoiser + 76 limiter). Performance contract: 480 samples, all stages on, < 150 µs on one core, zero heap allocations after `DspPipeline::new`. Output is always finite (NaN/Inf → reset + pass-through latch).
 
 ---
 
@@ -240,7 +237,7 @@ Full detail: [`docs/project/05-ui-ux.md`](docs/project/05-ui-ux.md).
 ### Visual Layout & UX Requirements
 
 - **Top Header Bar**:
-  - Input Device Selector (Dropdown of physical mics) + **APO status badge** (`Active` / `Not installed` / `Inactive` / `Error`, with Install/Repair action). There is no output-target selector: the APO processes the mic itself (D-004, D-008).
+  - Input Device Selector (Dropdown of physical mics) + **Virtual-Cable status badge** (`Active` / `Cable missing` / `Inactive` / `Error`, D-018). There is no output-target selector: `tine-engine` automatically routes to `CABLE Input` (D-008, D-018).
   - Archetype Selector Pill (Dynamic, Condenser, Headset, Laptop) + `"Auto-Tune (8s)"` button.
   - `"Hear Myself"` (Monitor Toggle) with latency warning badge & A/B Bypass Toggle (hotkey `Space` while window focused to compare Raw vs. Tine).
 - **Center Canvas — "The Golden Line"**:
@@ -261,16 +258,14 @@ Any agent modifying `tine-ui` must execute this self-check loop before marking a
 
 ---
 
-## 7. Windows Output Routing Strategy (D-004)
+## 7. Windows Output Routing Strategy (D-018, supersedes D-004)
 
-**v0.1 — Native Windows APO (no virtual cable).** `tine-dsp` is compiled into `tine_apo.dll`, a COM Audio Processing Object (`IAudioProcessingObject`, `IAudioProcessingObjectRT`, `IAudioProcessingObjectConfiguration`, `IAudioSystemEffects`*), registered as a stream/endpoint effect in the selected capture endpoint's `FxProperties`. Every app that opens that microphone (Discord, CS2, OBS, browsers) receives processed audio.
+**v0.1 — Virtual-cable output from `tine-engine` (no native APO).** T02 proved an unsigned Rust COM APO (`apo_spike.dll`) is not loaded by `audiodg.exe` via `FxProperties` on stock Windows 11 24H2+. Under **D-018** and **D-029**, `tine-engine`'s `VirtualCableRouter` captures the physical mic via `cpal` WASAPI, runs `DspPipeline`, and outputs to `CABLE Input (VB-Audio Virtual Cable)`. Every app (Discord, CS2, OBS, browsers) selects `CABLE Output` as its microphone.
 
-- **Install / repair / uninstall** run through `tine.exe --elevated-helper` (one UAC prompt). They back up and restore the original `FxProperties` values exactly, wrap any existing vendor APO so its effects are preserved, and check the APO loaded (shm heartbeat) within 5 s, rolling back on failure.
-- **Health check**: on startup and on device/property change, detect when Windows Update or a driver update removed the registration, and offer one-click repair.
-- **Boot params**: last `DspParams` per endpoint are kept in `%ProgramData%\Tine\endpoints\{guid}.json` so processing is correct even when `tine.exe` isn't running.
-- **"Hear Myself"**: `tine.exe` captures the processed endpoint with cpal and plays it to the chosen headphones.
-- **Known limits**: apps opening the mic in RAW or exclusive mode bypass APOs.
-- **Gate**: task T02 (APO feasibility spike) must pass first. If a Rust APO cannot load on stock Windows 11, record a new decision and fall back to virtual-sink routing (`tine-engine` auto-binds to `CABLE Input (VB-Audio Virtual Cable)` and outputs processed audio there).
+- **No runtime elevation**: `tine.exe` runs entirely in the user session. Per-endpoint boot params are persisted in `%ProgramData%\Tine\endpoints\{guid}.json` (Users: modify ACL created by the MSI, D-030).
+- **Auto-Tune**: `services` hosts a session-local `Local\Tine.v1.autotune-shim-*` bypass lease and feeds the calibrator from the routing tap while bypassed (D-029).
+- **"Hear Myself"**: `tine.exe` monitors the microphone *input* signal to the chosen headphones via `cpal` (processed-capture monitoring requires WASAPI render-loopback, deferred post-v0.1; D-029).
+- **Known limits**: apps opening the mic in exclusive mode bypass shared-mode capture and must point to `CABLE Output`. A driver-packaged/signed APO is deferred post-v0.1.
 
 ---
 
