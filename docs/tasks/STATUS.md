@@ -23,5 +23,5 @@
 | T19 | Header + Golden Line canvas | D — UI | done | `task/T19-ui-main-screen` | #18 | t19 (GLM) |
 | T20 | Pro rack, Auto-Tune overlay, onboarding | D — UI | done | `task/T20-ui-pro-autotune-onboarding` | #21 | t20 (GLM) |
 | T21 | End-to-end integration in `tine.exe` | Z — Integration & ship | done | `task/T21-end-to-end` | #24 | t21 (GLM) |
-| T22 | QA: soak, perf, mic/app matrix, listening tests | Z — Integration & ship | todo | — | — | — |
+| T22 | QA: soak, perf, mic/app matrix, listening tests | Z — Integration & ship | done | `task/T22-qa` | #31 | t22 (GLM) |
 | T23 | Installer, signing, release, OSS docs | Z — Integration & ship | done | `task/T23-packaging-release` | #29 | t23 (GLM) |
