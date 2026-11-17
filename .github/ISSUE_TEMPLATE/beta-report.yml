@@ -1,0 +1,158 @@
+name: Beta report
+description: File your Tine v0.1.0-beta experience (Community beta, task T22)
+title: "[beta] <your mic> on <your Windows version>"
+labels: ["beta-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing the Tine beta! This template feeds the release coverage matrix
+        (docs/tasks/T22-qa-soak-perf.md → docs/project/10-qa-report.md).
+
+        Before you start: install the `v0.1.0-beta.N` pre-release, pick "Install/start"
+        below, run onboarding + Auto-Tune, then use the mic from your usual apps
+        (Discord, a game, a browser call) for about 15 minutes.
+
+        Two attachments make the report usable — please add both:
+        1. Diagnostics: run `tine diag` (tray → "Copy diagnostics" or the CLI) and attach the zip.
+        2. Soak report: run `tine soak --minutes 15 --report soak-15m.json` and attach the JSON.
+        Neither contains audio or personal data.
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Windows version
+      options:
+        - Windows 10 22H2
+        - Windows 11 23H2
+        - Windows 11 24H2
+        - Windows 11 25H2+
+        - Other (say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: mic-type
+    attributes:
+      label: Microphone type
+      description: Which archetype are you testing? (Multi-select if you tried several mics.)
+      multiple: true
+      options:
+        - Dynamic USB/XLR
+        - Condenser USB (QuadCast, Yeti, …)
+        - Headset boom ( wired )
+        - Laptop / webcam mic
+        - Bluetooth headset (HFP/HSP)
+        - Other (say which below)
+    validations:
+      required: true
+  - type: input
+    id: mic-model
+    attributes:
+      label: Microphone make & model
+      placeholder: "e.g. Shure MV7, HyperX QuadCast, laptop built-in"
+    validations:
+      required: true
+  - type: dropdown
+    id: endpoint-audio-stack
+    attributes:
+      label: On-board audio / vendor DSP on this endpoint
+      description: We need Realtek/Nahimic/Dolby/Sonar coverage for release.
+      options:
+        - Realtek (on-board jack)
+        - Nahimic / MSI Audio
+        - Dolby (Atmos / Digital)
+        - SteelSeries Sonar
+        - Razer Synapse
+        - None / unknown
+        - Other (say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install & onboarding result
+      options:
+        - Installed, onboarding + Auto-Tune all worked first try
+        - Installed, but needed a retry / workaround (explain below)
+        - Install or onboarding failed (explain below)
+    validations:
+      required: true
+  - type: dropdown
+    id: autotune
+    attributes:
+      label: Auto-Tune (8 s wizard) result
+      options:
+        - Applied a result that sounded good
+        - Applied a result that sounded worse than before (details below)
+        - Failed (e.g. "too quiet", "not enough speech")
+    validations:
+      required: true
+  - type: input
+    id: autotune-numbers
+    attributes:
+      label: Auto-Tune reported numbers (if shown)
+      placeholder: "e.g. speech RMS -18 dBFS, peak -4.5 dBFS, denoise 0.85"
+  - type: dropdown
+    id: rating
+    attributes:
+      label: Overall sound rating (1 = much worse than raw, 5 = broadcast-ready)
+      options: ["1", "2", "3", "4", "5"]
+    validations:
+      required: true
+  - type: dropdown
+    id: preference
+    attributes:
+      label: A/B against raw: which do you prefer?
+      options:
+        - Tine, clearly
+        - Tine, slightly
+        - Can't tell
+        - Raw, slightly
+        - Raw, clearly
+    validations:
+      required: true
+  - type: dropdown
+    id: apps
+    attributes:
+      label: Apps you used the mic through
+      multiple: true
+      options:
+        - Discord
+        - OBS / stream
+        - Chrome or Edge (web calls)
+        - Zoom
+        - Microsoft Teams
+        - CS2 / other game voice
+        - Windows Voice Recorder
+        - Audacity / DAW (RAW/exclusive warning expected)
+        - Other (say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: perf-feel
+    attributes:
+      label: Did Tine affect your machine's responsiveness?
+      options:
+        - No — didn't notice it
+        - Slightly noticeable
+        - Clearly noticeable (CPU/RAM/lag — details below)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Anything broken or surprising?
+      description: Crashes, dropouts, apps that got no mic, monitor (Hear Myself) glitches, tray issues.
+      placeholder: "What happened, what you expected, steps to reproduce."
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Attach diagnostics + soak report
+      description: "`tine diag` zip and `tine soak --minutes 15 --report soak-15m.json`.
+        Drag the files into this textarea to attach them."
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Privacy check
+      options:
+        - label: I understand the diag bundle contains no audio or personal data (endpoint ids are hashed), and my report will be public on GitHub.
+          required: true

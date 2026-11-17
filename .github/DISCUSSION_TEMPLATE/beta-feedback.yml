@@ -1,0 +1,40 @@
+name: Beta feedback & questions
+description: Sound impressions, A/B against raw, and questions during a beta round
+labels: ["beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Quick reactions and questions about a **v0.1.0-beta.N** build. Found something broken?
+        File a **[Beta report](../../issues/new?template=beta-report.yml)** instead — that is what
+        feeds the release coverage matrix.
+  - type: input
+    id: mic
+    attributes:
+      label: Your mic (make/model + type)
+      placeholder: "e.g. HyperX Cloud II headset, MacBook-ish laptop array, …"
+    validations:
+      required: true
+  - type: dropdown
+    id: version
+    attributes:
+      label: Beta version
+      options:
+        - v0.1.0-beta.1
+        - v0.1.0-beta.2
+        - v0.1.0-beta.3+
+    validations:
+      required: true
+  - type: textarea
+    id: impression
+    attributes:
+      label: Your impression
+      description: How does Tine sound vs your raw mic? Which macro knob mattered most
+        (Purity, Body, Presence, Leveler)? Any app where it didn't work?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Machine context (optional)
+      description: CPU / RAM / Windows version / voice apps used — helps us correlate performance reports.

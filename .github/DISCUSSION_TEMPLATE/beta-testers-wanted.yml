@@ -1,0 +1,35 @@
+name: Beta testers wanted
+description: Kick-off thread for a v0.1.0-beta.N round (maintainer posts; D-016 / T22)
+title: "Beta testers wanted — v0.1.0-beta.N"
+labels: ["beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Tine v0.1.0-beta.N is looking for beta testers.**
+
+        Tine is an ultra-lightweight, open-source microphone conditioner for Windows:
+        one 8-second Auto-Tune and any mic sounds broadcast-ready — in *every* app at once.
+
+        ### What we need covered this round
+        | Coverage | Met so far |
+        | :--- | :--- |
+        | ≥ 2 condenser mics | see [QA report](../../blob/main/docs/project/10-qa-report.md) |
+        | ≥ 2 laptop / webcam mics | see QA report |
+        | ≥ 1 Bluetooth headset | see QA report |
+        | ≥ 2 Realtek / vendor-DSP endpoints (Realtek, Nahimic, Dolby, Sonar) | see QA report |
+        | Windows 10 22H2 **and** Windows 11 24H2+ | see QA report |
+
+        ### How to test (15 minutes)
+        1. Grab the `v0.1.0-beta.N` pre-release from **Releases** (do not use on your only machine
+           during an important call; v0.1 beta is unsigned — SmartScreen will warn).
+        2. Install, launch, pick your mic, run the 8-second Auto-Tune (speak normally during the voice phase).
+        3. Use Discord / a game / a browser call for 15 minutes.
+        4. Produce the two evidence files:
+           - `tine diag` → a zip (tray menu → "Copy diagnostics", or the CLI)
+           - `tine soak --minutes 15 --report soak-15m.json` (leave the machine alone while it runs)
+        5. **Reply below** saying what hardware you're testing, then **file a [Beta report](../../issues/new?template=beta-report.yml)**
+           with the sound rating and attachments.
+
+        FAIR chunks of registry / audio settings are involved in uninstalling cleanly — the
+        uninstaller is tested, but beta means beta. Questions? Ask in this thread.
