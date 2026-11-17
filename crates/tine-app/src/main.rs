@@ -8,27 +8,16 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod autostart;
-mod cli;
-mod console;
-mod diag;
-mod hash;
-mod logging;
-mod proto;
-mod security;
-mod services;
-mod shell;
-mod single_instance;
-mod soak;
-mod tray;
-mod ui;
-mod version;
-mod zip;
-
-pub mod ui_bridge;
+use tine_app::{cli, console, proto, shell, ui_bridge, version};
 
 fn main() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // `--ui` is dispatched before the strict CLI parse: the window child
+    // owns its own tooling arguments (Rune headless `--snap`/`--tree` for
+    // agent verification of the real window host).
+    if args.first().is_some_and(|a| a == "--ui") {
+        return ui_bridge::run_ui_child();
+    }
     let mode = match cli::parse(args) {
         Ok(mode) => mode,
         Err(usage) => {
@@ -36,7 +25,12 @@ fn main() {
             if usage.is_empty() {
                 println!("{}", cli::usage());
             } else {
-                println!("error: {usage}\n\n{}", cli::usage());
+                println!(
+                    "error: {usage}
+
+{}",
+                    cli::usage()
+                );
             }
             std::process::exit(proto::exit_code::USAGE);
         }
@@ -48,7 +42,7 @@ fn main() {
             let code = shell::run_app(background, metrics);
             std::process::exit(code);
         }
-        cli::Mode::UiChild => ui::run_ui_child(),
+        cli::Mode::UiChild => ui_bridge::run_ui_child(),
         cli::Mode::Version => {
             console::attach_for_cli();
             println!("tine {}", version::tine_version());
@@ -57,8 +51,8 @@ fn main() {
         cli::Mode::ElevatedHelper { rest } => {
             console::attach_for_cli();
             println!(
-                "Nothing elevated to do (D-018): Tine v0.1 routes through a virtual audio cable and\n\
-                 never installs a system APO. The `--elevated-helper` entry point is kept only so\n\
+                "Nothing elevated to do (D-018): Tine v0.1 routes through a virtual audio cable and
+                 never installs a system APO. The `--elevated-helper` entry point is kept only so
                  old shortcuts answer clearly. Arguments ignored: {rest}",
                 rest = rest.join(" ")
             );
