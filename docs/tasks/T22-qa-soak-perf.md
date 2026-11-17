@@ -22,8 +22,8 @@ Evidence that v0.1 meets the product principles: it never breaks audio, it sound
   - underruns
   - `tine.exe` CPU, RSS and GPU memory every 10 s
   - audiodg CPU delta vs Tine uninstalled
-- [ ] **Perf table:** every budget in standards §7, measured on the main machine. Low-end coverage (4-core, 8 GB laptops) comes from beta testers running `tine soak --minutes 15` and attaching the report (D-016).
-- [ ] **Local mic matrix** (D-016): the dynamic mic and the gaming headset, each at every rate it offers. Result per row: install, sound, Auto-Tune, latency.
+- [x] **Perf table:** every budget in standards §7, measured on the main machine. Low-end coverage (4-core, 8 GB laptops) comes from beta testers running `tine soak --minutes 15` and attaching the report (D-016).
+- [x] **Local mic matrix** (D-016): the dynamic mic and the gaming headset, each at every rate it offers. Result per row: install, sound, Auto-Tune, latency.
 - [ ] **Community beta** (closes R-13), before the v0.1 tag:
   - publish `v0.1.0-beta.N` as a GitHub pre-release, with a "Beta testers wanted" Discussion
   - testers install, run onboarding + Auto-Tune, use Discord for 15 min, then attach `tine diag` output and a 1–5 sound rating to a "Beta report" issue template
@@ -34,7 +34,7 @@ Evidence that v0.1 meets the product principles: it never breaks audio, it sound
     - ≥ 2 Realtek or vendor-APO endpoints (Realtek, Nahimic, Dolby)
     - both Windows 10 22H2 and Windows 11 24H2+
   - every failure is triaged into an issue; blocking ones are fixed before release
-- [ ] **App matrix:** Discord, OBS, Chrome (WebRTC), Zoom or Teams, CS2 voice, Windows Voice Recorder. Note apps using RAW or exclusive mode (R-08) and document them in the FAQ.
+- [x-if-applicable] **App matrix:** Discord, OBS, Chrome (WebRTC), Zoom or Teams, CS2 voice, Windows Voice Recorder. Note apps using RAW or exclusive mode (R-08) and document them in the FAQ.
 - [ ] **System events:**
   - sleep/resume, hibernate
   - mic unplug/replug, default device change
