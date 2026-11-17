@@ -76,6 +76,7 @@ fn ten_minute_44100_to_48000_with_clock_drift_has_zero_glitches() {
     let mut underruns = 0u64;
     let mut max_step_diff = 0.0f32;
     let mut prev_out = 0.0f32;
+    let mut have_prev = false;
     let mut primed_seen = false;
 
     for cb in 0..60_000u64 {
@@ -115,11 +116,18 @@ fn ten_minute_44100_to_48000_with_clock_drift_has_zero_glitches() {
                 underruns += 1;
             }
             for &s in out_buf.iter().step_by(2) {
-                let diff = (s - prev_out).abs();
-                if diff > max_step_diff {
-                    max_step_diff = diff;
+                // Seed the continuity tracker with the first primed sample instead of 0.0:
+                // prime timing depends on the jitter-buffer headroom (D-027), and the sine's
+                // phase at the first checked callback is not guaranteed to be near zero —
+                // only sample-to-sample steps *after* the seed prove continuity.
+                if have_prev {
+                    let diff = (s - prev_out).abs();
+                    if diff > max_step_diff {
+                        max_step_diff = diff;
+                    }
                 }
                 prev_out = s;
+                have_prev = true;
             }
         }
     }
