@@ -29,6 +29,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   # Set TINE_SIGNING_ENABLED=true and TINE_SIGN_COMMAND to a signtool.exe
   # command line (SignPath / Azure Trusted Signing; see the runbook) to sign
   # before hashing. Empty/absent = unsigned build (beta default).
@@ -51,6 +52,9 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          cache-on-failure: true
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -76,9 +80,6 @@ jobs:
 
       - name: Run tests (nextest)
         run: cargo nextest run --workspace
-
-      - name: Run headless UI verification
-        run: cargo test -p tine-ui
 
       # Spec: build --release. The workspace has no "tooling" member; the
       # installer ships only tine.exe under the D-018 virtual-cable topology

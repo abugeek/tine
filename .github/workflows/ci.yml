@@ -11,10 +11,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  check:
-    name: Build, Lint, Test & Policy
+  lint:
+    name: Lint, no_std & Policy
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -28,11 +29,14 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+          cache-on-failure: true
 
-      - name: Install cargo-nextest & cargo-deny
+      - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest,cargo-deny
+          tool: cargo-deny
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -44,9 +48,6 @@ jobs:
         run: |
           cargo check -p tine-protocol --no-default-features
           cargo check -p tine-dsp --no-default-features
-
-      - name: Run tests (nextest)
-        run: cargo nextest run --workspace
 
       - name: Check dependencies (cargo-deny)
         run: cargo deny check
@@ -74,11 +75,55 @@ jobs:
           Assert-NoDep "tine-ui"  @("windows") @("--depth", "1")
           Write-Host "Dependency direction checks passed."
 
+  test:
+    name: Tests (nextest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run tests (nextest)
+        run: cargo nextest run --workspace
+
+  size-gate:
+    name: Release Binary Size Gate
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          cache-on-failure: true
+
       - name: Build release & check artifact sizes
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          cargo build --workspace --profile release
+          cargo build --release -p tine-app
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $appExe = Get-Item "target/release/tine.exe"
