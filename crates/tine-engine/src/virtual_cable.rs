@@ -289,6 +289,7 @@ impl VirtualCableRouter {
             overruns: c.overruns,
             callbacks: c.callbacks.saturating_add(p.callbacks),
             max_callback_us: c.max_callback_us.max(p.max_callback_us),
+            xruns: c.xruns.saturating_add(p.xruns),
         }
     }
 

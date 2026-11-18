@@ -88,6 +88,9 @@ pub struct StreamStats {
     pub callbacks: u64,
     /// Maximum observed callback execution duration in microseconds.
     pub max_callback_us: u32,
+    /// Non-fatal backend glitch notifications (xruns, reroutes) that did not
+    /// require a rebuild.
+    pub xruns: u64,
 }
 
 /// Active mono `f32` capture stream pushing into an [`SpscRing`].
@@ -118,7 +121,8 @@ impl CaptureStream {
         self.stats.snapshot(Some((self.overruns_fn)()))
     }
 
-    /// Returns `true` if the backend reported a stream error (e.g., device unplugged).
+    /// Returns `true` if the backend reported a fatal stream error (e.g., device
+    /// unplugged). Benign xruns are counted in [`StreamStats::xruns`] instead.
     #[must_use]
     pub fn has_error(&self) -> bool {
         self.stats.error_flag.load(Ordering::Acquire)
@@ -162,7 +166,8 @@ impl PlaybackStream {
         self.stats.snapshot(None)
     }
 
-    /// Returns `true` if the backend reported a stream error (e.g., device unplugged).
+    /// Returns `true` if the backend reported a fatal stream error (e.g., device
+    /// unplugged). Benign xruns are counted in [`StreamStats::xruns`] instead.
     #[must_use]
     pub fn has_error(&self) -> bool {
         self.stats.error_flag.load(Ordering::Acquire)
@@ -366,9 +371,10 @@ pub fn open_capture<const N: usize>(
         move |data, _| {
             processor.process_data(data);
         },
-        move |_err| {
-            // RT-safe: atomic flag only, no alloc/log/panic.
-            err_stats.error_flag.store(true, Ordering::Release);
+        move |err: cpal::Error| {
+            // RT-safe: atomics only, no alloc/log/panic. Benign xruns are
+            // counted; only fatal kinds latch the rebuild flag.
+            err_stats.record_stream_error(err.kind());
         },
         None,
     )?;
@@ -437,9 +443,10 @@ pub fn open_playback_with_headroom<const N: usize>(
         move |data, _| {
             processor.process_data(data);
         },
-        move |_err| {
-            // RT-safe: atomic flag only, no alloc/log/panic.
-            err_stats.error_flag.store(true, Ordering::Release);
+        move |err: cpal::Error| {
+            // RT-safe: atomics only, no alloc/log/panic. Benign xruns are
+            // counted; only fatal kinds latch the rebuild flag.
+            err_stats.record_stream_error(err.kind());
         },
         None,
     )?;

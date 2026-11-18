@@ -209,6 +209,43 @@ pub fn init(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Installs the global `tracing` subscriber writing to a dedicated log file
+/// (e.g. `tine-ui.log` for the `--ui` child process so it never races with the
+/// parent's `tine.log` rotation).
+///
+/// # Errors
+/// Returns the io error when the log directory/file cannot be created.
+pub fn init_child_log(dir: &Path, file_name: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(file_name);
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let sink = Arc::new(Mutex::new(file));
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(true)
+        .with_level(true)
+        .with_writer(move || {
+            struct SharedFile(Arc<Mutex<File>>);
+            impl Write for SharedFile {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    match self.0.lock() {
+                        Ok(mut f) => f.write(buf),
+                        Err(p) => p.into_inner().write(buf),
+                    }
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    match self.0.lock() {
+                        Ok(mut f) => f.flush(),
+                        Err(p) => p.into_inner().flush(),
+                    }
+                }
+            }
+            SharedFile(Arc::clone(&sink))
+        })
+        .try_init();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{KEEP, MAX_FILE_BYTES, RotatingFile, rolled_name};

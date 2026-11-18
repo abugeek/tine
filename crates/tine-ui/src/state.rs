@@ -167,11 +167,30 @@ impl AppState {
         self.ui.sink.send(intent);
     }
 
-    /// Optimistically updates a macro locally and emits [`Intent::SetMacro`].
+    /// Optimistically updates a macro locally (including resolving the live
+    /// `DspParams` so the Golden Line curve animates at 60 Hz during drags) and
+    /// emits [`Intent::SetMacro`].
     pub fn set_macro_optimistic(&mut self, m: Macro, value: f32) {
         m.set(&mut self.model.macros, value);
         let clamped = m.get(self.model.macros);
+        self.resolve_params_optimistic();
         self.emit(Intent::SetMacro(m, clamped));
+    }
+
+    /// Optimistically switches the microphone archetype locally (updating the
+    /// Golden Line curve immediately) and emits [`Intent::SetArchetype`].
+    pub fn set_archetype_optimistic(&mut self, arch: tine_protocol::presets::Archetype) {
+        self.model.archetype = arch;
+        self.resolve_params_optimistic();
+        self.emit(Intent::SetArchetype(arch));
+    }
+
+    fn resolve_params_optimistic(&mut self) {
+        let preset = tine_dsp::presets::builtin(self.model.archetype);
+        let mut resolved =
+            tine_dsp::macros::MacroMapper::apply(preset, None, self.model.macros, self.model.pins, &self.model.params);
+        resolved.bypass = self.model.bypass;
+        self.model.params = resolved;
     }
 
     /// Optimistically toggles bypass locally and emits [`Intent::ToggleBypass`].

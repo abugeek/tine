@@ -653,17 +653,17 @@ fn autotune_wizard_applies_calibration_through_apply_intent() {
         started.elapsed()
     );
     let report = *app.bridge.pending_calibration().expect("report held for the card");
-    // T11 acceptance semantics: −6..−3 dBFS simulated peak; speech +
-    // input gain anchored at −18 dBFS; the noisy room drives a high AI mix.
+    // Auto-Tune acceptance: −9..−6 dBFS simulated peak; speech +
+    // input gain anchored at −20 dBFS; the noisy room drives a high AI mix.
     assert!(
-        report.simulated_peak_db > -6.0 && report.simulated_peak_db < -3.0,
+        (-9.0..=-6.0).contains(&report.simulated_peak_db),
         "verified peak {} dBFS",
         report.simulated_peak_db
     );
     let cal = &report.calibration;
     assert!(
-        (cal.speech_rms_db + cal.derived.input_gain_db - -18.0).abs() < 1.0,
-        "speech landed at -18 dBFS (rms {} + gain {})",
+        (cal.speech_rms_db + cal.derived.input_gain_db - -20.0).abs() < 1.0,
+        "speech landed at -20 dBFS (rms {} + gain {})",
         cal.speech_rms_db,
         cal.derived.input_gain_db
     );

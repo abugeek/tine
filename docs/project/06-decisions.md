@@ -225,3 +225,35 @@ A calibration's derived `input_gain_db`, `gate_threshold_db`, `denoise_mix`, `co
 **Why:** The check would need the shell's first HTTP client (GitHub Releases API), which D-025 explicitly avoids adding (in-house shell utilities policy), inflates the R-21-stressed binary, and expands the attack surface of a process that autostarts for every user. The version seam already exists and a manual check costs the user one page load.
 
 **Consequences:** The spec's "opt-in update check" step is dropped for v0.1 (documented in the task file's adapted steps and the README FAQ); if beta feedback demands it, it lands as an opt-in `settings.json` flag + one "new version available" tray notice, per the original Q-06 recommendation.
+
+### D-032 · 2026-11-18 · Accepted — `cpal` stream errors are classified; benign xruns never rebuild a stream (T24)
+
+**Decision:** `audio_io` error callbacks call `AtomicStreamStats::record_stream_error(kind)`. `ErrorKind::Xrun` (WASAPI `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`), `DeviceChanged` (stream rerouted, still active) and `RealtimeDenied` (audio keeps running) increment `StreamStats::xruns`; every other kind latches `error_flag` as before. `tine status` reports `router.xruns`.
+
+**Why:** cpal 0.18 delivers the discontinuity flag through the error callback. Latching it made the shell tear down and rebuild the routing loop twice on every start (125 rebuilds in one dev log), turned a one-buffer glitch into a rebuild gap, aborted `devhost record-raw`, and made SteelSeries Sonar's virtual mic unusable as an input (it raises the flag right after start).
+
+**Consequences:** genuine device loss still rebuilds (unchanged recovery path). Xruns are visible as a counter instead of being invisible restarts.
+
+### D-033 · 2026-11-18 · Accepted — `tine.exe` delay-loads its window-stack DLLs (T24)
+
+**Decision:** `crates/tine-app/build.rs` links `tine.exe` (MSVC) with `/DELAYLOAD` for `dxgi.dll`, `dwrite.dll`, `uiautomationcore.dll`, `dwmapi.dll`, `imm32.dll` plus `delayimp.lib`.
+
+**Why:** one binary hosts the always-on parent and the `--ui` child (D-017), so the parent statically imported DXGI. Overlay/OSD hook DLLs (RivaTuner was present on the dev machine) treat a DXGI-loaded process as a 3D app and set up a 51 MB private commit at its first window (the tray): parent Private Bytes 58 MB against a < 4 MB target. Bisected in-process to the first `CreateWindowExW`; the same block appeared in two unrelated DXGI-importing apps on that machine.
+
+**Consequences:** parent Private Bytes 58 → 4.6 MB, Working Set ~16–18 MB; the `--ui` child loads the DLLs on first call (verified: window renders, DX12 + DXGI load in the child only). Binary 20.63 → 20.75 MiB (inside the R-23 24 MiB gate). A new eager import of a graphics DLL in the parent path would undo this — keep the list in `build.rs` in sync.
+
+### D-034 · 2026-11-18 · Accepted — Listener gate: park the routing loop while nobody records the virtual mic (T24)
+
+**Decision:** after the first successful route, a `tine-listener-gate` thread (own COM MTA) polls the audio sessions of the sink's capture side (`CABLE Input` ↔ `CABLE Output`, `listeners::capture_name_for_sink`). When no other process has an *active* capture session and nothing internal needs the signal (Hear Myself wanted/running, window meters pulled within 10 s, Auto-Tune or its lease) for 10 s continuously, the router stops ("parked"). Parked, it polls every 200 ms and resumes through the normal `router_follow` path on the first listener; Hear Myself, meters and Auto-Tune call `services::router_wake` synchronously. Any probe failure or missing capture endpoint counts as "listening".
+
+**Why:** with no listener the loop was pure waste: ~1 % of a core in `tine.exe`, ~2 % in `audiodg.exe` for the cable streams, ~300 wakeups/s and the measured frame-pacing cost while gaming. Sonar already idles this way.
+
+**Consequences:** an app that opens `CABLE Output` while Tine is parked gets audio after ≤ ~0.3 s (R-24). `status` reports `router.parked`. The tray/link stays "Active" while parked (routing is healthy, just idle). A user-facing opt-out is not in v0.1.
+
+### D-035 · 2026-11-18 · Accepted — Start-up prime is 2× the steady jitter target, drained explicitly (T24, amends D-027)
+
+**Decision:** `AdaptiveResampler` waits for `STARTUP_PRIME_FACTOR (2) × target` before the *first* render, then drains the surplus at a fixed `STARTUP_DRAIN_RATE` (+0.5 % playback speed, ~0.09 semitone, ~4 s) with the drift PI loop frozen; when the fill reaches the target the loop takes over from zeroed state. The steady-state target (D-027 / router 2 callbacks, monitor 3) is unchanged.
+
+**Why:** when the cable sink already had an active reader, the shared engine drained a 1× prime in a burst: 1 underrun in 5 cold starts and in 2 of 3 resumes. A first attempt that let the PI loop drain the surplus failed the re-benchmark: its ±0.1 % clamp needs ~20 s, the integral winds up, and the fill then falls ~45 % below target for tens of seconds — 164 underruns between 20 s and 50 s after start under scheduler jitter (modelled and reproduced). The explicit drain has no windup and lands exactly on target.
+
+**Consequences:** up to +20 ms latency for ~4 s after a (re)start only. Measured: 0 underruns in 8 cold starts with a listener, 0 in 5 park/resume cycles, 0/0/1 in three 90 s runs under sampler jitter (background level). Unit tests pin the doubled prime, burst absorption after priming, drain-without-undershoot over 90 simulated seconds, and unchanged honest-underrun semantics.

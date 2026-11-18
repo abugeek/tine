@@ -123,6 +123,7 @@ fn wide(path: &Path) -> Vec<u16> {
 /// The temp file is a sibling of `path` so the final rename stays on the same
 /// volume and is atomic.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| PersistError::Io {
             path: path.to_path_buf(),
@@ -130,8 +131,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
         })?;
     }
 
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = path.with_file_name(format!(
-        "{}.tmp-{}",
+        "{}.tmp-{}-{seq}",
         path.file_name()
             .map_or_else(|| "tine".to_owned(), |n| n.to_string_lossy().into_owned()),
         std::process::id()

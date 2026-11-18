@@ -565,7 +565,7 @@ fn track_fill(w: f32, h: f32, norm: f32, color: rune::Color) -> rune::Shape {
 }
 
 fn meter_color(db: f32, t: TineTheme) -> rune::Color {
-    if db > -3.0 {
+    if db > -1.5 {
         t.meter_red
     } else if db > -12.0 {
         t.meter_amber
@@ -614,6 +614,18 @@ fn unpin_section(s: &mut AppState, stage: Stage) {
     s.ui.pro_field.close();
 }
 
+fn stage_subtitle(number: u8) -> &'static str {
+    match number {
+        1 => "Mic gain & low-rumble cut",
+        2 => "AI noise removal & silence gate",
+        3 => "Tone shaping (warmth, mud, clarity, air)",
+        4 => "Tames harsh 'S' and 'T' sounds",
+        5 => "Evens out whispers & loud speech",
+        6 => "Brickwall ceiling to prevent clipping",
+        _ => "",
+    }
+}
+
 /// One stage section: header (title, optional enable switch, optional section
 /// "Unpin all") and a two-column body of generated control rows.
 fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> El {
@@ -626,6 +638,11 @@ fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> E
             text(format!("{} · {}", stage.number, stage.title))
                 .font(typography::LABEL)
                 .color(t.text),
+        )
+        .child(
+            text(stage_subtitle(stage.number))
+                .font(typography::CAPTION)
+                .color(t.text_dim),
         );
 
     if let Some(enable) = stage.enable {

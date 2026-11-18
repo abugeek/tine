@@ -7,6 +7,7 @@ pub mod apo_admin;
 pub mod audio_io;
 pub mod autotune;
 pub mod controller;
+pub mod listeners;
 pub mod model;
 pub mod monitor;
 pub mod paths;

@@ -41,6 +41,7 @@ games, OBS, browsers) hears processed audio through a native APO, with no virtua
 | [T21](T21-end-to-end-integration.md) | End-to-end integration in `tine.exe` | Z | T14, T17, T20 | M |
 | [T22](T22-qa-soak-perf.md) | QA: soak, perf, mic/app matrix, listening tests | Z | T21 | M |
 | [T23](T23-packaging-release.md) | Installer, signing, release, OSS docs | Z | T22 | M |
+| [T24](T24-perf-competitor-followup.md) | Competitor benchmark follow-up: stream health, idle cost, memory | Z | T22 | M |
 
 ## Dependency graph
 

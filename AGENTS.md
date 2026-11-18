@@ -282,7 +282,7 @@ A task is ready when every task it depends on is done. Each task lists the files
 | B — Windows / APO | **T02 APO spike (go/no-go)** → T13 `tine_apo.dll` → T14 install/health/repair |
 | C — Engine / App | T03 Rune lifecycle spike → T12 cpal I/O + devhost → T15 engine core → T16 audio services → T17 `tine.exe` shell |
 | D — UI | T18 foundation + headless harness → T19 header + Golden Line → T20 Pro rack + Auto-Tune + onboarding |
-| Z — Integration & ship | T21 end-to-end → T22 QA → T23 release |
+| Z — Integration & ship | T21 end-to-end → T22 QA → T23 release → T24 perf follow-up (`scripts/bench`) |
 
 To assign a task, tell the agent: *"Read `AGENTS.md`, `docs/project/09-engineering-standards.md`, then `docs/tasks/<file>` and do it."*
 

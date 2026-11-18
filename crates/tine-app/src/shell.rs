@@ -47,6 +47,10 @@ struct Shell {
     ui_child: Option<std::process::Child>,
     soaks: Vec<std::thread::JoinHandle<()>>,
     entered: Instant,
+    /// Whether the persisted "Hear Myself" state was applied after boot
+    /// (the first `ModelChanged`); before T24 it only started once the
+    /// window opened, while `status` already reported it as on.
+    monitor_restored: bool,
 }
 
 impl Shell {
@@ -197,6 +201,7 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
         ui_child: None,
         soaks: Vec::new(),
         entered,
+        monitor_restored: false,
     };
 
     // 5. Tray (cold-start finish line).
@@ -236,6 +241,12 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     // 7. Event loop.
     let mut code = exit_code::OK;
     let mut last_health_check = Instant::now();
+    let mut router_backoff = Duration::from_secs(1);
+    let mut router_retry_at: Option<Instant> = if routed {
+        None
+    } else {
+        Some(Instant::now() + router_backoff)
+    };
     loop {
         match rx.recv_timeout(HEALTH_CHECK_INTERVAL) {
             Ok(msg) => match msg {
@@ -245,7 +256,14 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                     if let Some(endpoint) = shell.model.as_ref().and_then(|m| m.endpoint.as_ref()) {
                         let routed = services::router_follow(endpoint.as_str());
                         shell.link = link_from_router(routed);
+                        if routed {
+                            router_backoff = Duration::from_secs(1);
+                            router_retry_at = None;
+                        } else {
+                            router_retry_at = Some(Instant::now() + router_backoff);
+                        }
                     }
+                    shell.restore_monitor_once();
                     shell.sync_tray(&tx);
                 }
                 Msg::Engine(Event::ApoLink(link)) => {
@@ -286,7 +304,8 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
         }
         if last_health_check.elapsed() >= HEALTH_CHECK_INTERVAL {
             last_health_check = Instant::now();
-            if services::router_has_error() {
+            let has_err = services::router_has_error();
+            if has_err && router_retry_at.is_none() {
                 let ep = shell
                     .model
                     .as_ref()
@@ -295,6 +314,37 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                 tracing::warn!(target: "tine::shell", endpoint = %ep, "router stream error detected; rebuilding");
                 let routed = services::router_follow(&ep);
                 shell.link = link_from_router(routed);
+                if routed {
+                    router_backoff = Duration::from_secs(1);
+                    router_retry_at = None;
+                } else {
+                    router_retry_at = Some(Instant::now() + router_backoff);
+                    router_backoff = (router_backoff * 2).min(Duration::from_secs(30));
+                }
+                shell.sync_tray(&tx);
+            } else if has_err {
+                // Error while already in backoff: tear down the broken router
+                // once and wait for the backoff deadline before retrying.
+                services::router_stop();
+                shell.link = LinkState::Unlinked;
+                shell.sync_tray(&tx);
+            } else if matches!(shell.link, LinkState::Unlinked) && router_retry_at.is_some_and(|t| Instant::now() >= t)
+            {
+                let ep = shell
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.endpoint.as_ref())
+                    .map_or_else(|| endpoint.as_str().to_owned(), |e| e.as_str().to_owned());
+                let routed = services::router_follow(&ep);
+                shell.link = link_from_router(routed);
+                if routed {
+                    tracing::info!(target: "tine::shell", endpoint = %ep, "router recovered");
+                    router_backoff = Duration::from_secs(1);
+                    router_retry_at = None;
+                } else {
+                    router_retry_at = Some(Instant::now() + router_backoff);
+                    router_backoff = (router_backoff * 2).min(Duration::from_secs(30));
+                }
                 shell.sync_tray(&tx);
             }
         }
@@ -316,8 +366,13 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
         let _ = child.kill();
         let _ = child.wait();
     }
+    // Write pending settings before the process can exit (nothing joins the
+    // controller thread, so the drop-triggered flush alone could be lost).
+    if !handle.flush_blocking(Duration::from_secs(2)) {
+        tracing::warn!(target: "tine::shell", "settings flush on shutdown timed out");
+    }
     drop(shell); // drops its controller handle clone
-    drop(handle); // drops the last handle -> controller thread flushes and exits
+    drop(handle); // drops the last handle -> controller thread exits
     drop(forwarder);
     drop(guard); // releases `Local\Tine.SingleInstance` and closes the pipe name
     code
@@ -415,6 +470,23 @@ impl Shell {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Starts "Hear Myself" from the persisted settings once, after the
+    /// first model arrives (the router is already following by then; if it
+    /// is not, the services start the monitor when routing comes up).
+    /// Nothing is re-persisted: the controller already holds this state.
+    fn restore_monitor_once(&mut self) {
+        if self.monitor_restored {
+            return;
+        }
+        let Some(model) = self.model.as_ref() else {
+            return;
+        };
+        self.monitor_restored = true;
+        if model.monitor.enabled {
+            services::monitor_apply(true, model.monitor.output_device.as_deref());
         }
     }
 

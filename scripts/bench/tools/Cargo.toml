@@ -1,0 +1,20 @@
+# Benchmark-only helpers (gpu-stress, mic-record, sessions) for scripts/bench/compare.ps1.
+# Deliberately NOT a workspace member and never shipped.
+[package]
+name = "bench-tools"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dependencies]
+wgpu = "30.0.2"
+pollster = "1.0.1"
+cpal = "0.18.2"
+hound = "3.5.1"
+windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_Devices_FunctionDiscovery", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant", "Win32_Foundation"] }
+
+[profile.release]
+opt-level = 3

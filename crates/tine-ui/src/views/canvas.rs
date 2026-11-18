@@ -257,9 +257,68 @@ impl PeakHold {
     }
 }
 
+/// Smoothed meter ballistics + ~5 Hz numeric readout throttle.
+#[derive(Clone, Copy)]
+struct MeterBallistics {
+    last_seq: u64,
+    smooth_in: f32,
+    smooth_out: f32,
+    text_seq: u64,
+    text_in: f32,
+    text_out: f32,
+}
+
+impl MeterBallistics {
+    const fn new() -> Self {
+        Self {
+            last_seq: u64::MAX,
+            smooth_in: METER_MIN_DB,
+            smooth_out: METER_MIN_DB,
+            text_seq: u64::MAX,
+            text_in: METER_MIN_DB,
+            text_out: METER_MIN_DB,
+        }
+    }
+
+    fn observe(&mut self, tel: &AudioTelemetryFrame) -> (f32, f32, f32, f32) {
+        if self.last_seq == u64::MAX || tel.sequence < self.last_seq {
+            self.smooth_in = tel.input_rms_db;
+            self.smooth_out = tel.output_rms_db;
+            self.text_in = tel.input_rms_db;
+            self.text_out = tel.output_rms_db;
+            self.last_seq = tel.sequence;
+            self.text_seq = tel.sequence;
+        } else if tel.sequence != self.last_seq {
+            // Fast attack (~22 ms), smooth decay (~320 ms) at 60 Hz.
+            const ALPHA_ATTACK: f32 = 0.55;
+            const ALPHA_DECAY: f32 = 0.05;
+            let step = |cur: f32, target: f32| {
+                let a = if target > cur { ALPHA_ATTACK } else { ALPHA_DECAY };
+                cur + a * (target - cur)
+            };
+            self.smooth_in = step(self.smooth_in, tel.input_rms_db);
+            self.smooth_out = step(self.smooth_out, tel.output_rms_db);
+            self.last_seq = tel.sequence;
+
+            // Update numeric text at ~5 Hz (every 12 frames) so digits don't blur.
+            if tel.sequence.saturating_sub(self.text_seq) >= 12 {
+                self.text_in = self.smooth_in;
+                self.text_out = self.smooth_out;
+                self.text_seq = tel.sequence;
+            }
+        }
+        (self.smooth_in, self.smooth_out, self.text_in, self.text_out)
+    }
+}
+
 thread_local! {
     static PEAKS: RefCell<[PeakHold; 2]> = const { RefCell::new([PeakHold::new(); 2]) };
     static PEAK_OBSERVED_SEQ: RefCell<u64> = const { RefCell::new(u64::MAX) };
+    static METERS_SMOOTH: RefCell<MeterBallistics> = const { RefCell::new(MeterBallistics::new()) };
+}
+
+fn smoothed_meters(tel: &AudioTelemetryFrame) -> (f32, f32, f32, f32) {
+    METERS_SMOOTH.with_borrow_mut(|m| m.observe(tel))
 }
 
 /// Peak-held levels `(input, output)` in dBFS for the current telemetry frame.
@@ -283,7 +342,7 @@ fn held_peaks(tel: &AudioTelemetryFrame) -> (f32, f32) {
 }
 
 fn meter_color(db: f32, t: TineTheme) -> Color {
-    if db > -3.0 {
+    if db > -1.5 {
         t.meter_red
     } else if db > -12.0 {
         t.meter_amber
@@ -300,8 +359,23 @@ const fn db_norm(db: f32) -> f32 {
 /// Renders the Golden Line canvas panel.
 pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     let t = TineTheme::dark();
-    let tel = &s.live.telemetry;
+    let silent_fallback = AudioTelemetryFrame {
+        input_rms_db: METER_MIN_DB,
+        input_peak_db: METER_MIN_DB,
+        output_rms_db: METER_MIN_DB,
+        output_peak_db: METER_MIN_DB,
+        ..AudioTelemetryFrame::default()
+    };
+    let tel = if s.live.telemetry.sequence == 0
+        && s.live.telemetry.input_rms_db == 0.0
+        && s.live.telemetry.output_rms_db == 0.0
+    {
+        &silent_fallback
+    } else {
+        &s.live.telemetry
+    };
     let held = held_peaks(tel);
+    let (smooth_in, smooth_out, text_in, text_out) = smoothed_meters(tel);
 
     // Settled plot size from the previous layout pass (re-runs the view on resize).
     let [plot_w, plot_h] = cx
@@ -314,22 +388,20 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     let title_row = row()
         .key("canvas/title-row")
         .w_full()
+        .gap(spacing::SM)
         .child(
-            text("Golden Line — Voice Conditioner")
+            text("Golden Line — Drag nodes up/down · Space to compare Raw/Tine")
                 .font(typography::BODY)
                 .color(t.text),
         )
         .child(el().key("canvas/title-spacer").grow(1.0))
         .child(
-            text(format!(
-                "In {:.1} dBFS  |  Out {:.1} dBFS",
-                tel.input_rms_db, tel.output_rms_db
-            ))
-            .font(typography::CAPTION)
-            .color(t.text_dim),
+            text(format!("In {text_in:.0} dBFS  |  Out {text_out:.0} dBFS"))
+                .font(typography::CAPTION)
+                .color(t.text_dim),
         );
 
-    // --- Plot column: grid, curve, spectrum, macro nodes, tooltip ---
+    // --- Plot column: grid, curve, spectrum, zone/dB/freq labels, macro nodes, tooltip ---
     let mut plot = col()
         .key("canvas/plot")
         .grow(1.0)
@@ -344,6 +416,8 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
                 .key("canvas/spectrum")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)),
         )
+        .child(zone_labels(plot_w))
+        .child(db_labels(plot_h))
         .child(freq_labels(plot_w, plot_h));
 
     for m in Macro::ALL {
@@ -355,7 +429,13 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
     }
 
     // --- Meters column (right edge) ---
-    let meters = meters_panel(tel, held, t);
+    let meters = meters_panel(tel, (smooth_in, smooth_out), held, t);
+
+    let legend = row().key("canvas/legend").w_full().child(
+        text("Purity: Noise & Gate  ·  Body: Warmth & Mud  ·  Presence: Clarity & S-sounds  ·  Leveler: Even Volume")
+            .font(typography::CAPTION)
+            .color(t.text_dim),
+    );
 
     col()
         .key("canvas")
@@ -379,18 +459,27 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
                 .child(plot)
                 .child(meters),
         )
+        .child(legend)
 }
 
-/// Static grid layer: 0 dB reference line, ±6 dB guides and 100/1k/10k gridlines.
+/// Static grid layer: 0 dB reference line, ±6/±12 dB guides and 100/1k/10k gridlines.
 fn grid_layer(t: TineTheme) -> El {
     memo("canvas/grid", (), move || {
         let mut s = Shape::new();
-        let gridline = |s: Shape, x: f32| s.line([x, 0.0], [x, 1.0], 1.0, LineCap::Butt, t.border);
-        s = gridline(s, freq_x(100.0));
-        s = gridline(s, freq_x(1000.0));
-        s = gridline(s, freq_x(10_000.0));
+        let vline = |s: Shape, x: f32| s.line([x, 0.0], [x, 1.0], 1.0, LineCap::Butt, t.border);
+        let hline = |s: Shape, db: f32, color| {
+            let y = 0.5 - db / (2.0 * DB_MAX);
+            s.line([0.0, y], [1.0, y], 1.0, LineCap::Butt, color)
+        };
+        s = vline(s, freq_x(100.0));
+        s = vline(s, freq_x(1000.0));
+        s = vline(s, freq_x(10_000.0));
+        s = hline(s, 12.0, t.border);
+        s = hline(s, 6.0, t.border);
         // 0 dB reference line at mid height.
-        s = s.line([0.0, 0.5], [1.0, 0.5], 1.0, LineCap::Butt, t.accent_glow);
+        s = hline(s, 0.0, t.accent_glow);
+        s = hline(s, -6.0, t.border);
+        s = hline(s, -12.0, t.border);
         canvas(s)
             .key("canvas/grid")
             .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
@@ -439,6 +528,47 @@ fn spectrum_shape(spectrum: &[f32; 32], width: f32, height: f32, t: TineTheme) -
         );
     }
     shape
+}
+
+// Sonar-style frequency zone labels along the top edge of the plot.
+const ZONE_LABELS: [(&str, f32); 5] = [
+    ("WARMTH", 135.0),
+    ("MUD", 350.0),
+    ("MIDS", 1100.0),
+    ("CLARITY", 3800.0),
+    ("AIR", 11_000.0),
+];
+
+fn zone_labels(plot_w: f32) -> El {
+    let mut strip = row().key("canvas/zone-labels").w(plot_w).h(16.0).absolute(0.0, 4.0);
+    for (name, hz) in ZONE_LABELS {
+        let x = freq_x(hz) * plot_w;
+        strip = strip.child(
+            row()
+                .key(format!("canvas/zone-{name}"))
+                .w(68.0)
+                .h(14.0)
+                .center()
+                .absolute((x - 34.0).max(2.0).min((plot_w - 70.0).max(2.0)), 0.0)
+                .child(text(name).font(typography::CAPTION).color(t_dim())),
+        );
+    }
+    strip
+}
+
+fn db_labels(plot_h: f32) -> El {
+    let mut col_el = col().key("canvas/db-labels").w(36.0).h(plot_h).absolute(6.0, 0.0);
+    for (label, db) in [("+12", 12.0), ("+6", 6.0), ("0 dB", 0.0), ("-6", -6.0), ("-12", -12.0)] {
+        let y = ((0.5 - db / (2.0 * DB_MAX)) * plot_h - 7.0).clamp(18.0, (plot_h - 32.0).max(18.0));
+        col_el = col_el.child(
+            row()
+                .key(format!("canvas/db-{label}"))
+                .h(14.0)
+                .absolute(0.0, y)
+                .child(text(label).font(typography::CAPTION).color(t_dim())),
+        );
+    }
+    col_el
 }
 
 // The frequency labels are drawn inside the plot at its bottom edge.
@@ -537,22 +667,41 @@ fn macro_node(m: Macro, value: f32, plot_w: f32, plot_h: f32, t: TineTheme) -> E
             }
         });
 
-    let caption_y = (y_c + NODE_R + 2.0).min((plot_h - 16.0).max(0.0));
+    let short_caption = match m {
+        Macro::Purity => "Purity · Noise",
+        Macro::Body => "Body · Warmth",
+        Macro::Presence => "Presence · Clarity",
+        Macro::Leveler => "Leveler · Level",
+    };
+    let caption_y = if y_c + NODE_R + 18.0 > plot_h - 16.0 {
+        (y_c - NODE_R - 16.0).max(20.0)
+    } else {
+        y_c + NODE_R + 2.0
+    };
     let caption = row()
         .key(format!("{}/caption", m.key()))
         .role("label")
         .label(m.label())
-        .w(56.0)
+        .w(112.0)
         .h(14.0)
         .center()
-        .absolute((x - 28.0).max(0.0).min(plot_w - 58.0), caption_y)
-        .child(text(m.label()).font(typography::CAPTION).color(t_dim()));
+        .absolute((x - 56.0).max(0.0).min((plot_w - 114.0).max(0.0)), caption_y)
+        .child(text(short_caption).font(typography::CAPTION).color(t_dim()));
 
     col()
         .key(format!("{}/wrap", m.key()))
         .absolute(0.0, 0.0)
         .child(node)
         .child(caption)
+}
+
+fn macro_summary(m: Macro) -> &'static str {
+    match m {
+        Macro::Purity => "Cuts background noise & silences room hum",
+        Macro::Body => "Adds vocal warmth & reduces boxy mud",
+        Macro::Presence => "Boosts clarity & tames harsh 'S' sounds",
+        Macro::Leveler => "Evens out quiet & loud speech",
+    }
 }
 
 /// Spring-animated tooltip card shown while a node is hovered or dragged.
@@ -572,6 +721,7 @@ fn tooltip_for(m: Macro, model: &UiModel, t: TineTheme) -> El {
         .fill(t.surface_raised)
         .border(1.0, t.accent)
         .child(text(title.clone()).font(typography::LABEL).color(t.text))
+        .child(text(macro_summary(m)).font(typography::CAPTION).color(t.text))
         .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()));
 
     for r in rows {
@@ -582,7 +732,7 @@ fn tooltip_for(m: Macro, model: &UiModel, t: TineTheme) -> El {
 }
 
 /// In/Out meters with clip LEDs and the compressor GR mini-bar.
-fn meters_panel(tel: &AudioTelemetryFrame, held: (f32, f32), t: TineTheme) -> El {
+fn meters_panel(tel: &AudioTelemetryFrame, smooth_rms: (f32, f32), held: (f32, f32), t: TineTheme) -> El {
     const METER_W: f32 = 14.0;
     const METER_H: f32 = 150.0;
 
@@ -604,7 +754,7 @@ fn meters_panel(tel: &AudioTelemetryFrame, held: (f32, f32), t: TineTheme) -> El
             canvas(meter_shape(
                 METER_W,
                 METER_H,
-                tel.input_rms_db,
+                smooth_rms.0,
                 tel.input_peak_db,
                 held.0,
                 t,
@@ -624,7 +774,7 @@ fn meters_panel(tel: &AudioTelemetryFrame, held: (f32, f32), t: TineTheme) -> El
             canvas(meter_shape(
                 METER_W,
                 METER_H,
-                tel.output_rms_db,
+                smooth_rms.1,
                 tel.output_peak_db,
                 held.1,
                 t,

@@ -62,27 +62,30 @@ pub const VOICE_WINDOW_MS: f32 = 20.0;
 /// A voice window counts as voiced when its RMS exceeds noise RMS by this much.
 pub const VOICED_ABOVE_NOISE_DB: f32 = 10.0;
 /// Gate threshold offset above the measured noise RMS (dB).
-pub const GATE_OFFSET_DB: f32 = 6.0;
+pub const GATE_OFFSET_DB: f32 = 8.0;
 /// Noise RMS above which the aggressive `RNNoise` mix is selected (dBFS).
 pub const NOISY_RMS_DB: f32 = -48.0;
 /// Speech-to-noise ratio below which the aggressive `RNNoise` mix is selected (dB).
 pub const NOISY_SNR_DB: f32 = 26.0;
 /// Post-gain noise RMS above which the aggressive `RNNoise` mix is selected (dBFS).
-pub const NOISY_POST_GAIN_RMS_DB: f32 = -42.0;
+pub const NOISY_POST_GAIN_RMS_DB: f32 = -48.0;
+/// Input gain above which the aggressive `RNNoise` mix is selected (dB) so
+/// boosted room noise is suppressed.
+pub const HIGH_GAIN_DENOISE_DB: f32 = 12.0;
 /// `denoise_mix` selected for noisy rooms.
 pub const NOISY_DENOISE_MIX: f32 = 0.85;
 /// `denoise_mix` selected for quiet rooms.
 pub const QUIET_DENOISE_MIX: f32 = 0.50;
 /// Target integrated voiced-speech RMS after calibration (dBFS).
-pub const TARGET_SPEECH_RMS_DB: f32 = -18.0;
+pub const TARGET_SPEECH_RMS_DB: f32 = -20.0;
 /// Maximum input gain the calibrator may ask for (dB); above this it fails.
 pub const MAX_INPUT_GAIN_DB: f32 = 36.0;
 /// Compressor threshold offset above the gained voiced RMS (dB).
 pub const COMP_THRESH_OFFSET_DB: f32 = 2.0;
 /// Simulated output peaks must land at or above this (dBFS).
-pub const PEAK_TARGET_LOW_DB: f32 = -6.0;
+pub const PEAK_TARGET_LOW_DB: f32 = -9.0;
 /// Simulated output peaks must land at or below this (dBFS).
-pub const PEAK_TARGET_HIGH_DB: f32 = -3.0;
+pub const PEAK_TARGET_HIGH_DB: f32 = -6.0;
 /// Maximum makeup-verification simulation passes in `finish()`.
 pub const MAX_VERIFY_ITERATIONS: usize = 4;
 /// Sample is "clipped" at/above this level (dBFS).
@@ -636,18 +639,19 @@ impl AutoCalibrator {
     ) -> CalibrationReport {
         let gain = clamp_param(ParamId::InputGainDb, TARGET_SPEECH_RMS_DB - m.speech_rms_db);
         let snr_db = m.speech_rms_db - self.noise_rms_db;
-        let denoise = if snr_db < NOISY_SNR_DB || (self.noise_rms_db + gain) > NOISY_POST_GAIN_RMS_DB {
+        let denoise = if snr_db < NOISY_SNR_DB
+            || (self.noise_rms_db + gain) > NOISY_POST_GAIN_RMS_DB
+            || gain > HIGH_GAIN_DENOISE_DB
+        {
             NOISY_DENOISE_MIX
         } else {
             QUIET_DENOISE_MIX
         };
         // Stage 1 input gain runs before Stage 2 expander, so the expander sees
-        // `noise_rms_db + gain`. Also account for RNNoise attenuation before the
-        // expander so quiet speech syllables aren't chopped when AI denoising is active.
-        let gate = clamp_param(
-            ParamId::GateThresholdDb,
-            self.noise_rms_db + gain + GATE_OFFSET_DB - 4.0 * denoise,
-        );
+        // `noise_rms_db + gain`. Keep the gate threshold comfortably above the
+        // boosted room noise floor (and its non-click peak envelope) so quiet
+        // room sounds aren't amplified when the user is silent.
+        let gate = clamp_param(ParamId::GateThresholdDb, self.noise_rms_db + gain + GATE_OFFSET_DB);
         let thresh = clamp_param(ParamId::CompThreshDb, m.speech_rms_db + gain + COMP_THRESH_OFFSET_DB);
 
         let mut cal = Calibration {
@@ -932,11 +936,11 @@ mod tests {
 
     #[test]
     fn peak_target_distance_bands() {
+        assert_eq!(peak_target_distance(-9.0), 0.0);
+        assert_eq!(peak_target_distance(-7.5), 0.0);
         assert_eq!(peak_target_distance(-6.0), 0.0);
-        assert_eq!(peak_target_distance(-4.5), 0.0);
-        assert_eq!(peak_target_distance(-3.0), 0.0);
-        assert_eq!(peak_target_distance(-9.0), 3.0);
-        assert_eq!(peak_target_distance(0.0), 3.0);
+        assert_eq!(peak_target_distance(-12.0), 3.0);
+        assert_eq!(peak_target_distance(-3.0), 3.0);
     }
 
     #[test]

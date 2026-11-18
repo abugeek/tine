@@ -47,7 +47,7 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
                     "header/autotune",
                     "button",
                     "Auto-Tune (8s)",
-                    false,
+                    true,
                     t,
                     |s| {
                         s.emit(Intent::StartAutoTune);
@@ -58,7 +58,13 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
             row()
                 .key("header/bottom-row")
                 .w_full()
+                .center()
                 .gap(spacing::SM)
+                .child(
+                    text("1. Pick mic type  ·  2. Run Auto-Tune (8s)  ·  3. Fine-tune below")
+                        .font(typography::CAPTION)
+                        .color(t.text_dim),
+                )
                 .child(el().key("header/spacer-2").grow(1.0))
                 .child(monitor_group(s, t))
                 .child(bypass_switch(s, t)),
@@ -92,6 +98,16 @@ fn pill_button(
         .child(text(label_str).font(typography::LABEL).color(fg))
 }
 
+fn truncate_name(name: &str, max_chars: usize) -> String {
+    let mut chars = name.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
 /// Mic selector: shows the selected microphone and opens a native dropdown menu.
 fn mic_selector(s: &AppState, t: TineTheme) -> El {
     let mic_name = s
@@ -99,7 +115,7 @@ fn mic_selector(s: &AppState, t: TineTheme) -> El {
         .selected
         .and_then(|idx| s.model.endpoints.get(idx))
         .map_or("No Microphone", |e| e.name.as_str());
-    let label = format!("Mic: {mic_name} ▾");
+    let label = format!("Mic: {} ▾", truncate_name(mic_name, 28));
     let count = s.model.endpoints.len();
 
     row()
@@ -161,10 +177,10 @@ fn apo_status(s: &AppState, t: TineTheme) -> El {
         ApoBadge::NotInstalled | ApoBadge::Error(_) => t.danger,
     };
     let status_text = match &s.model.apo {
-        ApoBadge::Active => String::from("Cable: Active"),
-        ApoBadge::NotInstalled => String::from("Cable: Missing"),
-        ApoBadge::Inactive => String::from("Cable: Inactive"),
-        ApoBadge::Error(msg) => format!("Cable: Error — {msg}"),
+        ApoBadge::Active => String::from("Virtual Mic: Ready"),
+        ApoBadge::NotInstalled => String::from("Virtual Mic: Missing"),
+        ApoBadge::Inactive => String::from("Virtual Mic: Inactive"),
+        ApoBadge::Error(msg) => format!("Virtual Mic: Error — {msg}"),
     };
 
     let mut apo_row = row()
@@ -222,8 +238,7 @@ fn archetype_pills(s: &AppState, t: TineTheme) -> El {
         };
         let selected = s.model.archetype == arch;
         arch_group = arch_group.child(pill_button(key, "radio", name, selected, t, move |s| {
-            s.model.archetype = arch;
-            s.emit(Intent::SetArchetype(arch));
+            s.set_archetype_optimistic(arch);
         }));
     }
 
@@ -231,7 +246,11 @@ fn archetype_pills(s: &AppState, t: TineTheme) -> El {
 }
 
 fn bypass_switch(s: &AppState, t: TineTheme) -> El {
-    let label = if s.model.bypass { "A/B: Raw" } else { "A/B: Tine" };
+    let label = if s.model.bypass {
+        "Sound: Raw (Off)"
+    } else {
+        "Sound: Tine (On)"
+    };
     pill_button("header/bypass", "switch", label, !s.model.bypass, t, |s| {
         s.toggle_bypass_optimistic();
     })
@@ -261,13 +280,12 @@ fn monitor_group(s: &AppState, t: TineTheme) -> El {
     ));
 
     if monitor.enabled {
-        // Latency warning badge while monitoring is live.
+        // Nominal round-trip delay is ~42 ms (21.6 ms DSP + WASAPI); only warn red if > 60 ms.
         let latency = monitor.estimated_latency_ms;
-        let over_budget = latency > 23.0;
-        let (color, note) = if over_budget {
-            (t.danger, format!("⚠ ~{latency:.0} ms"))
+        let (color, note) = if latency > 60.0 {
+            (t.danger, format!("⚠ ~{latency:.0} ms delay"))
         } else {
-            (t.meter_amber, format!("~{latency:.0} ms"))
+            (t.text_dim, format!("~{latency:.0} ms delay"))
         };
         group = group.child(
             text(note)

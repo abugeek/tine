@@ -139,3 +139,124 @@ fn virtual_cable_param_updates_and_bypass_zero_alloc() {
         frame.output_rms_db
     );
 }
+
+fn measure_tone_rms(proc: &mut VirtualCableProcessor<65_536>, freq_hz: f32, amp: f32, blocks: usize) -> (f32, f32) {
+    let mut block = [0.0_f32; 480];
+    let mut phase = 0.0_f32;
+    let phase_inc = TAU * freq_hz / 48_000.0;
+    let mut sq_sum = 0.0_f64;
+    let mut peak = 0.0_f32;
+    let mut count = 0usize;
+    let warmup = blocks / 2;
+
+    for b in 0..blocks {
+        for s in &mut block {
+            *s = amp * phase.sin();
+            phase = (phase + phase_inc) % TAU;
+        }
+        proc.process_block(&mut block);
+        if b >= warmup {
+            for &s in &block {
+                let a = s.abs();
+                if a > peak {
+                    peak = a;
+                }
+                sq_sum += f64::from(s) * f64::from(s);
+                count += 1;
+            }
+        }
+    }
+    let rms = (sq_sum / count.max(1) as f64).sqrt() as f32;
+    (rms, peak)
+}
+
+#[test]
+fn virtual_cable_sliders_eq_dynamics_measurably_shape_audio() {
+    let params = Arc::new(ParamBlock::new());
+    let telemetry = Arc::new(Triple::new(AudioTelemetryFrame::default()));
+    let tap = Arc::new(SpscRing::<65_536>::new());
+
+    let mut proc = VirtualCableProcessor::new(
+        48_000.0,
+        4096,
+        Arc::clone(&params),
+        Arc::clone(&telemetry),
+        Arc::clone(&tap),
+    );
+
+    // 1. EQ low-shelf boost (+9 dB @ 250 Hz) vs cut (-9 dB @ 250 Hz) on 160 Hz tone.
+    let mut eq_boost = DspParams {
+        denoise_mix: 0.0,
+        gate_enabled: false,
+        comp_enabled: false,
+        deesser_enabled: false,
+        hpf_enabled: false,
+        ..DspParams::DEFAULT
+    };
+    eq_boost.eq_freq_hz[0] = 250.0;
+    eq_boost.eq_gain_db[0] = 9.0;
+    params.store(&eq_boost);
+    let (rms_boost, _) = measure_tone_rms(&mut proc, 160.0, 0.1, 40);
+
+    let mut eq_cut = eq_boost;
+    eq_cut.eq_gain_db[0] = -9.0;
+    params.store(&eq_cut);
+    let (rms_cut, _) = measure_tone_rms(&mut proc, 160.0, 0.1, 40);
+    assert!(
+        rms_boost > rms_cut * 3.0,
+        "EQ low-shelf boost ({rms_boost}) must significantly exceed cut ({rms_cut})"
+    );
+
+    // 2. Compressor (thresh -30 dBFS, ratio 6:1, no auto-makeup) reduces -6 dBFS tone.
+    let comp_off = DspParams {
+        denoise_mix: 0.0,
+        gate_enabled: false,
+        deesser_enabled: false,
+        hpf_enabled: false,
+        comp_enabled: false,
+        ..DspParams::DEFAULT
+    };
+    params.store(&comp_off);
+    let (rms_uncomp, _) = measure_tone_rms(&mut proc, 1000.0, 0.5, 40);
+
+    let comp_on = DspParams {
+        comp_enabled: true,
+        comp_thresh_db: -30.0,
+        comp_ratio: 6.0,
+        comp_auto_makeup: false,
+        comp_makeup_db: 0.0,
+        ..comp_off
+    };
+    params.store(&comp_on);
+    let (rms_comp, _) = measure_tone_rms(&mut proc, 1000.0, 0.5, 40);
+    assert!(
+        rms_comp < rms_uncomp * 0.5,
+        "compressor must reduce loud signal ({rms_comp} < 0.5 * {rms_uncomp})"
+    );
+
+    // 3. Gate (thresh -20 dBFS, ratio 6:1) attenuates a -40 dBFS floor.
+    let gate_on = DspParams {
+        gate_enabled: true,
+        gate_threshold_db: -20.0,
+        gate_ratio: 6.0,
+        ..comp_off
+    };
+    params.store(&gate_on);
+    let (rms_gated, _) = measure_tone_rms(&mut proc, 1000.0, 0.01, 60);
+    assert!(
+        rms_gated < 0.004,
+        "gate must attenuate -40 dBFS floor (got rms={rms_gated})"
+    );
+
+    // 4. Brickwall limiter caps output below ceiling (-6 dBFS ≈ 0.501).
+    let lim = DspParams {
+        limiter_ceiling_db: -6.0,
+        ..comp_off
+    };
+    params.store(&lim);
+    let (_, peak_limited) = measure_tone_rms(&mut proc, 1000.0, 0.9, 40);
+    assert!(
+        peak_limited <= 0.52,
+        "limiter ceiling -6 dBFS must cap peak (got {peak_limited})"
+    );
+}

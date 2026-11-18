@@ -253,8 +253,29 @@ pub fn badge_from_health(state: &ApoState) -> ApoBadge {
 
 /// Maps endpoint records to the UI rows (the id is kept as the picker's
 /// stable choice key).
+/// `true` when `spawn_device_watcher` saw a Windows audio device change (or on
+/// initial startup) so `child_refresh_model` re-enumerates COM endpoints.
+static DEVICES_DIRTY: AtomicBool = AtomicBool::new(true);
+
+/// Maps `CaptureEndpoint` records into `tine-ui` picker rows, excluding
+/// virtual-cable loopback inputs (`CABLE Output`) when physical mics exist so
+/// users cannot accidentally route Tine's own output back into its input.
 #[must_use]
 pub fn endpoint_rows(list: &[CaptureEndpoint]) -> Vec<EndpointRow> {
+    let physical: Vec<EndpointRow> = list
+        .iter()
+        .filter(|e| {
+            let lower = e.name.to_ascii_lowercase();
+            !lower.contains("cable output") && !lower.contains("vb-audio")
+        })
+        .map(|e| EndpointRow {
+            id: e.id.clone(),
+            name: e.name.clone(),
+        })
+        .collect();
+    if !physical.is_empty() {
+        return physical;
+    }
     list.iter()
         .map(|e| EndpointRow {
             id: e.id.clone(),
@@ -1042,6 +1063,9 @@ struct ChildModel {
     monitor_on: bool,
     endpoint_id: String,
     endpoints: Vec<String>,
+    output_devices: Vec<String>,
+    badge: ApoBadge,
+    last_device_refresh: Option<Instant>,
     last_local_edit: Option<Instant>,
 }
 
@@ -1054,6 +1078,11 @@ impl ChildModel {
             endpoints: apo_admin::list_capture_endpoints()
                 .map(|list| list.into_iter().map(|e| e.id).collect::<Vec<_>>())
                 .unwrap_or_default(),
+            output_devices: list_outputs()
+                .map(|list| list.into_iter().map(|d| d.name).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            badge: ApoBadge::Inactive,
+            last_device_refresh: None,
             last_local_edit: None,
         }
     }
@@ -1159,11 +1188,18 @@ fn initial_ui_model() -> UiModel {
 /// first-run onboarding detection.
 pub fn run_ui_child() {
     if let Ok(paths) = EnginePaths::system() {
-        let _ = crate::logging::init(&paths.logs_dir());
+        let _ = crate::logging::init_child_log(&paths.logs_dir(), "tine-ui.log");
     }
     tracing::info!(target: "tine::ui", "UI child starting");
 
     let model = initial_ui_model();
+    let initial_bypass = model.bypass;
+    let initial_monitor_on = model.monitor.enabled;
+    let initial_endpoint_id = model
+        .selected
+        .and_then(|idx| model.endpoints.get(idx))
+        .map(|e| e.id.clone())
+        .unwrap_or_default();
     ONBOARDING_PERSISTED.store(!model.first_run, Ordering::Release);
     if model.first_run {
         tracing::info!(target: "tine::ui", "first run detected: onboarding overlay shown");
@@ -1188,7 +1224,15 @@ pub fn run_ui_child() {
     let worker_handle = handle.clone();
     if std::thread::Builder::new()
         .name("tine-ui-bridge".to_owned())
-        .spawn(move || child_worker(&worker_handle, &rx_intents))
+        .spawn(move || {
+            child_worker(
+                &worker_handle,
+                &rx_intents,
+                initial_bypass,
+                initial_monitor_on,
+                initial_endpoint_id,
+            );
+        })
         .is_err()
     {
         tracing::error!(target: "tine::ui", "bridge worker spawn failed");
@@ -1198,22 +1242,73 @@ pub fn run_ui_child() {
     app.run();
 }
 
+/// Drains all currently queued intents and coalesces consecutive slider drags
+/// (`SetMacro` / `SetParam`) to their latest value so dragging a control never
+/// builds a multi-second pipe backlog.
+fn coalesce_intents(first: Intent, rx: &Receiver<Intent>) -> Vec<Intent> {
+    let mut batch = vec![first];
+    while let Ok(next) = rx.try_recv() {
+        match next {
+            Intent::SetMacro(m, v) => {
+                if let Some(existing) = batch
+                    .iter_mut()
+                    .rev()
+                    .find(|i| matches!(i, Intent::SetMacro(em, _) if *em == m))
+                {
+                    *existing = Intent::SetMacro(m, v);
+                    continue;
+                }
+            }
+            Intent::SetParam(id, v) => {
+                if let Some(existing) = batch
+                    .iter_mut()
+                    .rev()
+                    .find(|i| matches!(i, Intent::SetParam(eid, _) if *eid == id))
+                {
+                    *existing = Intent::SetParam(id, v);
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        batch.push(next);
+    }
+    batch
+}
+
 /// The child's bridge worker: intent dispatch to the pipe (admin requests
 /// run here, on this worker thread), the Auto-Tune wizard's ~10 Hz
 /// progress poll while a run is in flight, plus timed `status`/`meters`
 /// polls that post coalesced, visibility-gated updates to the Rune state.
-fn child_worker(handle: &rune::AppHandle<AppState>, rx_intents: &Receiver<Intent>) {
+fn child_worker(
+    handle: &rune::AppHandle<AppState>,
+    rx_intents: &Receiver<Intent>,
+    initial_bypass: bool,
+    initial_monitor_on: bool,
+    initial_endpoint_id: String,
+) {
     let pipe = single_instance::pipe_name_for_user();
     let mut model = ChildModel::new();
+    model.bypass = initial_bypass;
+    model.monitor_on = initial_monitor_on;
+    model.endpoint_id = initial_endpoint_id;
     let mut autotune_active = false;
     let epoch = Instant::now();
     let mut last_status = epoch.checked_sub(STATUS_PERIOD).unwrap_or(epoch);
     let mut last_meters = epoch.checked_sub(METERS_PERIOD).unwrap_or(epoch);
     let mut last_wizard = epoch.checked_sub(WIZARD_PERIOD).unwrap_or(epoch);
     loop {
-        // 1. Pending intents take priority (latency-free UI).
+        // 1. Pending intents take priority (coalesced so rapid slider drags stay instant).
         let woke = match rx_intents.recv_timeout(METERS_PERIOD) {
-            Ok(intent) => child_dispatch(handle, &pipe, &mut model, &intent),
+            Ok(first) => {
+                let mut started = false;
+                for intent in coalesce_intents(first, rx_intents) {
+                    if child_dispatch(handle, &pipe, &mut model, &intent) {
+                        started = true;
+                    }
+                }
+                started
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         };
@@ -1262,6 +1357,9 @@ fn child_worker(handle: &rune::AppHandle<AppState>, rx_intents: &Receiver<Intent
             {
                 handle.update_if(move |s, _| {
                     METERS_QUEUED.store(false, Ordering::Release);
+                    if s.live == live {
+                        return false;
+                    }
                     s.live = live;
                     true
                 });
@@ -1303,6 +1401,9 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
         close_wizard(handle);
     } else if let Intent::DiscardCalibration = intent {
         tracing::info!(target: "tine::ui", "auto-tune results discarded");
+        close_wizard(handle);
+    } else if let Intent::CancelAutoTune = intent {
+        tracing::info!(target: "tine::ui", "auto-tune cancelled / closed");
         close_wizard(handle);
     }
     let req = match intent {
@@ -1449,14 +1550,26 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
         tracing::debug!(target: "tine::ui", "status unavailable (parent starting?)");
         return;
     };
-    // Picker rows the parent's next `SelectEndpoint` indexes into.
-    model.endpoints = apo_admin::list_capture_endpoints().map_or_else(
-        |e| {
-            tracing::warn!(target: "tine::ui", "endpoint re-enumeration failed: {e}");
-            model.endpoints.clone()
-        },
-        |list| list.into_iter().map(|e| e.id).collect::<Vec<_>>(),
-    );
+    // Re-enumerate COM audio devices only when DeviceWatcher signaled a change,
+    // on initial load, or as a 30s fallback (avoids 3 COM enumerations every 2s).
+    let device_stale = model
+        .last_device_refresh
+        .is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+    if DEVICES_DIRTY.swap(false, Ordering::AcqRel) || device_stale {
+        model.last_device_refresh = Some(Instant::now());
+        model.endpoints = apo_admin::list_capture_endpoints().map_or_else(
+            |e| {
+                tracing::warn!(target: "tine::ui", "endpoint re-enumeration failed: {e}");
+                model.endpoints.clone()
+            },
+            |list| list.into_iter().map(|e| e.id).collect::<Vec<_>>(),
+        );
+        model.output_devices = list_outputs().map_or_else(
+            |_| model.output_devices.clone(),
+            |list| list.into_iter().map(|d| d.name).collect::<Vec<_>>(),
+        );
+        model.badge = badge_from_health(&apo_admin::health(&model.endpoint_id));
+    }
     let mut note_banner: Option<String> = None;
     if let Some(notes) = status.get("notes").and_then(Value::as_array)
         && !notes.is_empty()
@@ -1492,9 +1605,7 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
     let monitor_on = model.monitor_on;
     let monitor_device = status.get("monitor_device").and_then(Value::as_str).map(str::to_owned);
     let latency = if monitor_on { nominal_monitor_latency_ms() } else { 0.0 };
-    let devices = list_outputs()
-        .map(|list| list.into_iter().map(|d| d.name).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let devices = model.output_devices.clone();
     let profile_update = if in_edit_cooldown {
         None
     } else {
@@ -1536,7 +1647,7 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
         Some((macros, params, pins, archetype))
     };
     let selected_id = model.endpoint_id.clone();
-    let badge = badge_from_health(&apo_admin::health(&selected_id));
+    let badge = model.badge.clone();
     handle.update_if(move |s, _| {
         if s.model.first_run && s.ui.onboarding_dismissed {
             s.model.first_run = false;
@@ -1584,6 +1695,7 @@ fn spawn_device_watcher(handle: &rune::AppHandle<AppState>) {
         .spawn(move || {
             let watcher = watcher;
             while let Ok(_event) = rx.recv() {
+                DEVICES_DIRTY.store(true, Ordering::Release);
                 match apo_admin::list_capture_endpoints() {
                     Ok(list) => {
                         let rows = endpoint_rows(&list);

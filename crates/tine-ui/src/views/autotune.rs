@@ -807,9 +807,9 @@ mod tests {
         }
         // Uniform noise at +-0.005 has ~-50.8 dBFS RMS: a quiet room.
         assert!(results.noise_rms_db < -48.0);
-        // The report's offline verification proves the -6..-3 dBFS window.
+        // The report's offline verification proves the -9..-6 dBFS window.
         assert!(
-            (-6.0..=-3.0).contains(&results.simulated_peak_db),
+            (-9.0..=-6.0).contains(&results.simulated_peak_db),
             "simulated peak {}",
             results.simulated_peak_db
         );
