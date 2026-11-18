@@ -19,8 +19,21 @@ use cpal::Data;
 use tine_protocol::sync::SpscRing;
 
 use super::StreamStats;
-use super::convert::{downmix_to_mono, upmix_from_mono};
+use super::convert::{downmix_to_mono, upmix_from_mono_at};
 use super::drift::AdaptiveResampler;
+
+/// Whether a `cpal` stream error means the stream is dead and must be
+/// rebuilt. `Xrun` (WASAPI `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, which
+/// some drivers raise right after start), `DeviceChanged` (the stream was
+/// rerouted and stays active) and `RealtimeDenied` (audio keeps running) are
+/// notifications, not failures.
+#[must_use]
+pub(crate) const fn stream_error_is_fatal(kind: cpal::ErrorKind) -> bool {
+    !matches!(
+        kind,
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied
+    )
+}
 
 /// Lock-free atomic counters updated from the RT callback and read from control threads.
 pub(crate) struct AtomicStreamStats {
@@ -28,6 +41,9 @@ pub(crate) struct AtomicStreamStats {
     pub(crate) overruns: AtomicU64,
     pub(crate) callbacks: AtomicU64,
     pub(crate) max_callback_us: AtomicU32,
+    /// Non-fatal backend notifications (WASAPI data discontinuity, reroute,
+    /// refused RT promotion): counted, never a reason to rebuild the stream.
+    pub(crate) xruns: AtomicU64,
     pub(crate) error_flag: AtomicBool,
 }
 
@@ -38,6 +54,7 @@ impl AtomicStreamStats {
             overruns: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             max_callback_us: AtomicU32::new(0),
+            xruns: AtomicU64::new(0),
             error_flag: AtomicBool::new(false),
         }
     }
@@ -48,6 +65,20 @@ impl AtomicStreamStats {
             overruns: ring_overruns.unwrap_or_else(|| self.overruns.load(Ordering::Relaxed)),
             callbacks: self.callbacks.load(Ordering::Relaxed),
             max_callback_us: self.max_callback_us.load(Ordering::Relaxed),
+            xruns: self.xruns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Records a backend stream error. RT-safe (atomics only): runs on the
+    /// stream thread. Only fatal kinds latch `error_flag`, which makes the
+    /// owner tear the stream down and rebuild it; a benign xrun would
+    /// otherwise turn a one-buffer glitch into a full rebuild gap.
+    #[inline]
+    pub(crate) fn record_stream_error(&self, kind: cpal::ErrorKind) {
+        if stream_error_is_fatal(kind) {
+            self.error_flag.store(true, Ordering::Release);
+        } else {
+            self.xruns.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -187,15 +218,15 @@ impl<const N: usize> PlaybackProcessor<N> {
     pub fn process_data(&mut self, data: &mut Data) {
         let start = Instant::now();
         let total_frames = data.len().checked_div(self.channels).unwrap_or(0);
-        let desired_target = self.resampler.desired_target_for(total_frames);
+        let prime_target = self.resampler.priming_target_for(total_frames);
         let was_primed = self.resampler.is_primed();
 
         // Drain available samples from SpscRing into the local jitter buffer.
-        // While unprimed, drop any excess backlog down to `desired_target` so
+        // While unprimed, drop any excess backlog down to the priming target so
         // startup queuing before playback's first callback does not inflate latency.
         loop {
-            if !was_primed && self.resampler.fill_level() > desired_target {
-                self.resampler.trim_to_target(desired_target);
+            if !was_primed && self.resampler.fill_level() > prime_target {
+                self.resampler.trim_to_target(prime_target);
             }
             let free = self.resampler.free();
             if free == 0 {
@@ -216,25 +247,20 @@ impl<const N: usize> PlaybackProcessor<N> {
                 break;
             }
         }
-        if !was_primed && self.resampler.fill_level() > desired_target {
-            self.resampler.trim_to_target(desired_target);
+        if !was_primed && self.resampler.fill_level() > prime_target {
+            self.resampler.trim_to_target(prime_target);
         }
 
         // Render in chunks bounded by mono_scratch (in case cpal sends a larger buffer).
         let mut any_underrun = false;
-
-        if total_frames <= self.mono_scratch.len() {
-            if let Some(mono) = self.mono_scratch.get_mut(..total_frames) {
-                any_underrun = self.resampler.render(mono);
-                upmix_from_mono(mono, self.channels, data);
+        let mut frame_off = 0usize;
+        while frame_off < total_frames {
+            let chunk_frames = total_frames.saturating_sub(frame_off).min(self.mono_scratch.len());
+            if let Some(mono) = self.mono_scratch.get_mut(..chunk_frames) {
+                any_underrun |= self.resampler.render(mono);
+                upmix_from_mono_at(mono, self.channels, data, frame_off);
             }
-        } else {
-            // Fallback for unexpectedly huge buffers: fill what fits and zero the rest.
-            let cap = self.mono_scratch.len();
-            if let Some(mono) = self.mono_scratch.get_mut(..cap) {
-                any_underrun = self.resampler.render(mono);
-                upmix_from_mono(mono, self.channels, data);
-            }
+            frame_off = frame_off.saturating_add(chunk_frames);
         }
 
         if any_underrun {
@@ -262,25 +288,69 @@ impl<const N: usize> PlaybackProcessor<N> {
 mod tests {
     use super::*;
 
+    /// A WASAPI data discontinuity (cpal `Xrun`) right after start must be
+    /// counted, not latched: latching it made the router tear down and
+    /// rebuild twice per app start and abort `devhost record-raw` (T24).
+    #[test]
+    fn benign_stream_errors_are_counted_not_latched() {
+        let stats = AtomicStreamStats::new();
+        for kind in [
+            cpal::ErrorKind::Xrun,
+            cpal::ErrorKind::DeviceChanged,
+            cpal::ErrorKind::RealtimeDenied,
+        ] {
+            assert!(!stream_error_is_fatal(kind), "{kind:?} must not be fatal");
+            stats.record_stream_error(kind);
+        }
+        assert!(!stats.error_flag.load(Ordering::Acquire));
+        assert_eq!(stats.snapshot(None).xruns, 3);
+    }
+
+    #[test]
+    fn fatal_stream_errors_latch_the_rebuild_flag() {
+        for kind in [
+            cpal::ErrorKind::DeviceNotAvailable,
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::BackendError,
+            cpal::ErrorKind::DeviceBusy,
+        ] {
+            let stats = AtomicStreamStats::new();
+            assert!(stream_error_is_fatal(kind), "{kind:?} must be fatal");
+            stats.record_stream_error(kind);
+            assert!(stats.error_flag.load(Ordering::Acquire));
+            assert_eq!(stats.snapshot(None).xruns, 0);
+        }
+    }
+
     #[test]
     fn resampler_trim_before_priming_drops_startup_backlog() {
         let mut resampler = AdaptiveResampler::with_headroom(48_000, 48_000, 16_384, 2.0);
         let desired_target = resampler.desired_target_for(480);
         assert_eq!(desired_target, 960);
+        // T24: the first prime is deeper; backlog is trimmed to that depth.
+        let prime_target = resampler.priming_target_for(480);
+        assert_eq!(prime_target, 960 * super::super::drift::STARTUP_PRIME_FACTOR);
 
         // Simulate 120 ms of startup backlog (5760 samples).
         let chunk = [0.25_f32; 480];
         for _ in 0..12 {
             resampler.push_input(&chunk);
-            if !resampler.is_primed() && resampler.fill_level() > desired_target {
-                resampler.trim_to_target(desired_target);
+            if !resampler.is_primed() && resampler.fill_level() > prime_target {
+                resampler.trim_to_target(prime_target);
             }
         }
-        assert_eq!(resampler.fill_level(), desired_target);
+        assert_eq!(resampler.fill_level(), prime_target);
 
         let mut out = [0.0_f32; 480];
         assert!(!resampler.render(&mut out));
         assert!(resampler.is_primed());
-        assert_eq!(resampler.fill_level(), 480);
+        // The first primed render already runs the +0.5 % start-up drain.
+        let after = resampler.fill_level();
+        assert!(
+            (prime_target - 484..=prime_target - 480).contains(&after),
+            "fill {after}"
+        );
+        // Once primed, the steady target applies again.
+        assert_eq!(resampler.priming_target_for(480), desired_target);
     }
 }

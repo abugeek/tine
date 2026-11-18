@@ -18,8 +18,8 @@ use std::time::Instant;
 use assert_no_alloc::AllocDisabler;
 use common::{peak_db, pink_noise, read_flac_mono, rms_db, sine, white_noise};
 use tine_dsp::calibrator::{
-    AutoCalibrator, CHANGED_PARAM_COUNT, CHANGED_PARAMS, CalFailure, CalPhase, CalibrationReport, MAX_INPUT_GAIN_DB,
-    MIN_VOICED_MS, PEAK_TARGET_HIGH_DB, PEAK_TARGET_LOW_DB, TARGET_SPEECH_RMS_DB,
+    AutoCalibrator, CHANGED_PARAM_COUNT, CHANGED_PARAMS, CalFailure, CalPhase, CalibrationReport, GATE_OFFSET_DB,
+    MAX_INPUT_GAIN_DB, MIN_VOICED_MS, PEAK_TARGET_HIGH_DB, PEAK_TARGET_LOW_DB, TARGET_SPEECH_RMS_DB,
 };
 use tine_dsp::macros::MacroMapper;
 use tine_dsp::presets::{PresetDef, builtin};
@@ -204,7 +204,7 @@ fn noisy_quiet_fixture_meets_acceptance() {
     let cal = &report.calibration;
     let noise_region = stream.get(FS..4 * FS).expect("noise region");
 
-    // Gate threshold = measured noise RMS + input gain + 6 dB - 4 * denoise_mix
+    // Gate threshold = measured noise RMS + input gain + GATE_OFFSET_DB
     // (clamped to SPECS, ± 0.5 dB), with noise_rms independently measured as
     // the median of 100 ms window RMS values.
     let noise_rms = median_window_rms_db(noise_region, FS / 10);
@@ -213,8 +213,7 @@ fn noisy_quiet_fixture_meets_acceptance() {
         "fixture noise level sanity: {noise_rms:.2} dBFS"
     );
     let gate_spec = ParamId::GateThresholdDb.spec();
-    let expected_gate = (noise_rms + cal.derived.input_gain_db + 6.0 - 4.0 * cal.derived.denoise_mix)
-        .clamp(gate_spec.min, gate_spec.max);
+    let expected_gate = (noise_rms + cal.derived.input_gain_db + GATE_OFFSET_DB).clamp(gate_spec.min, gate_spec.max);
     assert!(
         (cal.derived.gate_threshold_db - expected_gate).abs() <= 0.5,
         "gate {} dB vs expected {expected_gate:.2} dB",
@@ -526,8 +525,8 @@ fn hot_preamp_quiet_room_uses_gentle_denoise_and_gain_shifted_gate() {
         cal.derived.input_gain_db
     );
     let gate_spec = ParamId::GateThresholdDb.spec();
-    let expected_gate = (cal.noise_rms_db + cal.derived.input_gain_db + 6.0 - 4.0 * cal.derived.denoise_mix)
-        .clamp(gate_spec.min, gate_spec.max);
+    let expected_gate =
+        (cal.noise_rms_db + cal.derived.input_gain_db + GATE_OFFSET_DB).clamp(gate_spec.min, gate_spec.max);
     assert!(
         (cal.derived.gate_threshold_db - expected_gate).abs() <= 0.1,
         "gate {} dB vs expected {expected_gate:.2} dB",

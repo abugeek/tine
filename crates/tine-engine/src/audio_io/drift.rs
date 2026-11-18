@@ -17,6 +17,29 @@
 /// callbacks (≈ 30 ms) via [`AdaptiveResampler::with_headroom`].
 pub(crate) const HEADROOM_CALLBACKS: f64 = 2.0;
 
+/// Start-up priming depth as a multiple of the steady target (T24).
+///
+/// Playback starts only once the local buffer holds this many targets. When
+/// the sink already has an active reader (an app recording `CABLE Output`),
+/// the shared engine's first render callbacks drain the buffer in a burst; a
+/// 1x prime starved once in ~1 of 5 such starts (measured). The surplus is
+/// drained by a fixed start-up drain ([`STARTUP_DRAIN_RATE`]), not by the
+/// drift loop, so steady-state latency and control behaviour are unchanged.
+pub(crate) const STARTUP_PRIME_FACTOR: usize = 2;
+
+/// Playback-speed surplus used to drain the start-up prime back to the steady
+/// target: +0.5 % (~0.09 semitone, inaudible) drains one extra target in ~4 s.
+///
+/// The drift PI loop must not do this: its +-0.1 % clamp needs ~20 s, during
+/// which the integral winds up and then drives the fill ~45 % below target
+/// for tens of seconds; with scheduler jitter that measured as 164 underruns
+/// between 20 s and 50 s after start (T24). The loop is frozen while draining
+/// and starts from zeroed state exactly at the target.
+pub(crate) const STARTUP_DRAIN_RATE: f64 = 0.005;
+
+// +0.5 % playback speed is ~0.09 semitone; keep the drain inaudibly small.
+const _: () = assert!(STARTUP_DRAIN_RATE > 0.0 && STARTUP_DRAIN_RATE <= 0.005);
+
 /// Nominal WASAPI shared-mode callback size in frames at 48 kHz, used for the
 /// pre-`render` center estimate (each `render` recomputes the target from the
 /// actual `out.len()`).
@@ -104,6 +127,8 @@ pub(crate) struct AdaptiveResampler {
     err_filtered: f64,
     err_integral: f64,
     primed: bool,
+    /// `true` from the (doubled) first prime until the fill is back at target.
+    draining_startup: bool,
     target_fill: usize,
     last_ratio: f64,
 }
@@ -136,6 +161,7 @@ impl AdaptiveResampler {
             err_filtered: 0.0,
             err_integral: 0.0,
             primed: false,
+            draining_startup: false,
             target_fill: default_target,
             last_ratio: base_ratio,
         }
@@ -173,6 +199,20 @@ impl AdaptiveResampler {
         ((self.headroom_callbacks * frames * self.base_ratio) as usize).clamp(128, self.ring.capacity() / 2)
     }
 
+    /// Fill level that must be reached before playback starts: the steady
+    /// target, times [`STARTUP_PRIME_FACTOR`] until the first prime.
+    #[inline]
+    pub(crate) fn priming_target_for(&self, out_frames: usize) -> usize {
+        let target = self.desired_target_for(out_frames);
+        if self.primed {
+            target
+        } else {
+            target
+                .saturating_mul(STARTUP_PRIME_FACTOR)
+                .min(self.ring.capacity().saturating_mul(3) / 4)
+        }
+    }
+
     /// Drops oldest queued samples so the ring fill level does not exceed `target`.
     #[inline]
     pub(crate) fn trim_to_target(&mut self, target: usize) {
@@ -200,8 +240,9 @@ impl AdaptiveResampler {
         self.target_fill = self.desired_target_for(out.len());
 
         if !self.primed {
-            if self.ring.len() >= self.target_fill {
+            if self.ring.len() >= self.priming_target_for(out.len()) {
                 self.primed = true;
+                self.draining_startup = STARTUP_PRIME_FACTOR > 1;
             } else {
                 out.fill(0.0);
                 return false;
@@ -215,18 +256,31 @@ impl AdaptiveResampler {
             && self.ring.len() > self.target_fill
         {
             self.ring.advance(self.ring.len().saturating_sub(self.target_fill));
+            self.draining_startup = false;
             self.err_filtered = 0.0;
             self.err_integral = 0.0;
             self.frac_pos = 0.0;
         }
 
-        // Smooth fill-level error (PI controller) and clamp drift adjustment to ±0.1 % (±0.001).
-        let fill = self.ring.len() as f64;
-        let target = (self.target_fill as f64).max(1.0);
-        let err = (fill - target) / target;
-        self.err_filtered += 0.02 * (err - self.err_filtered);
-        self.err_integral = (self.err_integral + err * 0.002).clamp(-1.0, 1.0);
-        let drift_adj = (self.err_filtered * 0.001 + self.err_integral * 0.0005).clamp(-0.001, 0.001);
+        // Start-up drain: consume the doubled prime at a fixed +0.5 % with the
+        // PI loop frozen, then hand over from exactly the target with zeroed
+        // controller state (no integral windup, no undershoot).
+        if self.draining_startup && self.ring.len() <= self.target_fill {
+            self.draining_startup = false;
+            self.err_filtered = 0.0;
+            self.err_integral = 0.0;
+        }
+        let drift_adj = if self.draining_startup {
+            STARTUP_DRAIN_RATE
+        } else {
+            // Smooth fill-level error (PI controller) and clamp drift adjustment to ±0.1 % (±0.001).
+            let fill = self.ring.len() as f64;
+            let target = (self.target_fill as f64).max(1.0);
+            let err = (fill - target) / target;
+            self.err_filtered += 0.02 * (err - self.err_filtered);
+            self.err_integral = (self.err_integral + err * 0.002).clamp(-1.0, 1.0);
+            (self.err_filtered * 0.001 + self.err_integral * 0.0005).clamp(-0.001, 0.001)
+        };
         let step = self.base_ratio * (1.0 + drift_adj);
         self.last_ratio = step;
 
@@ -281,7 +335,7 @@ mod tests {
     //! 30-min soak), while priming silence and *real* starvation keep their
     //! distinct, honest outcomes.
 
-    use super::{AdaptiveResampler, HEADROOM_CALLBACKS, LocalRing};
+    use super::{AdaptiveResampler, HEADROOM_CALLBACKS, LocalRing, STARTUP_PRIME_FACTOR};
 
     fn resampler_48k() -> AdaptiveResampler {
         AdaptiveResampler::new(48_000, 48_000, 16_384)
@@ -296,29 +350,56 @@ mod tests {
         );
     }
 
-    /// Priming waits for `HEADROOM_CALLBACKS × callback` of input; the silence
-    /// played while warming up must NOT be reported as an underrun.
+    /// Priming waits for `STARTUP_PRIME_FACTOR × HEADROOM_CALLBACKS × callback`
+    /// of input; the silence played while warming up must NOT be reported as
+    /// an underrun.
     #[test]
     fn priming_waits_for_headroom_and_is_not_an_underrun() {
         let mut r = resampler_48k();
         let block = [0.5_f32; 480];
         let mut out = [0.0_f32; 480];
+        let prime_callbacks = 2 * STARTUP_PRIME_FACTOR; // default 2-callback target, doubled
 
-        // 1 callback of input: short of the (default 2-callback) target.
-        assert_eq!(r.push_input(&block), 480);
-        let underrun = r.render(&mut out);
-        assert!(!underrun, "priming silence must not count as an underrun");
-        assert!(out.iter().all(|s| *s == 0.0), "pre-prime render must be silent");
-        assert_eq!(r.fill_level(), 480, "pre-prime render consumes nothing");
+        // Short of the start-up prime: silent, nothing consumed, no underrun.
+        for n in 1..prime_callbacks {
+            assert_eq!(r.push_input(&block), 480);
+            let underrun = r.render(&mut out);
+            assert!(!underrun, "priming silence must not count as an underrun");
+            assert!(out.iter().all(|s| *s == 0.0), "pre-prime render must be silent");
+            assert_eq!(r.fill_level(), 480 * n, "pre-prime render consumes nothing");
+        }
 
-        // One more callback homes the buffer; audio flows.
+        // The last callback reaches the start-up prime; audio flows.
         assert_eq!(r.push_input(&block), 480);
         assert!(!r.render(&mut out));
         assert!(
             out.iter().any(|s| *s > 0.1),
             "primed render must emit the buffered signal"
         );
-        assert_eq!(r.fill_level(), 480);
+        // The first primed render already runs the +0.5 % start-up drain.
+        let expected = 480 * (prime_callbacks - 1);
+        assert!(
+            (expected - 4..=expected).contains(&r.fill_level()),
+            "fill {} vs {expected}",
+            r.fill_level()
+        );
+    }
+
+    /// T24: right after priming, a sink that already has an active reader
+    /// pulls a burst of callbacks with no new input. The doubled start-up
+    /// prime must absorb a 2-callback burst without starving.
+    #[test]
+    fn startup_burst_after_priming_does_not_underrun() {
+        let mut r = resampler_48k();
+        let block = [0.5_f32; 480];
+        let mut out = [0.0_f32; 480];
+        for _ in 0..2 * STARTUP_PRIME_FACTOR {
+            assert_eq!(r.push_input(&block), 480);
+        }
+        assert!(!r.render(&mut out), "priming render");
+        assert!(!r.render(&mut out), "burst callback 1 must not starve");
+        assert!(!r.render(&mut out), "burst callback 2 must not starve");
+        assert!(out.iter().all(|s| *s > 0.1), "burst must play buffered audio");
     }
 
     /// The steady-state fill with `with_headroom(6.0)` absorbs a 4-callback
@@ -330,8 +411,8 @@ mod tests {
         let block = [0.5_f32; 480];
         let mut out = [0.0_f32; 480];
 
-        // Prime: 6 callbacks worth of input before the first render.
-        for _ in 0..6 {
+        // Prime: the doubled start-up prime of a 6-callback target.
+        for _ in 0..6 * STARTUP_PRIME_FACTOR {
             assert_eq!(r.push_input(&block), 480);
         }
         assert!(!r.render(&mut out));
@@ -353,8 +434,54 @@ mod tests {
         }
 
         // A gap that genuinely drains the buffer IS reported: no masking.
-        assert!(r.render(&mut out), "starvation must still be flagged");
+        let mut starved = false;
+        for _ in 0..64 {
+            if r.render(&mut out) {
+                starved = true;
+                break;
+            }
+        }
+        assert!(starved, "starvation must still be flagged");
         assert!(out.contains(&0.0), "starved render must contain silence");
+    }
+
+    /// T24 regression: after the doubled prime, the fill must settle at the
+    /// steady target without undershooting it (the drift loop alone wound up
+    /// and fell ~45 % below target 20-50 s after start, causing underruns).
+    #[test]
+    fn startup_surplus_drains_without_windup_or_undershoot() {
+        let mut r = resampler_48k();
+        let block = [0.5_f32; 480];
+        let mut out = [0.0_f32; 480];
+        for _ in 0..2 * STARTUP_PRIME_FACTOR {
+            assert_eq!(r.push_input(&block), 480);
+        }
+        assert!(!r.render(&mut out));
+        let mut drained_at = None;
+        let mut min_post_render = usize::MAX;
+        for n in 0..9_000 {
+            // 90 s of matched-rate input
+            assert_eq!(r.push_input(&block), 480);
+            assert!(!r.render(&mut out), "no underrun at callback {n}");
+            if drained_at.is_none() && !r.draining_startup {
+                drained_at = Some(n);
+            }
+            if drained_at.is_some() {
+                min_post_render = min_post_render.min(r.fill_level());
+            }
+        }
+        let drained_at = drained_at.unwrap_or(usize::MAX);
+        assert!(
+            drained_at <= 500,
+            "surplus must drain within ~5 s, took {drained_at} callbacks"
+        );
+        // Steady post-render fill is target - one callback = 480; allow a few
+        // samples of interpolation phase, never the old ~200-sample undershoot.
+        assert!(
+            min_post_render >= 470,
+            "fill undershot after the drain: {min_post_render}"
+        );
+        assert!((r.last_ratio() - 1.0).abs() <= 1.001e-3, "back inside the ±0.1 % loop");
     }
 
     /// Moderate playback-side overfill (within the hard-resync threshold) is
@@ -367,6 +494,16 @@ mod tests {
 
         // Overfill moderately (4 callbacks = 1920 < 3 * 960 = 2880 hard-resync threshold).
         for _ in 0..4 {
+            assert_eq!(r.push_input(&block), 480);
+        }
+        // Let the T24 start-up drain finish first (it runs outside the clamp;
+        // this test starts with 2400 samples, more than the trimmed 1920),
+        // then overfill moderately again so the drift loop has work to do.
+        for _ in 0..1_200 {
+            assert_eq!(r.push_input(&block), 480);
+            assert!(!r.render(&mut out));
+        }
+        for _ in 0..2 {
             assert_eq!(r.push_input(&block), 480);
         }
         for _ in 0..200 {

@@ -25,3 +25,4 @@
 | T21 | End-to-end integration in `tine.exe` | Z — Integration & ship | done | `task/T21-end-to-end` | #24 | t21 (GLM) |
 | T22 | QA: soak, perf, mic/app matrix, listening tests | Z — Integration & ship | done | `task/T22-qa` | #31 | t22 (GLM) |
 | T23 | Installer, signing, release, OSS docs | Z — Integration & ship | done | `task/T23-packaging-release` | #29 | t23 (GLM) |
+| T24 | Competitor benchmark follow-up: stream health, idle cost, memory | Z — Integration & ship | review | (working tree) | — | Claude |

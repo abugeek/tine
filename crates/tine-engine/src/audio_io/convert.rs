@@ -145,73 +145,95 @@ fn downmix_slice<T: Copy>(
 /// Upmixes mono `f32` samples in `mono` to all `channels` of `data`, converting to the
 /// stream's [`SampleFormat`].
 #[allow(clippy::arithmetic_side_effects)] // Floating-point clamping.
-pub(crate) fn upmix_from_mono(mono: &[f32], channels: usize, data: &mut Data) {
+pub(crate) fn upmix_from_mono_at(mono: &[f32], channels: usize, data: &mut Data, frame_offset: usize) {
     if channels == 0 || mono.is_empty() {
         return;
     }
 
     match data.sample_format() {
-        SampleFormat::F32 => upmix_slice(mono, channels, data.as_slice_mut::<f32>().unwrap_or(&mut []), |s| s),
+        SampleFormat::F32 => upmix_slice(
+            mono,
+            channels,
+            frame_offset,
+            data.as_slice_mut::<f32>().unwrap_or(&mut []),
+            |s| s,
+        ),
         SampleFormat::F64 => {
-            upmix_slice(mono, channels, data.as_slice_mut::<f64>().unwrap_or(&mut []), f64::from);
+            upmix_slice(
+                mono,
+                channels,
+                frame_offset,
+                data.as_slice_mut::<f64>().unwrap_or(&mut []),
+                f64::from,
+            );
         }
         SampleFormat::I16 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<i16>().unwrap_or(&mut []),
             f32::to_sample::<i16>,
         ),
         SampleFormat::I24 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<I24>().unwrap_or(&mut []),
             f32::to_sample::<I24>,
         ),
         SampleFormat::I32 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<i32>().unwrap_or(&mut []),
             f32::to_sample::<i32>,
         ),
         SampleFormat::I64 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<i64>().unwrap_or(&mut []),
             f32::to_sample::<i64>,
         ),
         SampleFormat::I8 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<i8>().unwrap_or(&mut []),
             f32::to_sample::<i8>,
         ),
         SampleFormat::U8 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<u8>().unwrap_or(&mut []),
             f32::to_sample::<u8>,
         ),
         SampleFormat::U16 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<u16>().unwrap_or(&mut []),
             f32::to_sample::<u16>,
         ),
         SampleFormat::U24 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<U24>().unwrap_or(&mut []),
             f32::to_sample::<U24>,
         ),
         SampleFormat::U32 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<u32>().unwrap_or(&mut []),
             f32::to_sample::<u32>,
         ),
         SampleFormat::U64 => upmix_slice(
             mono,
             channels,
+            frame_offset,
             data.as_slice_mut::<u64>().unwrap_or(&mut []),
             f32::to_sample::<u64>,
         ),
@@ -219,7 +241,17 @@ pub(crate) fn upmix_from_mono(mono: &[f32], channels: usize, data: &mut Data) {
     }
 }
 
-fn upmix_slice<T: Copy>(mono: &[f32], channels: usize, dst: &mut [T], from_f32: impl Fn(f32) -> T) {
+fn upmix_slice<T: Copy>(
+    mono: &[f32],
+    channels: usize,
+    frame_offset: usize,
+    dst: &mut [T],
+    from_f32: impl Fn(f32) -> T,
+) {
+    let start = frame_offset.saturating_mul(channels);
+    let Some(dst) = dst.get_mut(start..) else {
+        return;
+    };
     for (&m, frame) in mono.iter().zip(dst.chunks_exact_mut(channels)) {
         let clamped = if m.is_finite() { m.clamp(-1.0, 1.0) } else { 0.0 };
         let converted = from_f32(clamped);

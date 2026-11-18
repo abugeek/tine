@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,6 +65,10 @@ pub enum Command {
     ResetToArchetype,
     /// Update "Hear Myself" monitor settings (controller state, D-008).
     SetMonitor(MonitorSettings),
+    /// Write pending persistence now instead of after [`PERSIST_DEBOUNCE`]
+    /// (shutdown path, T24). Acknowledged through
+    /// [`ControllerHandle::flush_blocking`].
+    Flush,
 }
 
 /// Event from the controller to its listeners (UI, tray, CLI pipe).
@@ -130,6 +135,8 @@ type SharedClient = Arc<Mutex<Option<Arc<ShmClient>>>>;
 pub struct ControllerHandle {
     tx: Arc<Sender<Command>>,
     client: SharedClient,
+    /// Completed [`Command::Flush`] count (bumped by the controller thread).
+    flushed: Arc<AtomicU64>,
 }
 
 impl Clone for ControllerHandle {
@@ -137,6 +144,7 @@ impl Clone for ControllerHandle {
         Self {
             tx: Arc::clone(&self.tx),
             client: Arc::clone(&self.client),
+            flushed: Arc::clone(&self.flushed),
         }
     }
 }
@@ -148,6 +156,29 @@ impl ControllerHandle {
     /// spawn failure).
     pub fn send(&self, cmd: Command) -> Result<(), SendError<Command>> {
         self.tx.send(cmd)
+    }
+
+    /// Asks the controller to write pending persistence now and waits up to
+    /// `timeout` for it to finish. Returns `true` once the write completed.
+    ///
+    /// Shutdown calls this before dropping its handles: the drop-triggered
+    /// flush runs on the controller thread, which nothing joins, so a change
+    /// made just before quitting could be lost when the process exited first
+    /// (T24: "Hear Myself" set ~100 ms before `quit` was not saved).
+    #[must_use]
+    pub fn flush_blocking(&self, timeout: Duration) -> bool {
+        let before = self.flushed.load(Ordering::Acquire);
+        if self.tx.send(Command::Flush).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.flushed.load(Ordering::Acquire) > before {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        false
     }
 
     /// Latest telemetry frame (defaults when not linked over shared memory).
@@ -202,9 +233,11 @@ impl Controller {
         let (tx_evt, rx_evt) = channel::<Event>();
         let client_slot: SharedClient = Arc::new(Mutex::new(None));
 
+        let flushed = Arc::new(AtomicU64::new(0));
         let handle = ControllerHandle {
             tx: Arc::new(tx_cmd),
             client: Arc::clone(&client_slot),
+            flushed: Arc::clone(&flushed),
         };
 
         let slot = Arc::clone(&client_slot);
@@ -213,7 +246,7 @@ impl Controller {
         // observe a dead controller instead of a half-alive one.
         let _spawned = thread::Builder::new()
             .name("tine-controller".to_owned())
-            .spawn(move || run(cfg, rx_cmd, tx_evt, slot));
+            .spawn(move || run(cfg, rx_cmd, tx_evt, slot, &flushed));
         (handle, rx_evt)
     }
 }
@@ -231,7 +264,7 @@ struct Loop {
 /// Controller-thread main loop (message driven, blocking receive).
 // The thread entry point owns its channel endpoints and config by design.
 #[allow(clippy::needless_pass_by_value)]
-fn run(cfg: EngineConfig, rx: Receiver<Command>, tx: Sender<Event>, slot: SharedClient) {
+fn run(cfg: EngineConfig, rx: Receiver<Command>, tx: Sender<Event>, slot: SharedClient, flushed: &AtomicU64) {
     let paths = cfg.paths;
 
     // ---- Startup: load persisted state --------------------------------
@@ -297,6 +330,11 @@ fn run(cfg: EngineConfig, rx: Receiver<Command>, tx: Sender<Event>, slot: Shared
         };
 
         match received {
+            Ok(Some(Command::Flush)) => {
+                state.persist_at = None;
+                flush_persistence(&mut state, &tx, &paths);
+                flushed.fetch_add(1, Ordering::Release);
+            }
             Ok(Some(cmd)) => {
                 apply_command(&mut state, &cmd, &tx, &slot, &paths);
                 state.persist_at = Some(Instant::now() + PERSIST_DEBOUNCE);
@@ -386,6 +424,8 @@ fn apply_command(state: &mut Loop, cmd: &Command, tx: &Sender<Event>, slot: &Sha
         Command::SetMonitor(monitor) => {
             model.monitor = monitor.clone();
         }
+        // Handled by the loop before `apply_command` (no model change).
+        Command::Flush => {}
     }
 
     if endpoint_changed {
@@ -432,6 +472,12 @@ fn target_to_client(target: &Target) -> Option<Arc<ShmClient>> {
 /// Writes all persistence layers for the current state (debounce deadline or
 /// exit).
 fn flush_persistence(state: &mut Loop, tx: &Sender<Event>, paths: &EnginePaths) {
+    // Preserve UI-owned flags (`onboarding_completed`, `pro_drawer_open`) written
+    // by the shell/pipe so controller flushes never clobber them.
+    if let persist::Loaded::Fresh(disk) = persist::load_settings(paths) {
+        state.settings.onboarding_completed |= disk.onboarding_completed;
+        state.settings.pro_drawer_open = disk.pro_drawer_open;
+    }
     state.settings.selected_endpoint_id = state.model.endpoint.as_ref().map(|e| e.as_str().to_owned());
     state.settings.monitor_device_id = state.model.monitor.output_device.clone();
     state.settings.monitor_enabled = state.model.monitor.enabled;
@@ -513,6 +559,35 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(appeared, "profile must be flushed on exit");
+    }
+
+    /// T24: a change made right before shutdown must reach disk once
+    /// `flush_blocking` returns, without waiting for the debounce.
+    #[test]
+    fn flush_blocking_persists_immediately() {
+        let paths = temp_paths("flush");
+        let block = Arc::new(ParamBlock::new());
+        let cfg = EngineConfig::block(EndpointId::new("mic-f"), Arc::clone(&block), paths.clone());
+        let (handle, rx) = Controller::spawn(cfg);
+        assert!(wait_event(&rx, |e| matches!(e, Event::ModelChanged(_)), Duration::from_secs(5)).is_some());
+
+        let monitor = MonitorSettings {
+            enabled: true,
+            output_device: Some("Headphones".to_owned()),
+        };
+        assert!(handle.send(Command::SetMonitor(monitor)).is_ok());
+        let t0 = Instant::now();
+        assert!(
+            handle.flush_blocking(Duration::from_secs(5)),
+            "flush must be acknowledged"
+        );
+        assert!(t0.elapsed() < PERSIST_DEBOUNCE, "flush must not wait for the debounce");
+        let saved = crate::persist::load_settings(&paths).into_value();
+        assert!(
+            saved.monitor_enabled,
+            "monitor state must be on disk after flush_blocking"
+        );
+        assert_eq!(saved.monitor_device_id.as_deref(), Some("Headphones"));
     }
 
     fn test_calibration() -> Calibration {

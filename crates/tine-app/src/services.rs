@@ -34,6 +34,9 @@ use tine_engine::audio_io::DeviceRef;
 use tine_engine::autotune::{
     AutoTuneConfig, AutoTuneEvent, AutoTuneOutcome, AutoTuneRunner, CalFailure, CalPhase, CaptureSpec,
 };
+use tine_engine::listeners::{
+    GateAction, PARKED_POLL, ParkPolicy, RUNNING_POLL, foreign_listener, is_sink_capture_side,
+};
 use tine_engine::model::{AppModel, EndpointId, KeepPins, resolve};
 use tine_engine::monitor::Monitor;
 use tine_engine::paths::{EnginePaths, PathsError};
@@ -41,6 +44,7 @@ use tine_engine::persist;
 use tine_engine::shm_client::{LinkState, ShmClient};
 use tine_engine::virtual_cable::VirtualCableRouter;
 use tine_engine::visualizer::{EngineSignals, InProcessSignals, UiFrame, Visualizer};
+use tine_engine::win::CaptureSessionWatcher;
 use tine_protocol::params::DspParams;
 use tine_protocol::presets::Calibration;
 use tine_protocol::shm::{ShmLayout, init_layout_in_place};
@@ -155,6 +159,13 @@ struct LeaseShim {
 // the process-wide `Services` mutex plus the `stop` flag on teardown.
 unsafe impl Send for LeaseShim {}
 
+/// Where a parked routing loop resumes (T24 listener gate).
+#[derive(Clone)]
+struct ParkedRoute {
+    endpoint: String,
+    sink: String,
+}
+
 /// Desired "Hear Myself" state (remembered when audio routing is not yet active).
 #[derive(Clone, Default)]
 enum MonitorWanted {
@@ -174,10 +185,23 @@ struct Services {
     monitor: Option<Monitor>,
     monitor_wanted: MonitorWanted,
     router: Option<RouterSlot>,
+    /// Routing loop stopped by the listener gate (T24): no app records the
+    /// virtual mic and nothing in Tine needs the processed signal.
+    parked: Option<ParkedRoute>,
     autotune: Option<AutotuneState>,
     autotune_cancel: Arc<AtomicBool>,
     lease: Option<LeaseShim>,
     messages: Vec<String>,
+}
+
+fn silent_telemetry() -> AudioTelemetryFrame {
+    AudioTelemetryFrame {
+        input_rms_db: -90.0,
+        input_peak_db: -90.0,
+        output_rms_db: -90.0,
+        output_peak_db: -90.0,
+        ..AudioTelemetryFrame::default()
+    }
 }
 
 impl Services {
@@ -187,12 +211,13 @@ impl Services {
             frames: None,
             last_frame: FrameSnapshot {
                 spectrum: [0.0; 32],
-                telemetry: AudioTelemetryFrame::default(),
+                telemetry: silent_telemetry(),
             },
             last_pull: None,
             monitor: None,
             monitor_wanted: MonitorWanted::Off,
             router: None,
+            parked: None,
             autotune: None,
             autotune_cancel: Arc::new(AtomicBool::new(false)),
             lease: None,
@@ -202,7 +227,13 @@ impl Services {
 
     /// Logs and queues a user-facing message (never a silent failure).
     fn surface(&mut self, msg: String) {
+        if self.messages.iter().any(|m| m == &msg) {
+            return;
+        }
         tracing::warn!(target: "tine::services", "{msg}");
+        if self.messages.len() >= 16 {
+            self.messages.remove(0);
+        }
         self.messages.push(msg);
     }
 }
@@ -297,7 +328,7 @@ pub fn param_block() -> Arc<ParamBlock> {
 /// visualizer and the pipe stay connected across router restarts).
 fn router_telemetry() -> Arc<Triple<AudioTelemetryFrame>> {
     static T: OnceLock<Arc<Triple<AudioTelemetryFrame>>> = OnceLock::new();
-    Arc::clone(T.get_or_init(|| Arc::new(Triple::new(AudioTelemetryFrame::default()))))
+    Arc::clone(T.get_or_init(|| Arc::new(Triple::new(silent_telemetry()))))
 }
 
 /// Post-DSP tap samples published by the routing loop (process-wide).
@@ -328,6 +359,17 @@ fn input_rate(endpoint: &str) -> u32 {
 #[must_use]
 pub fn router_follow(endpoint: &str) -> bool {
     let wanted = endpoint.to_owned();
+    // T24: a parked loop counts as healthy; it resumes on the (possibly new)
+    // endpoint when a listener or an internal consumer appears.
+    if with(|s| match s.parked.as_mut() {
+        Some(p) => {
+            p.endpoint.clone_from(&wanted);
+            true
+        }
+        None => false,
+    }) {
+        return true;
+    }
     // E5: check idempotency (same endpoint AND healthy router) before
     // calling `input_rate()` / COM device enumeration.
     if with(|s| {
@@ -440,7 +482,11 @@ pub fn router_follow(endpoint: &str) -> bool {
     for msg in &failures {
         with(|s| s.surface(msg.clone()));
     }
-    with(|s| s.router.as_ref().is_some_and(|r| r.endpoint == endpoint))
+    let routed = with(|s| s.router.as_ref().is_some_and(|r| r.endpoint == endpoint));
+    if routed {
+        ensure_listener_gate();
+    }
+    routed
 }
 
 /// Returns `true` when an active routing loop has latched a stream
@@ -479,7 +525,10 @@ pub fn telemetry_live() -> Option<AudioTelemetryFrame> {
 #[must_use]
 pub fn router_status() -> Value {
     with(|s| match &s.router {
-        None => json!({ "on": false }),
+        None => match &s.parked {
+            Some(p) => json!({ "on": false, "parked": true, "endpoint": p.endpoint, "sink": p.sink }),
+            None => json!({ "on": false }),
+        },
         Some(slot) => {
             let stats = slot.router.stats();
             json!({
@@ -489,6 +538,7 @@ pub fn router_status() -> Value {
                 "rate_hz": slot.rate_hz,
                 "underruns": stats.underruns,
                 "overruns": stats.overruns,
+                "xruns": stats.xruns,
                 "callbacks": stats.callbacks,
                 "max_callback_us": stats.max_callback_us,
             })
@@ -544,6 +594,7 @@ pub fn spectrum() -> [f32; 32] {
 #[must_use]
 pub fn spectrum_on(paths: &EnginePaths) -> FrameSnapshot {
     ensure_reaper();
+    router_wake("meters");
     if CALIBRATING.load(Ordering::Acquire) {
         return with(|s| s.last_frame.clone());
     }
@@ -634,6 +685,7 @@ impl tine_engine::autotune::SampleSource for RouterTapSource {
 
 /// [`autotune_start`] against explicit persistence roots (test seam).
 pub fn autotune_start_on(paths: &EnginePaths) {
+    router_wake("auto-tune");
     if with(|s| matches!(s.autotune, Some(AutotuneState::Running { .. }))) {
         tracing::info!(target: "tine::services", "auto-tune already running");
         return;
@@ -1085,6 +1137,7 @@ pub fn monitor_apply_on(_paths: &EnginePaths, enabled: bool, device: Option<&str
         });
         return;
     }
+    router_wake("hear-myself");
     let out = device.map_or_else(DeviceRef::default, DeviceRef::parse);
     with(|s| {
         s.monitor_wanted = MonitorWanted::On(device.map(str::to_owned));
@@ -1129,6 +1182,7 @@ pub fn monitor_status() -> Value {
 /// visualizer pump. Idempotent.
 pub fn shutdown() {
     CALIBRATING.store(false, Ordering::Release);
+    GATE_STOP.store(true, Ordering::Release);
     with(|s| {
         s.monitor_wanted = MonitorWanted::Off;
         if let Some(m) = s.monitor.take() {
@@ -1140,11 +1194,131 @@ pub fn shutdown() {
         if let Some(slot) = s.router.take() {
             slot.router.stop();
         }
+        s.parked = None;
         if let Some(mut v) = s.visualizer.take() {
             v.stop();
         }
         s.frames = None;
     });
+}
+
+// ---------------------------------------------------------------------------
+// Listener gate (T24): park the routing loop while nobody listens
+// ---------------------------------------------------------------------------
+
+/// Set on shutdown so the gate never resumes a loop the app is tearing down.
+static GATE_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Whether something inside Tine consumes the processed signal right now:
+/// "Hear Myself", the window's meters/spectrum, or Auto-Tune.
+fn internal_need(s: &Services) -> bool {
+    !matches!(s.monitor_wanted, MonitorWanted::Off)
+        || s.monitor.is_some()
+        || s.visualizer.is_some()
+        || s.last_pull.is_some_and(|t| t.elapsed() < VISUALIZER_TAIL)
+        || s.autotune.is_some()
+        || s.lease.is_some()
+        || CALIBRATING.load(Ordering::Acquire)
+}
+
+/// Resumes a parked routing loop now. Internal consumers call this before
+/// they need the signal, so they never wait for the gate's poll. Returns
+/// `true` when a parked loop was restarted; a failed restart re-parks so the
+/// gate retries on its next poll.
+pub fn router_wake(reason: &str) -> bool {
+    let Some(parked) = with(|s| s.parked.take()) else {
+        return false;
+    };
+    let routed = router_follow(&parked.endpoint);
+    if routed {
+        tracing::info!(target: "tine::services", reason, endpoint = %parked.endpoint, "routing loop resumed");
+    } else {
+        tracing::warn!(target: "tine::services", reason, endpoint = %parked.endpoint,
+            "routing loop resume failed; staying parked");
+        with(|s| {
+            if s.router.is_none() {
+                s.parked = Some(parked);
+            }
+        });
+    }
+    routed
+}
+
+/// Stops the routing loop if nothing needs it (re-checked under the lock).
+fn park() {
+    with(|s| {
+        if internal_need(s) {
+            return;
+        }
+        if let Some(slot) = s.router.take() {
+            tracing::info!(target: "tine::services", endpoint = %slot.endpoint,
+                "routing loop parked (no app is recording the virtual mic)");
+            s.parked = Some(ParkedRoute {
+                endpoint: slot.endpoint.clone(),
+                sink: slot.sink.clone(),
+            });
+            slot.router.stop();
+        }
+    });
+}
+
+/// Starts the gate thread once (after the first successful route).
+fn ensure_listener_gate() {
+    static GATE: OnceLock<()> = OnceLock::new();
+    GATE.get_or_init(|| {
+        if std::thread::Builder::new()
+            .name("tine-listener-gate".to_owned())
+            .spawn(gate_loop)
+            .is_err()
+        {
+            tracing::warn!(target: "tine::services", "listener gate spawn failed; routing never parks");
+        }
+    });
+}
+
+fn gate_loop() {
+    let mut watcher = match CaptureSessionWatcher::new() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(target: "tine::services", "listener gate disabled: {e}");
+            return;
+        }
+    };
+    let own_pid = std::process::id();
+    let mut policy = ParkPolicy::default();
+    loop {
+        let parked = with(|s| s.parked.is_some());
+        std::thread::sleep(if parked { PARKED_POLL } else { RUNNING_POLL });
+        if GATE_STOP.load(Ordering::Acquire) {
+            return;
+        }
+        let (parked, sink) = with(|s| match (&s.router, &s.parked) {
+            (Some(r), _) => (false, Some(r.sink.clone())),
+            (None, Some(p)) => (true, Some(p.sink.clone())),
+            (None, None) => (false, None),
+        });
+        // Router down for another reason (error backoff, no cable): the
+        // shell's recovery owns it; the gate only acts on its own states.
+        let Some(sink) = sink else {
+            policy = ParkPolicy::default();
+            continue;
+        };
+        // Unknown (probe error, capture side missing) counts as listening.
+        let listener = match watcher.sessions(&|name| is_sink_capture_side(name, &sink)) {
+            Ok(Some(list)) => foreign_listener(&list, own_pid),
+            Ok(None) | Err(_) => true,
+        };
+        let needed = listener || with(|s| internal_need(s));
+        match policy.decide(Instant::now(), parked, needed) {
+            GateAction::Park => park(),
+            GateAction::Resume => {
+                if !GATE_STOP.load(Ordering::Acquire) {
+                    router_wake("listener");
+                }
+            }
+            GateAction::Stay => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

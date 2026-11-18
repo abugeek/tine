@@ -14,8 +14,9 @@ use tine_protocol::presets::Archetype;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, HANDLE, RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_UNPLUGGED, EDataFlow, ERole, IMMDevice,
-    IMMDeviceCollection, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Vtbl, MMDeviceEnumerator,
+    AudioSessionStateActive, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_UNPLUGGED,
+    EDataFlow, ERole, IAudioSessionControl2, IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
+    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Vtbl, MMDeviceEnumerator,
     PKEY_AudioEndpoint_FormFactor, eCapture, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{
@@ -659,4 +660,122 @@ impl Drop for ComDeviceWatcher {
             let _ = handle.join();
         }
     }
+}
+
+/// One audio session on a capture endpoint: who opened it and whether its
+/// stream is running right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureSession {
+    /// Owning process id (`0` for the endpoint's system session).
+    pub pid: u32,
+    /// `true` while the session is `AudioSessionStateActive` (stream started).
+    pub active: bool,
+}
+
+/// Reads the audio sessions on one capture endpoint, e.g. who records from
+/// the virtual cable's `CABLE Output` (T24 listener gate).
+///
+/// Owns a COM MTA initialization for the thread that creates it (not
+/// `Send`): create and use it on one dedicated thread. The endpoint's session
+/// manager is cached between calls and re-resolved after any failure.
+pub struct CaptureSessionWatcher {
+    enumerator: IMMDeviceEnumerator,
+    cached: Option<(String, IAudioSessionManager2)>,
+    _com: ComInit,
+}
+
+impl CaptureSessionWatcher {
+    /// Initializes COM on the calling thread and creates the device enumerator.
+    ///
+    /// # Errors
+    /// [`WinError::Com`] when COM or the `MMDeviceEnumerator` is unavailable.
+    pub fn new() -> Result<Self, WinError> {
+        let com = ComInit::new_mta()?;
+        // SAFETY: COM is initialized on this thread (held by `_com` for the
+        // watcher's lifetime); `MMDeviceEnumerator` is an in-proc MTA class.
+        let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+            .map_err(|e| WinError::com("CoCreateInstance(MMDeviceEnumerator)", e))?;
+        Ok(Self {
+            enumerator,
+            cached: None,
+            _com: com,
+        })
+    }
+
+    /// Sessions on the first active capture endpoint whose friendly name
+    /// satisfies `pick`; `Ok(None)` when no active capture endpoint matches.
+    ///
+    /// # Errors
+    /// [`WinError::Com`] on any WASAPI failure (the cache is dropped so the
+    /// next call re-resolves the endpoint).
+    pub fn sessions(&mut self, pick: &dyn Fn(&str) -> bool) -> Result<Option<Vec<CaptureSession>>, WinError> {
+        if self.cached.as_ref().is_none_or(|(name, _)| !pick(name)) {
+            self.cached = self.resolve(pick)?;
+        }
+        let Some((_, manager)) = self.cached.as_ref() else {
+            return Ok(None);
+        };
+        match read_sessions(manager) {
+            Ok(list) => Ok(Some(list)),
+            Err(e) => {
+                self.cached = None;
+                Err(e)
+            }
+        }
+    }
+
+    fn resolve(&self, pick: &dyn Fn(&str) -> bool) -> Result<Option<(String, IAudioSessionManager2)>, WinError> {
+        // SAFETY: `enumerator` is valid on this COM thread.
+        let collection: IMMDeviceCollection =
+            unsafe { self.enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) }
+                .map_err(|e| WinError::com("EnumAudioEndpoints(capture)", e))?;
+        // SAFETY: `collection` is a valid `IMMDeviceCollection`.
+        let count = unsafe { collection.GetCount() }.map_err(|e| WinError::com("IMMDeviceCollection::GetCount", e))?;
+        for idx in 0..count {
+            // SAFETY: `idx < count` and `collection` is valid.
+            let Ok(device) = (unsafe { collection.Item(idx) }) else {
+                continue;
+            };
+            // SAFETY: `device` is a valid `IMMDevice`.
+            let Some(name) = unsafe { device.OpenPropertyStore(STGM_READ) }
+                .ok()
+                .and_then(|store| read_string_prop(&store, &PKEY_Device_FriendlyName))
+            else {
+                continue;
+            };
+            if !pick(&name) {
+                continue;
+            }
+            // SAFETY: `device` is valid; `IAudioSessionManager2` is a documented
+            // activation target for audio endpoints.
+            let manager: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None) }
+                .map_err(|e| WinError::com("IMMDevice::Activate(IAudioSessionManager2)", e))?;
+            return Ok(Some((name, manager)));
+        }
+        Ok(None)
+    }
+}
+
+fn read_sessions(manager: &IAudioSessionManager2) -> Result<Vec<CaptureSession>, WinError> {
+    // SAFETY: `manager` is a valid session manager on this COM thread.
+    let list = unsafe { manager.GetSessionEnumerator() }.map_err(|e| WinError::com("GetSessionEnumerator", e))?;
+    // SAFETY: `list` is a valid `IAudioSessionEnumerator`.
+    let count = unsafe { list.GetCount() }.map_err(|e| WinError::com("IAudioSessionEnumerator::GetCount", e))?;
+    let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+    for idx in 0..count {
+        // SAFETY: `idx < count` and `list` is valid.
+        let Ok(control) = (unsafe { list.GetSession(idx) }) else {
+            continue;
+        };
+        // SAFETY: `control` is a valid `IAudioSessionControl`.
+        let active = unsafe { control.GetState() }.is_ok_and(|st| st == AudioSessionStateActive);
+        let pid = control
+            .cast::<IAudioSessionControl2>()
+            .ok()
+            // SAFETY: `c2` is a valid `IAudioSessionControl2`.
+            .and_then(|c2| unsafe { c2.GetProcessId() }.ok())
+            .unwrap_or(0);
+        out.push(CaptureSession { pid, active });
+    }
+    Ok(out)
 }

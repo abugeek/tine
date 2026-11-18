@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
 };
 use windows::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
-    SetStdHandle,
+    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCtrlHandler, SetStdHandle,
 };
 use windows::core::{PCWSTR, w};
 
@@ -68,11 +68,41 @@ pub fn attach_for_cli() {
 
     // GUI-subsystem process: attach to the invoker's console so `tine status`
     // prints where the user can see it.
+    // Only std slots without an inherited handle are rebound: a redirected
+    // `tine status > file` or `| findstr` hands the GUI process valid pipe or
+    // file handles, and overwriting them sent the output to the console
+    // instead of the pipe (scripts saw nothing; T24).
+    let rebind_out = !has_inherited_handle(STD_OUTPUT_HANDLE);
+    let rebind_err = !has_inherited_handle(STD_ERROR_HANDLE);
+    if !rebind_out && !rebind_err {
+        return;
+    }
     // SAFETY: `ATTACH_PARENT_PROCESS` is a constant process id sentinel.
     if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok() {
-        rebind_std(STD_OUTPUT_HANDLE, w!("CONOUT$"));
-        rebind_std(STD_ERROR_HANDLE, w!("CONOUT$"));
+        if rebind_out {
+            rebind_std(STD_OUTPUT_HANDLE, w!("CONOUT$"));
+        }
+        if rebind_err {
+            rebind_std(STD_ERROR_HANDLE, w!("CONOUT$"));
+        }
     }
+}
+
+/// Whether the process inherited a usable redirect target in this std slot:
+/// a pipe or a file from a redirecting parent. Null, invalid, console (`CHAR`)
+/// or stale copied handle values (`UNKNOWN`) are rebound to the console.
+fn has_inherited_handle(which: STD_HANDLE) -> bool {
+    // SAFETY: `GetStdHandle` only reads the process std-handle slot.
+    let Ok(h) = (unsafe { GetStdHandle(which) }) else {
+        return false;
+    };
+    if h.is_invalid() || h.0.is_null() {
+        return false;
+    }
+    // SAFETY: `GetFileType` only queries the handle; a stale value yields
+    // `FILE_TYPE_UNKNOWN` instead of faulting.
+    let kind = unsafe { GetFileType(h) };
+    kind == FILE_TYPE_DISK || kind == FILE_TYPE_PIPE
 }
 
 /// Replaces one process std handle with the given console pseudo-file.

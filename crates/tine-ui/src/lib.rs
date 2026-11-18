@@ -56,6 +56,10 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
 #[must_use]
 pub fn on_key(s: &mut AppState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
     match &ev.key {
+        Key::Escape if s.ui.pro_field.param.is_some() => {
+            s.ui.pro_field.close();
+            true
+        }
         Key::Text(t) if t == " " && !ev.mods.cmd && !ev.mods.ctrl && !ev.mods.alt => {
             // Space toggles A/B bypass when not handled by a focused control.
             s.toggle_bypass_optimistic();
