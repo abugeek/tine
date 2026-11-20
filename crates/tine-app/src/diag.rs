@@ -39,7 +39,11 @@ pub fn collect(paths: &EnginePaths) -> Value {
         })
         .unwrap_or_default();
     let virtual_cable = tine_engine::apo_admin::find_virtual_cable_sink().map_or(Value::Null, |sink| match sink {
-        Some(sink) => json!({ "name": sink.name, "available": sink.is_available }),
+        Some(sink) => json!({
+            "name": sink.name,
+            "available": sink.is_available,
+            "app_microphone_target": tine_engine::listeners::capture_name_for_sink(&sink.name),
+        }),
         None => Value::Null,
     });
 
@@ -67,6 +71,8 @@ pub fn hash_endpoint_ids(settings: &tine_protocol::settings::AppSettings) -> Val
         "monitor_device_id": settings.monitor_device_id.as_deref().map(crate::hash::fnv64_hex),
         "monitor_enabled": settings.monitor_enabled,
         "pro_drawer_open": settings.pro_drawer_open,
+        "denoise_engine": settings.denoise_engine.as_str(),
+        "park_when_unused": settings.park_when_unused,
         "autostart": settings.autostart,
         "start_minimized": settings.start_minimized,
         "window_width": settings.window_width,
@@ -220,5 +226,20 @@ mod tests {
     #[test]
     fn three_logs_are_included_at_most() {
         assert_eq!(LOGS_TO_INCLUDE, 3);
+    }
+
+    #[test]
+    fn hash_endpoint_ids_includes_denoise_and_ptt() {
+        let s = AppSettings::default();
+        let json = hash_endpoint_ids(&s);
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.get("denoise_engine").and_then(Value::as_str),
+            Some(s.denoise_engine.as_str())
+        );
+        assert_eq!(
+            obj.get("park_when_unused").and_then(Value::as_bool),
+            Some(s.park_when_unused)
+        );
     }
 }

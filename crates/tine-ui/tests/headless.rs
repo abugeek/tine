@@ -164,7 +164,7 @@ fn assert_tree_invariants(scene_name: &str, w: u32, h: u32, tree: &Value) {
     ];
 
     // Focus order matches docs/project/05-ui-ux.md.
-    if scene_name == "golden_line" || scene_name == "golden_line_tooltip" {
+    if scene_name == "golden_line" || scene_name == "golden_line_light" || scene_name == "golden_line_tooltip" {
         assert_eq!(
             focus_order, expected_prefix,
             "scene={scene_name} ({w}x{h}) focus order mismatch"
@@ -284,12 +284,65 @@ fn headless_scenes_render_and_pass_checks() {
 
 #[test]
 fn theme_contrast_meets_wcag_aa() {
-    let t = TineTheme::dark();
-    for bg in [t.bg, t.surface, t.surface_raised] {
-        assert!(contrast_ratio(t.text, bg) >= 4.5);
-        assert!(contrast_ratio(t.text_dim, bg) >= 4.5);
+    for t in [TineTheme::dark(), TineTheme::light()] {
+        for bg in [t.bg, t.surface, t.surface_raised] {
+            assert!(contrast_ratio(t.text, bg) >= 4.5);
+            assert!(contrast_ratio(t.text_dim, bg) >= 4.5);
+        }
+        assert!(contrast_ratio(t.text_on_accent, t.accent) >= 4.5);
     }
-    assert!(contrast_ratio(t.text_on_accent, t.accent) >= 4.5);
+}
+
+#[test]
+fn theme_toggle_and_deck_controls_work() {
+    use tine_protocol::params::ParamId;
+    use tine_protocol::presets::Archetype;
+    use tine_ui::theme::ThemeMode;
+
+    let sink = RecordingSink::default();
+    let mut rt = runtime_with(sink.clone());
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.theme_mode, ThemeMode::Dark);
+
+    // Header theme toggle switches Dark -> Light.
+    let (tx, ty) = rt.find("header/theme-toggle").expect("header/theme-toggle");
+    rt.pointer_down(tx, ty);
+    rt.pointer_up(tx, ty);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.theme_mode, ThemeMode::Light);
+
+    // Master deck slide switch toggles Light -> Dark.
+    let (dx, dy) = rt.find("deck/theme-switch").expect("deck/theme-switch");
+    rt.pointer_down(dx, dy);
+    rt.pointer_up(dx, dy);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.theme_mode, ThemeMode::Dark);
+
+    // Clicking CUE · GATE toggles GateEnabled and emits Intent::SetParam.
+    assert!(rt.state.model.params.gate_enabled);
+    let (cx, cy) = rt.find("deck/cue-gate").expect("deck/cue-gate");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    rt.frame(1.0 / 60.0);
+    assert!(!rt.state.model.params.gate_enabled);
+    assert!(sink.0.borrow().contains(&Intent::SetParam(ParamId::GateEnabled, 0.0)));
+
+    // Clicking Broadcast Voice FX preset updates macros & live-linked sub-params.
+    let (fx_x, fx_y) = rt.find("deck/fx-broadcast").expect("deck/fx-broadcast");
+    rt.pointer_down(fx_x, fx_y);
+    rt.pointer_up(fx_x, fx_y);
+    rt.frame(1.0 / 60.0);
+    assert!((rt.state.model.macros.body - 0.72).abs() < 1e-4);
+
+    // Clicking Voice Profile next stepper advances Archetype.
+    assert_eq!(rt.state.model.archetype, Archetype::Dynamic);
+    let (nx, ny) = rt.find("deck/arch-next").expect("deck/arch-next");
+    rt.pointer_down(nx, ny);
+    rt.pointer_up(nx, ny);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.model.archetype, Archetype::Condenser);
+    assert!(sink.0.borrow().contains(&Intent::SetArchetype(Archetype::Condenser)));
 }
 
 #[derive(Clone, Default)]
@@ -444,6 +497,45 @@ fn drag_body_up_100px_is_monotonic_and_updates_label() {
     let expected = (start_body + 100.0 * 0.004).min(1.0);
     assert!((rt.state.model.macros.body - expected).abs() < 1e-4);
     assert_eq!(element_label(&rt, "macro/body"), format!("Body {expected:.2}"));
+}
+
+#[test]
+fn drag_knob_horizontally_right_and_left() {
+    let sink = RecordingSink::default();
+    let mut rt = runtime_with(sink.clone());
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+
+    let start = rt.state.model.macros.purity;
+    let (mx, my) = rt.find("macro/purity").expect("macro/purity");
+
+    // Drag right 60 px -> increases clockwise.
+    rt.pointer_down(mx, my);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(mx + 60.0, my);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(mx + 60.0, my);
+    rt.frame(1.0 / 60.0);
+    let after_right = (start + 60.0 * 0.004).min(1.0);
+    assert!(
+        (rt.state.model.macros.purity - after_right).abs() < 1e-4,
+        "right drag must turn knob clockwise: got {} expected {after_right}",
+        rt.state.model.macros.purity
+    );
+
+    // Drag left 90 px -> decreases counter-clockwise.
+    rt.pointer_down(mx, my);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(mx - 90.0, my);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(mx - 90.0, my);
+    rt.frame(1.0 / 60.0);
+    let after_left = (after_right - 90.0 * 0.004).max(0.0);
+    assert!(
+        (rt.state.model.macros.purity - after_left).abs() < 1e-4,
+        "left drag must turn knob counter-clockwise: got {} expected {after_left}",
+        rt.state.model.macros.purity
+    );
 }
 
 #[test]
@@ -1144,4 +1236,232 @@ fn headless_frame_build_and_encode_budget() {
         mean < budget_ms,
         "mean build+encode {mean:.3} ms must stay under {budget_ms:.1} ms"
     );
+}
+
+#[test]
+fn macro_knob_unpins_sub_knob_and_drives_it() {
+    use tine_protocol::params::{Band, ParamId};
+
+    let sink = RecordingSink::default();
+    let mut rt = runtime_with(sink.clone());
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+
+    // Drag LOW sub-knob up 50 px -> pins EqGainDb(B0).
+    let (kx, ky) = rt.find("deck/knob/eq-low").expect("deck/knob/eq-low");
+    rt.pointer_down(kx, ky);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(kx, ky - 50.0);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(kx, ky - 50.0);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.model.pins.is_pinned(ParamId::EqGainDb(Band::B0)));
+
+    // Drag BODY macro knob down 60 px -> must unpin EqGainDb(B0) and drive it down!
+    let low_before = rt.state.model.params.eq_gain_db[Band::B0.index()];
+    let (bx, by) = rt.find("macro/body").expect("macro/body");
+    rt.pointer_down(bx, by);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(bx, by + 60.0);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(bx, by + 60.0);
+    rt.frame(1.0 / 60.0);
+
+    assert!(
+        !rt.state.model.pins.is_pinned(ParamId::EqGainDb(Band::B0)),
+        "turning BODY macro must unpin driven sub-knob"
+    );
+    assert!(
+        rt.state.model.params.eq_gain_db[Band::B0.index()] < low_before,
+        "LOW sub-knob must move with BODY macro"
+    );
+    assert!(sink.0.borrow().contains(&Intent::Unpin(ParamId::EqGainDb(Band::B0))));
+
+    // Double-clicking sub-knob when unpinned sets it to archetype base, and
+    // clicking Neutral clears all pins and restores defaults.
+    let (nx, ny) = rt.find("deck/fx-reset").expect("deck/fx-reset");
+    rt.pointer_down(nx, ny);
+    rt.pointer_up(nx, ny);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.model.pins.is_empty());
+    assert!((rt.state.model.macros.body - 0.5).abs() < 1e-4);
+}
+
+#[test]
+fn presence_and_leveler_move_sub_knobs_below_midpoint() {
+    use tine_protocol::params::Band;
+
+    let sink = RecordingSink::default();
+    let mut rt = runtime_with(sink);
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+
+    // Drag PRESENCE down 100 px -> well below 50%.
+    let clarity_before = rt.state.model.params.eq_gain_db[Band::B3.index()];
+    let air_before = rt.state.model.params.eq_gain_db[Band::B4.index()];
+    let (px, py) = rt.find("macro/presence").expect("macro/presence");
+    rt.pointer_down(px, py);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(px, py + 100.0);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(px, py + 100.0);
+    rt.frame(1.0 / 60.0);
+
+    assert!(rt.state.model.macros.presence < 0.3);
+    assert!(rt.state.model.params.eq_gain_db[Band::B3.index()] < clarity_before);
+    assert!(rt.state.model.params.eq_gain_db[Band::B4.index()] < air_before);
+
+    // Drag LEVELER down 100 px -> below 50%, moves both THRESH and RATIO.
+    let thresh_before = rt.state.model.params.comp_thresh_db;
+    let ratio_before = rt.state.model.params.comp_ratio;
+    let (lx, ly) = rt.find("macro/leveler").expect("macro/leveler");
+    rt.pointer_down(lx, ly);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(lx, ly + 100.0);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(lx, ly + 100.0);
+    rt.frame(1.0 / 60.0);
+
+    assert!(rt.state.model.macros.leveler < 0.3);
+    assert!(rt.state.model.params.comp_thresh_db > thresh_before);
+    assert!(rt.state.model.params.comp_ratio < ratio_before);
+}
+
+#[test]
+fn pro_rack_auto_enables_disabled_stages_and_groups_eq_bands() {
+    use tine_protocol::params::{Band, ParamId};
+
+    let sink = RecordingSink::default();
+    let mut init = make_golden_line();
+    init.ui.pro_drawer_open = true;
+    assert!(!init.model.params.deesser_enabled);
+    assert!(init.model.params.comp_auto_makeup);
+
+    let mut rt = runtime_with_state(sink.clone(), init);
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+
+    // Stage 3 groups all 5 EQ bands into dedicated band cards.
+    for b in 0..5 {
+        let key = format!("pro/eq-band/{b}");
+        assert!(
+            rt.elements().iter().any(|e| e.key.as_deref() == Some(key.as_str())),
+            "missing EQ band card {key}"
+        );
+    }
+
+    // Drag Band 1 log-taper Frequency slider -> changes EqFreqHz(B0).
+    let freq_before = rt.state.model.params.eq_freq_hz[Band::B0.index()];
+    let (fx, fy) = scroll_rack_to(&mut rt, "slider/eq.0.freq_hz");
+    rt.pointer_down(fx, fy);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_move(fx + 30.0, fy);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(fx + 30.0, fy);
+    rt.frame(1.0 / 60.0);
+    assert_ne!(rt.state.model.params.eq_freq_hz[Band::B0.index()], freq_before);
+
+    // Dragging De-Esser Amount when De-Esser is off must auto-enable DeesserEnabled.
+    let (dx, dy) = scroll_rack_to(&mut rt, "slider/deesser_amount_db");
+    rt.pointer_down(dx, dy);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(dx, dy);
+    rt.frame(1.0 / 60.0);
+    assert!(rt.state.model.params.deesser_enabled);
+    assert!(
+        sink.0
+            .borrow()
+            .contains(&Intent::SetParam(ParamId::DeesserEnabled, 1.0))
+    );
+
+    // Dragging Comp Makeup when Auto Makeup is on must auto-disable CompAutoMakeup.
+    let (mx, my) = scroll_rack_to(&mut rt, "slider/comp_makeup_db");
+    rt.pointer_down(mx, my);
+    rt.frame(1.0 / 60.0);
+    rt.pointer_up(mx, my);
+    rt.frame(1.0 / 60.0);
+    assert!(!rt.state.model.params.comp_auto_makeup);
+    assert!(
+        sink.0
+            .borrow()
+            .contains(&Intent::SetParam(ParamId::CompAutoMakeup, 0.0))
+    );
+}
+
+#[test]
+fn autotune_results_style_and_audition_pills_preview_and_emit() {
+    use tine_dsp::calibrator::VoiceStyle;
+    use tine_protocol::params::Band;
+
+    let sink = RecordingSink::default();
+    let mut rt = runtime_with_state(sink.clone(), tine_ui::scenes::make_auto_tune_results());
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+
+    // Click Broadcast style pill -> sets Broadcast, starts Tuned audition, emits PreviewCalibration.
+    let (bx, by) = rt.find("autotune/style-broadcast").expect("autotune/style-broadcast");
+    rt.pointer_down(bx, by);
+    rt.pointer_up(bx, by);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.autotune_style, VoiceStyle::Broadcast);
+    assert_eq!(rt.state.ui.autotune_audition_raw, Some(false));
+    let broadcast_low_db = rt.state.model.params.eq_gain_db[Band::B0.index()];
+    assert!(sink.0.borrow().contains(&Intent::PreviewCalibration {
+        style: VoiceStyle::Broadcast,
+        keep_pins: true,
+        audition_raw: Some(false),
+    }));
+
+    // Click Crisp style pill -> sets Crisp, lowers low-shelf gain compared to Broadcast.
+    let (cx, cy) = rt.find("autotune/style-crisp").expect("autotune/style-crisp");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.autotune_style, VoiceStyle::Crisp);
+    assert_eq!(rt.state.ui.autotune_audition_raw, Some(false));
+    let crisp_low_db = rt.state.model.params.eq_gain_db[Band::B0.index()];
+    assert!(
+        broadcast_low_db > crisp_low_db,
+        "Broadcast eq_gain_db[0] ({broadcast_low_db}) must exceed Crisp ({crisp_low_db})"
+    );
+    assert!(sink.0.borrow().contains(&Intent::PreviewCalibration {
+        style: VoiceStyle::Crisp,
+        keep_pins: true,
+        audition_raw: Some(false),
+    }));
+
+    // Click Raw Mic audition pill -> switches audition_raw to Some(true).
+    let (rx, ry) = rt.find("autotune/audition-raw").expect("autotune/audition-raw");
+    rt.pointer_down(rx, ry);
+    rt.pointer_up(rx, ry);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.autotune_audition_raw, Some(true));
+    assert!(sink.0.borrow().contains(&Intent::PreviewCalibration {
+        style: VoiceStyle::Crisp,
+        keep_pins: true,
+        audition_raw: Some(true),
+    }));
+
+    // Click Hear Tuned audition pill -> switches back to Some(false), clicking again stops (None).
+    let (tx, ty) = rt.find("autotune/audition-tuned").expect("autotune/audition-tuned");
+    rt.pointer_down(tx, ty);
+    rt.pointer_up(tx, ty);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.autotune_audition_raw, Some(false));
+    assert!(sink.0.borrow().contains(&Intent::PreviewCalibration {
+        style: VoiceStyle::Crisp,
+        keep_pins: true,
+        audition_raw: Some(false),
+    }));
+
+    let (tx, ty) = rt.find("autotune/audition-tuned").expect("autotune/audition-tuned");
+    rt.pointer_down(tx, ty);
+    rt.pointer_up(tx, ty);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.ui.autotune_audition_raw, None);
+    assert!(sink.0.borrow().contains(&Intent::PreviewCalibration {
+        style: VoiceStyle::Crisp,
+        keep_pins: true,
+        audition_raw: None,
+    }));
 }

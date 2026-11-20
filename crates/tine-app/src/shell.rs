@@ -18,7 +18,10 @@ use tine_engine::model::{EndpointId, KeepPins, Macro, MonitorSettings};
 use tine_engine::paths::EnginePaths;
 use tine_engine::persist;
 use tine_engine::shm_client::LinkState;
+use tine_engine::win::{ComDeviceWatcher, DeviceEvent};
 
+use crate::hotkeys::{HotkeyAction, HotkeyWatcher};
+use crate::power::{PowerEvent, PowerWatcher};
 use crate::proto::{PipeRequest, PipeResponse, exit_code};
 use crate::single_instance::PipeJob;
 use crate::tray::{TraySnapshot, menu_id};
@@ -32,6 +35,12 @@ enum Msg {
     Pipe(PipeJob),
     /// Engine event (forwarded from a forwarder thread).
     Engine(Event),
+    /// Global Win32 hotkey (`Ctrl+Shift+M` / `Ctrl+Shift+B`).
+    Hotkey(HotkeyAction),
+    /// Windows `MMDevice` plug/unplug/default-device event.
+    Device(DeviceEvent),
+    /// Windows sleep / resume notification.
+    Power(PowerEvent),
 }
 
 /// Everything the app loop needs; lives on the loop thread.
@@ -57,7 +66,9 @@ impl Shell {
     fn snapshot(&self) -> TraySnapshot {
         let mut s = TraySnapshot::initial();
         s.linked = self.link.is_linked();
+        s.muted = services::is_muted();
         s.autostart = self.autostart;
+        s.keep_warm = !services::park_when_unused();
         if let Some(model) = &self.model {
             s.bypass = model.bypass;
             s.monitor = model.monitor.enabled;
@@ -234,19 +245,80 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     //     follows the controller's endpoint on every `ModelChanged`.
     //     The loop's health is this topology's "linked" notion — with
     //     the block target the engine never emits `ApoLink`.
+    let _ = services::set_denoise_engine(settings.denoise_engine);
+    services::set_park_when_unused(settings.park_when_unused);
     let routed = services::router_follow(endpoint.as_str());
     shell.link = link_from_router(routed);
     shell.sync_tray(&tx);
 
+    // 6c. Watchers: global hotkeys, Windows MMDevice hotplug, and power sleep/resume.
+    let (tx_hk, rx_hk) = channel::<HotkeyAction>();
+    let _hotkey_watcher = HotkeyWatcher::start(&settings.hotkey_mute, &settings.hotkey_bypass, tx_hk);
+    {
+        let tx_forward = tx.clone();
+        std::thread::Builder::new()
+            .name("tine-hk-forward".to_owned())
+            .spawn(move || {
+                while let Ok(act) = rx_hk.recv() {
+                    if tx_forward.send(Msg::Hotkey(act)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+    }
+
+    let (tx_dev, rx_dev) = channel::<DeviceEvent>();
+    let _device_watcher = match ComDeviceWatcher::start(tx_dev) {
+        Ok(w) => {
+            let tx_forward = tx.clone();
+            std::thread::Builder::new()
+                .name("tine-dev-forward".to_owned())
+                .spawn(move || {
+                    while let Ok(ev) = rx_dev.recv() {
+                        if tx_forward.send(Msg::Device(ev)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .ok();
+            Some(w)
+        }
+        Err(e) => {
+            tracing::warn!(target: "tine::shell", error = %e, "device watcher disabled");
+            None
+        }
+    };
+
+    let (tx_pwr, rx_pwr) = channel::<PowerEvent>();
+    let power_watcher = PowerWatcher::start(tx_pwr);
+    if power_watcher.is_some() {
+        let tx_forward = tx.clone();
+        std::thread::Builder::new()
+            .name("tine-pwr-forward".to_owned())
+            .spawn(move || {
+                while let Ok(ev) = rx_pwr.recv() {
+                    if tx_forward.send(Msg::Power(ev)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+    }
+    let _power_watcher = power_watcher;
+
+    // 6d. First-launch / explicit user launch (MSI "Run Tine now", Start
+    //     Menu shortcut, or double-clicking tine.exe without --background):
+    //     open the window immediately so first-run onboarding appears.
+    //     Autostart (--background) and --metrics stay headless in the tray.
+    if !background && !metrics && !settings.start_minimized {
+        shell.open_ui();
+    }
+
     // 7. Event loop.
     let mut code = exit_code::OK;
     let mut last_health_check = Instant::now();
-    let mut router_backoff = Duration::from_secs(1);
-    let mut router_retry_at: Option<Instant> = if routed {
-        None
-    } else {
-        Some(Instant::now() + router_backoff)
-    };
+    let mut recovery = RecoveryState::new(routed, Instant::now());
     loop {
         match rx.recv_timeout(HEALTH_CHECK_INTERVAL) {
             Ok(msg) => match msg {
@@ -256,12 +328,7 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                     if let Some(endpoint) = shell.model.as_ref().and_then(|m| m.endpoint.as_ref()) {
                         let routed = services::router_follow(endpoint.as_str());
                         shell.link = link_from_router(routed);
-                        if routed {
-                            router_backoff = Duration::from_secs(1);
-                            router_retry_at = None;
-                        } else {
-                            router_retry_at = Some(Instant::now() + router_backoff);
-                        }
+                        recovery.record_result(routed, Instant::now());
                     }
                     shell.restore_monitor_once();
                     shell.sync_tray(&tx);
@@ -277,6 +344,39 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                     // save) must reach the user, not only the log (T22 QA).
                     services::surface_message(format!("Tine couldn't apply or save a change: {e}"));
                 }
+                Msg::Hotkey(act) => match act {
+                    HotkeyAction::ToggleMute => {
+                        let muted = services::toggle_muted();
+                        tracing::info!(target: "tine::hotkeys", muted, "mute hotkey pressed");
+                        shell.sync_tray(&tx);
+                    }
+                    HotkeyAction::ToggleBypass => {
+                        let next = shell.model.as_ref().is_none_or(|m| !m.bypass);
+                        tracing::info!(target: "tine::hotkeys", bypass = next, "bypass hotkey pressed");
+                        let _ = shell.handle.send(Command::SetBypass(next));
+                    }
+                },
+                Msg::Device(ev) => {
+                    let selected_id = shell
+                        .model
+                        .as_ref()
+                        .and_then(|m| m.endpoint.as_ref())
+                        .map_or_else(|| endpoint.as_str().to_owned(), |e| e.as_str().to_owned());
+                    if recovery.on_device_event(&selected_id, &ev, Instant::now()) {
+                        shell.endpoint_names = None;
+                    }
+                }
+                Msg::Power(PowerEvent::Suspending) => {
+                    tracing::info!(target: "tine::power", "system suspending; pausing router recovery");
+                    recovery.on_suspend();
+                    services::router_stop();
+                    shell.link = LinkState::Unlinked;
+                    shell.sync_tray(&tx);
+                }
+                Msg::Power(PowerEvent::Resumed) => {
+                    tracing::info!(target: "tine::power", "system resumed; scheduling audio recovery");
+                    recovery.on_resume(Instant::now());
+                }
                 Msg::Tray(TrayEvent::Activate { .. }) => shell.open_ui(),
                 Msg::Tray(TrayEvent::Menu(id)) if id == menu_id::OPEN => shell.open_ui(),
                 Msg::Tray(TrayEvent::Menu(id)) if id == menu_id::QUIT => {
@@ -284,7 +384,10 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
                     code = exit_code::OK;
                     break;
                 }
-                Msg::Tray(TrayEvent::Menu(id)) => shell.on_tray_menu(&id),
+                Msg::Tray(TrayEvent::Menu(id)) => {
+                    shell.on_tray_menu(&id);
+                    shell.sync_tray(&tx);
+                }
                 Msg::Pipe(job) => {
                     if matches!(job.request, PipeRequest::Quit) {
                         tracing::info!(target: "tine::shell", "quit requested via pipe");
@@ -302,50 +405,43 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        if last_health_check.elapsed() >= HEALTH_CHECK_INTERVAL {
-            last_health_check = Instant::now();
+        let now = Instant::now();
+        if last_health_check.elapsed() >= HEALTH_CHECK_INTERVAL || recovery.is_due(now) {
+            last_health_check = now;
+            let ep = shell
+                .model
+                .as_ref()
+                .and_then(|m| m.endpoint.as_ref())
+                .map_or_else(|| endpoint.as_str().to_owned(), |e| e.as_str().to_owned());
+            let out_dev = shell.model.as_ref().and_then(|m| m.monitor.output_device.clone());
             let has_err = services::router_has_error();
-            if has_err && router_retry_at.is_none() {
-                let ep = shell
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.endpoint.as_ref())
-                    .map_or_else(|| endpoint.as_str().to_owned(), |e| e.as_str().to_owned());
-                tracing::warn!(target: "tine::shell", endpoint = %ep, "router stream error detected; rebuilding");
-                let routed = services::router_follow(&ep);
-                shell.link = link_from_router(routed);
-                if routed {
-                    router_backoff = Duration::from_secs(1);
-                    router_retry_at = None;
+            if has_err {
+                if recovery.on_stream_error(now) {
+                    tracing::warn!(target: "tine::shell", endpoint = %ep, "router stream error detected; rebuilding");
+                    let routed = services::router_force_rebuild(&ep);
+                    shell.link = link_from_router(routed);
+                    recovery.record_result(routed, now);
+                    if routed {
+                        let _ = services::monitor_recover(out_dev.as_deref());
+                    }
+                    shell.sync_tray(&tx);
                 } else {
-                    router_retry_at = Some(Instant::now() + router_backoff);
-                    router_backoff = (router_backoff * 2).min(Duration::from_secs(30));
+                    services::router_stop();
+                    shell.link = LinkState::Unlinked;
+                    shell.sync_tray(&tx);
                 }
-                shell.sync_tray(&tx);
-            } else if has_err {
-                // Error while already in backoff: tear down the broken router
-                // once and wait for the backoff deadline before retrying.
-                services::router_stop();
-                shell.link = LinkState::Unlinked;
-                shell.sync_tray(&tx);
-            } else if matches!(shell.link, LinkState::Unlinked) && router_retry_at.is_some_and(|t| Instant::now() >= t)
-            {
-                let ep = shell
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.endpoint.as_ref())
-                    .map_or_else(|| endpoint.as_str().to_owned(), |e| e.as_str().to_owned());
-                let routed = services::router_follow(&ep);
+            } else if recovery.take_due_rebuild(now) {
+                let routed = services::router_force_rebuild(&ep);
                 shell.link = link_from_router(routed);
+                recovery.record_result(routed, now);
                 if routed {
                     tracing::info!(target: "tine::shell", endpoint = %ep, "router recovered");
-                    router_backoff = Duration::from_secs(1);
-                    router_retry_at = None;
-                } else {
-                    router_retry_at = Some(Instant::now() + router_backoff);
-                    router_backoff = (router_backoff * 2).min(Duration::from_secs(30));
+                    let _ = services::monitor_recover(out_dev.as_deref());
                 }
                 shell.sync_tray(&tx);
+            } else if services::monitor_has_error() {
+                tracing::warn!(target: "tine::shell", "monitor stream error detected; rebuilding");
+                let _ = services::monitor_recover(out_dev.as_deref());
             }
         }
     }
@@ -378,14 +474,9 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     code
 }
 
-fn is_virtual_capture_device(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("cable output") || lower.contains("vb-audio") || lower.contains("sonar - microphone")
-}
-
 /// Best-effort default capture endpoint: prefers the Windows default
-/// physical mic (excluding virtual cables like VB-Audio / Sonar), then
-/// any physical mic, falling back to the first active device only if
+/// physical mic (excluding virtual cables like VB-Audio / `VoiceMeeter` / VAC / Sonar),
+/// then any physical mic, falling back to the first active device only if
 /// nothing else exists. COM; used only when nothing is persisted yet.
 fn default_capture_endpoint() -> Option<EndpointId> {
     if let Ok(inputs) = tine_engine::audio_io::list_inputs()
@@ -393,8 +484,12 @@ fn default_capture_endpoint() -> Option<EndpointId> {
     {
         let chosen = inputs
             .iter()
-            .find(|d| d.is_default && !is_virtual_capture_device(&d.name))
-            .or_else(|| inputs.iter().find(|d| !is_virtual_capture_device(&d.name)))
+            .find(|d| d.is_default && !tine_engine::apo_admin::is_virtual_cable_capture(&d.name))
+            .or_else(|| {
+                inputs
+                    .iter()
+                    .find(|d| !tine_engine::apo_admin::is_virtual_cable_capture(&d.name))
+            })
             .or_else(|| inputs.iter().find(|d| d.is_default))
             .or_else(|| inputs.first());
         if let Some(dev) = chosen {
@@ -403,7 +498,7 @@ fn default_capture_endpoint() -> Option<EndpointId> {
     }
     tine_engine::apo_admin::list_capture_endpoints().ok().and_then(|list| {
         list.iter()
-            .find(|ep| !is_virtual_capture_device(&ep.name))
+            .find(|ep| !tine_engine::apo_admin::is_virtual_cable_capture(&ep.name))
             .or_else(|| list.first())
             .map(|ep| EndpointId::new(ep.id.clone()))
     })
@@ -450,6 +545,10 @@ impl Shell {
             return;
         }
         match id {
+            menu_id::MUTE => {
+                let muted = services::toggle_muted();
+                tracing::info!(target: "tine::tray", muted, "mute toggled from tray");
+            }
             menu_id::BYPASS => {
                 let next = self.model.as_ref().is_none_or(|m| !m.bypass);
                 let _ = self.handle.send(Command::SetBypass(next));
@@ -458,6 +557,16 @@ impl Shell {
                 let current = self.model.as_ref().is_some_and(|m| m.monitor.enabled);
                 let next = !current;
                 self.apply_monitor(next, None);
+            }
+            menu_id::KEEP_WARM => {
+                let next_park = !services::park_when_unused();
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                settings.park_when_unused = next_park;
+                if let Err(e) = persist::save_settings(&settings, &self.paths) {
+                    tracing::error!(target: "tine::shell", error = %e, "failed to save park_when_unused");
+                }
+                services::set_park_when_unused(next_park);
+                tracing::info!(target: "tine::shell", keep_warm = !next_park, "keep-warm PTT toggled");
             }
             menu_id::AUTOSTART => {
                 let next = !self.autostart;
@@ -542,12 +651,16 @@ impl Shell {
                 // The reply carries the flow state: `running` right away,
                 // or the surfaced reason when the run could not start.
                 let state = services::autotune_state();
-                if state.get("flow").and_then(Value::as_str) != Some("running") {
-                    for note in services::take_messages() {
+                let notes = if state.get("flow").and_then(Value::as_str) == Some("running") {
+                    Vec::new()
+                } else {
+                    let list = services::take_messages();
+                    for note in &list {
                         tracing::warn!(target: "tine::shell", "{note}");
                     }
-                }
-                PipeResponse::ok(json!({ "calibrate": state }))
+                    list
+                };
+                PipeResponse::ok(json!({ "calibrate": state, "notes": notes }))
             }
             PipeRequest::Quit => PipeResponse::empty(), // handled by the loop
             PipeRequest::Set { .. }
@@ -599,6 +712,21 @@ impl Shell {
             PipeRequest::CalibrateDiscard => {
                 services::autotune_discard();
                 PipeResponse::ok(json!({ "calibrate": "discarded" }))
+            }
+            PipeRequest::CalibratePreview {
+                style,
+                keep_pins,
+                audition_raw,
+            } => {
+                let parsed = tine_dsp::calibrator::VoiceStyle::from_name(&style)
+                    .unwrap_or(tine_dsp::calibrator::VoiceStyle::AutoBalanced);
+                let out_dev = self.model.as_ref().and_then(|m| m.monitor.output_device.clone());
+                PipeResponse::ok(services::autotune_preview(
+                    parsed,
+                    keep_pins,
+                    audition_raw,
+                    out_dev.as_deref(),
+                ))
             }
             PipeRequest::Monitor { on, device } => {
                 self.apply_monitor(on, device);
@@ -667,6 +795,65 @@ impl Shell {
                     PipeResponse::err(exit_code::NOT_RUNNING, "no capture endpoint selected")
                 }
             }
+            PipeRequest::SetDenoiseEngine { engine } => {
+                let Some(parsed) = tine_protocol::params::DenoiseEngine::from_name(&engine) else {
+                    return PipeResponse::err(
+                        exit_code::USAGE,
+                        format!("unknown denoiser `{engine}` (rnnoise|deepfilter|off)"),
+                    );
+                };
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                settings.denoise_engine = parsed;
+                if let Err(e) = persist::save_settings(&settings, &self.paths) {
+                    tracing::error!(target: "tine::shell", error = %e, "failed to save denoise_engine");
+                    return PipeResponse::err(exit_code::FAILURE, format!("Failed to save settings: {e}"));
+                }
+                let routed = services::set_denoise_engine(parsed);
+                if self.model.as_ref().and_then(|m| m.endpoint.as_ref()).is_some() {
+                    self.link = link_from_router(routed);
+                }
+                self.sync_tray(tx);
+                PipeResponse::ok(json!({
+                    "denoise_engine": parsed.as_str(),
+                    "routed": routed,
+                }))
+            }
+            PipeRequest::SetParkWhenUnused { enabled } => {
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                settings.park_when_unused = enabled;
+                if let Err(e) = persist::save_settings(&settings, &self.paths) {
+                    tracing::error!(target: "tine::shell", error = %e, "failed to save park_when_unused");
+                    return PipeResponse::err(exit_code::FAILURE, format!("Failed to save settings: {e}"));
+                }
+                services::set_park_when_unused(enabled);
+                self.sync_tray(tx);
+                PipeResponse::ok(json!({ "park_when_unused": enabled }))
+            }
+            PipeRequest::MicCheckStart => {
+                let params = self
+                    .model
+                    .as_deref()
+                    .map_or_else(services::last_controller_params, tine_engine::model::resolve);
+                let out_dev = self.model.as_ref().and_then(|m| m.monitor.output_device.clone());
+                PipeResponse::ok(services::mic_check_start(params, out_dev.as_deref()))
+            }
+            PipeRequest::MicCheckQuery => PipeResponse::ok(services::mic_check_query()),
+            PipeRequest::MicCheckSetMode { raw } => {
+                let updated = services::mic_check_set_mode(raw);
+                PipeResponse::ok(json!({ "raw": raw, "active": updated }))
+            }
+            PipeRequest::MicCheckStop => {
+                services::mic_check_stop();
+                PipeResponse::ok(json!({ "flow": "idle" }))
+            }
+            PipeRequest::Mute { on } => {
+                let muted = match on {
+                    Some(v) => services::set_muted(v),
+                    None => services::toggle_muted(),
+                };
+                self.sync_tray(tx);
+                PipeResponse::ok(json!({ "muted": muted }))
+            }
         }
     }
 
@@ -689,6 +876,9 @@ impl Shell {
                 })
             }),
             "bypass": model.is_some_and(|m| m.bypass),
+            "muted": services::is_muted(),
+            "denoise_engine": services::denoise_engine().as_str(),
+            "park_when_unused": services::park_when_unused(),
             "state": if self.link.is_linked() {
                 if model.is_some_and(|m| m.bypass) { "bypassed" } else { "processing" }
             } else {
@@ -698,6 +888,7 @@ impl Shell {
             "monitor": model.is_some_and(|m| m.monitor.enabled),
             "monitor_device": model.and_then(|m| m.monitor.output_device.clone()),
             "router": services::router_status(),
+            "raw_mic_apps": services::raw_mic_apps(),
             "autotune": services::autotune_state(),
             "notes": services::take_messages(),
             "autostart": self.autostart,
@@ -774,10 +965,108 @@ fn link_string(link: &LinkState) -> &'static str {
     }
 }
 
+/// Pure recovery state machine for USB mic unplug/replug & sleep/resume.
+struct RecoveryState {
+    suspended: bool,
+    pending_rebuild_at: Option<Instant>,
+    backoff: Duration,
+}
+
+impl RecoveryState {
+    const MIN_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    const REPLUG_SETTLE: Duration = Duration::from_millis(300);
+    const RESUME_SETTLE: Duration = Duration::from_millis(600);
+
+    fn new(initially_routed: bool, now: Instant) -> Self {
+        Self {
+            suspended: false,
+            pending_rebuild_at: (!initially_routed).then_some(now + Self::MIN_BACKOFF),
+            backoff: Self::MIN_BACKOFF,
+        }
+    }
+
+    fn on_suspend(&mut self) {
+        self.suspended = true;
+        self.pending_rebuild_at = None;
+    }
+
+    fn on_resume(&mut self, now: Instant) {
+        self.suspended = false;
+        self.backoff = Self::MIN_BACKOFF;
+        self.pending_rebuild_at = Some(now + Self::RESUME_SETTLE);
+    }
+
+    /// Returns `true` when the cached endpoint list should be invalidated.
+    fn on_device_event(&mut self, selected_id: &str, ev: &DeviceEvent, now: Instant) -> bool {
+        let invalidate = matches!(
+            ev,
+            DeviceEvent::Added(_) | DeviceEvent::Removed(_) | DeviceEvent::StateChanged { .. }
+        );
+        if self.suspended {
+            return invalidate;
+        }
+        let is_selected = |id: &str| id == selected_id || selected_id == "default";
+        match ev {
+            DeviceEvent::Added(id) | DeviceEvent::StateChanged { id, active: true } if is_selected(id) => {
+                self.backoff = Self::MIN_BACKOFF;
+                self.pending_rebuild_at = Some(now + Self::REPLUG_SETTLE);
+            }
+            DeviceEvent::DefaultChanged(_) if selected_id == "default" => {
+                self.backoff = Self::MIN_BACKOFF;
+                self.pending_rebuild_at = Some(now + Self::REPLUG_SETTLE);
+            }
+            DeviceEvent::Removed(id) | DeviceEvent::StateChanged { id, active: false }
+                if is_selected(id) && self.pending_rebuild_at.is_none() =>
+            {
+                self.pending_rebuild_at = Some(now + self.backoff);
+            }
+            _ => {}
+        }
+        invalidate
+    }
+
+    fn on_stream_error(&mut self, now: Instant) -> bool {
+        if self.suspended {
+            return false;
+        }
+        let immediate = self.pending_rebuild_at.is_none();
+        if !immediate {
+            self.pending_rebuild_at = Some(now + self.backoff);
+        }
+        immediate
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        !self.suspended && self.pending_rebuild_at.is_some_and(|t| now >= t)
+    }
+
+    fn take_due_rebuild(&mut self, now: Instant) -> bool {
+        if self.is_due(now) {
+            self.pending_rebuild_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_result(&mut self, ok: bool, now: Instant) {
+        if ok {
+            self.backoff = Self::MIN_BACKOFF;
+            self.pending_rebuild_at = None;
+        } else if !self.suspended {
+            self.pending_rebuild_at = Some(now + self.backoff);
+            self.backoff = (self.backoff * 2).min(Self::MAX_BACKOFF);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::link_string;
+    use super::{RecoveryState, link_string};
+    use std::time::{Duration, Instant};
     use tine_engine::shm_client::LinkState;
+    use tine_engine::win::DeviceEvent;
 
     #[test]
     fn link_strings_are_stable() {
@@ -788,5 +1077,55 @@ mod tests {
         );
         assert_eq!(link_string(&LinkState::Stale { heartbeat_age_ms: 5 }), "stale");
         assert_eq!(link_string(&LinkState::Linked { heartbeat_age_ms: 0 }), "linked");
+    }
+
+    #[test]
+    fn recovery_handles_unplug_backoff_and_fast_replug() {
+        let t0 = Instant::now();
+        let mut r = RecoveryState::new(true, t0);
+        let mic = "usb-mic-1";
+
+        // Unplug fails first rebuild, backing off from 1s -> 2s.
+        assert!(r.on_device_event(
+            mic,
+            &DeviceEvent::StateChanged {
+                id: mic.to_owned(),
+                active: false
+            },
+            t0
+        ));
+        r.record_result(false, t0);
+        assert!(!r.take_due_rebuild(t0 + Duration::from_millis(500)));
+        assert!(r.take_due_rebuild(t0 + Duration::from_secs(1)));
+
+        r.record_result(false, t0 + Duration::from_secs(1));
+        assert!(!r.take_due_rebuild(t0 + Duration::from_secs(2)));
+
+        // Replugging the mic resets backoff and schedules fast 300 ms recovery.
+        let replug_at = t0 + Duration::from_millis(2100);
+        assert!(r.on_device_event(
+            mic,
+            &DeviceEvent::StateChanged {
+                id: mic.to_owned(),
+                active: true
+            },
+            replug_at
+        ));
+        assert!(!r.take_due_rebuild(replug_at + Duration::from_millis(200)));
+        assert!(r.take_due_rebuild(replug_at + Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn recovery_suppresses_work_during_suspend_and_recovers_on_resume() {
+        let t0 = Instant::now();
+        let mut r = RecoveryState::new(true, t0);
+        r.on_suspend();
+        assert!(!r.on_stream_error(t0 + Duration::from_millis(10)));
+        assert!(!r.take_due_rebuild(t0 + Duration::from_secs(5)));
+
+        let resume_at = t0 + Duration::from_secs(10);
+        r.on_resume(resume_at);
+        assert!(!r.take_due_rebuild(resume_at + Duration::from_millis(300)));
+        assert!(r.take_due_rebuild(resume_at + Duration::from_millis(600)));
     }
 }

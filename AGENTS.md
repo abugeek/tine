@@ -17,7 +17,7 @@ Tine is an ultra-lightweight, native, open-source microphone DSP (Digital Signal
 - **Never Break the User's Audio**: Every audio callback is panic-free; any NaN/Inf in the DSP resets state and latches pass-through so the user's mic never silences or clips. (v0.1 runs in the user session via virtual-cable routing per D-018, never inside `audiodg.exe`.)
 - **Real-Time Audio Safety**: Every real-time path (`DspPipeline::process` in `tine-dsp`, `cpal` callbacks in `tine-engine`/`tine-devhost`) must be 100% lock-free, allocation-free and panic-free. Zero `Mutex::lock()`, `RwLock`, `Vec::push()`, `Box::new()`, logging, or syscalls inside the audio callback. Enforced with `assert_no_alloc` in tests and `clippy::{unwrap_used, expect_used, panic, indexing_slicing}` denied in RT crates.
 - **Zero Idle GPU/UI Footprint**: `tine.exe` (D-017) keeps a lightweight tray + control plane + audio router parent always on, and spawns `tine.exe --ui` as a short-lived child process when the window opens. Closing the window exits `tine.exe --ui` and releases all `wgpu`/DX12 VRAM. With the window closed `tine.exe` targets < 12 MB Working Set (< 4 MB Private Bytes, hard limit 20 MB) and < 0.5 % CPU.
-- **Efficient From Day One**: Every performance budget in [`docs/project/09-engineering-standards.md` §7](docs/project/09-engineering-standards.md#7-performance-budgets-ci-enforced-where-marked-) is a requirement, not a wish. Key budgets: < 150 µs per 480-sample frame for the whole DSP, zero allocations on RT paths, `tine.exe` < 24 MiB (R-23), added DSP latency ≤ 21.6 ms at 48 kHz (1036 samples, D-019), and cold start to tray < 150 ms. CI enforces the measurable ones.
+- **Efficient From Day One**: Every performance budget in [`docs/project/09-engineering-standards.md` §7](docs/project/09-engineering-standards.md#7-performance-budgets-ci-enforced-where-marked-) is a requirement, not a wish. Key budgets: < 150 µs per 480-sample frame for the whole DSP, zero allocations on RT paths, `tine.exe` < 30 MiB (D-037), added DSP latency ≤ 21.6 ms at 48 kHz (1036 samples, D-019), and cold start to tray < 150 ms. CI enforces the measurable ones.
 - **Rate-Agnostic Pipeline, 48 kHz Native** (D-006): DSP runs on mono `f32`. 48 kHz is the native rate (matches `nnnoiseless`'s 480-sample / 10 ms frame). Every stage designs coefficients from the actual sample rate; only the denoiser resamples to/from 48 kHz when needed.
 
 ---
@@ -66,6 +66,7 @@ Latest stable versions checked on **2026-11-16**. Re-check them on crates.io whe
 [workspace.dependencies]
 # Audio
 cpal          = { version = "0.18.2", default-features = false, features = ["realtime"] } # WASAPI + RT thread priority (tine-engine, tine-devhost only)
+dfn3_rs       = { version = "0.1.2",  default-features = false, features = ["embedded-model"] } # DeepFilterNet3 denoiser (tine-dsp feature = deepfilter)
 nnnoiseless   = { version = "0.5.2",  default-features = false }  # Pure-Rust RNNoise, 480-sample frames @ 48 kHz
 rubato        = { version = "5.1.0",  default-features = false }  # Resampling (RNNoise path at non-48 kHz; device clock drift); alloc-free process_into_buffer
 realfft       = { version = "3.5.1",  default-features = false }  # Spectrum in tine.exe only (never in audiodg)

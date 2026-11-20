@@ -57,6 +57,15 @@ fn spawn_pipe_host(pipe: &str, handle: ControllerHandle) {
             while let Ok(job) = rx_jobs.recv() {
                 let resp = match &job.request {
                     PipeRequest::CalibrateQuery => PipeResponse::ok(services::autotune_state()),
+                    PipeRequest::CalibratePreview {
+                        style,
+                        keep_pins,
+                        audition_raw,
+                    } => {
+                        let parsed = tine_dsp::calibrator::VoiceStyle::from_name(style)
+                            .unwrap_or(tine_dsp::calibrator::VoiceStyle::AutoBalanced);
+                        PipeResponse::ok(services::autotune_preview(parsed, *keep_pins, *audition_raw, None))
+                    }
                     req => match pipe_control_command(req) {
                         Ok(cmd) => {
                             let _ = handle.send(cmd);
@@ -172,4 +181,17 @@ fn calibrate_query_answers_the_flow_state_over_the_pipe() {
     assert!(resp.ok, "{:?}", resp.error);
     let data = resp.data.expect("query payload");
     assert_eq!(data.get("flow").and_then(|f| f.as_str()), Some("idle"));
+
+    let preview_resp = single_instance::send_request(
+        &pipe,
+        &PipeRequest::CalibratePreview {
+            style: "broadcast".to_owned(),
+            keep_pins: true,
+            audition_raw: None,
+        },
+    )
+    .expect("preview pipe round trip");
+    assert!(preview_resp.ok, "{:?}", preview_resp.error);
+    let preview_data = preview_resp.data.expect("preview payload");
+    assert_eq!(preview_data.get("flow").and_then(|f| f.as_str()), Some("idle"));
 }

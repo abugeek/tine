@@ -257,3 +257,56 @@ A calibration's derived `input_gain_db`, `gate_threshold_db`, `denoise_mix`, `co
 **Why:** when the cable sink already had an active reader, the shared engine drained a 1× prime in a burst: 1 underrun in 5 cold starts and in 2 of 3 resumes. A first attempt that let the PI loop drain the surplus failed the re-benchmark: its ±0.1 % clamp needs ~20 s, the integral winds up, and the fill then falls ~45 % below target for tens of seconds — 164 underruns between 20 s and 50 s after start under scheduler jitter (modelled and reproduced). The explicit drain has no windup and lands exactly on target.
 
 **Consequences:** up to +20 ms latency for ~4 s after a (re)start only. Measured: 0 underruns in 8 cold starts with a listener, 0 in 5 park/resume cycles, 0/0/1 in three 90 s runs under sampler jitter (background level). Unit tests pin the doubled prime, burst absorption after priming, drain-without-undershoot over 90 simulated seconds, and unchanged honest-underrun semantics.
+
+### D-036 · 2026-11-19 · Accepted — Brand: fork-and-capsule mark, "Ember" palette
+
+**Decision:** Tine's icon is a tuning fork (a *tine* is a fork prong) whose U-shaped yoke holds a mic capsule, like a broadcast mic in its mount, on an ink-plum rounded plate. The palette ("Ember") is an ink-plum neutral ramp, warm ivory foreground and an amber → coral accent. `scripts/brand/render_icons.py` renders every asset into `assets/brand/` (SVG master, PNGs 16–1024 px, multi-size `tine.ico`, raw RGBA tray glyphs per tray state); `crates/tine-app/build.rs` links `tine.ico` into `tine.exe` as icon group 1 (a hand-written `.res`, no new build dependency); the `--ui` child uses it via `rune::set_app_icon_resource`; the MSI shows it in Apps & features. UI tokens live in `tine-ui::theme`, shared controls in `tine-ui::views::kit`.
+
+**Why:** the app had no icon at all, and the tray (cyan) and window (amber on Rune grey) disagreed. Three directions were compared on a concept board (Ember, Aurora mint, Violet); Ember was chosen: it keeps the warmth behind the "Golden Line" name, reads as a human voice, and is distinct from SteelSeries orange, NVIDIA green and Krisp blue.
+
+**Consequences:** the accent is reserved for the voice signal and one primary action per view (Auto-Tune in the header); selected-but-secondary states use `accent_soft`. The in-app mark is composed from native elements, not SVG, because Rune's full-color SVG path needs its `svg` feature (resvg), which would grow the binary. Changing a brand color means editing both `render_icons.py` and `theme.rs`, re-running the script and re-blessing the headless snapshots.
+
+### D-037 · 2026-11-19 · Accepted — Pluggable DeepFilterNet3 ("Studio Clean") & 30 MiB release budget
+
+**Decision:** Integrate `dfn3_rs = "0.1.2"` (embedded DeepFilterNet3 weights, dual-licensed MIT/Apache-2.0) behind `tine-dsp`'s `deepfilter` Cargo feature and a runtime `DenoiseEngine` selector (`Rnnoise` default | `DeepFilterNet3` "Studio Clean" | `Off` "Low-Latency"). Raise the release `tine.exe` binary size budget in CI and packaging scripts from 24 MiB to **30 MiB**.
+
+**Why:** RNNoise introduces subtle musical gating artifacts at lower SNR compared to DeepFilterNet3. Keeping `deepfilter` feature-gated preserves lightweight `tine-dsp` default builds while shipping full Studio Clean capability inside `tine.exe` (~27–28 MiB with embedded weights; `ALGORITHM_DELAY = 1440` samples -> `1996` total pipeline samples at 48 kHz).
+
+**Consequences:** `tine-engine`, `tine-app`, `tine-devhost`, and benchmarks enable `tine-dsp/deepfilter`. Users can toggle `RNNoise`, `Studio Clean`, or `Low-Lat` live from the header pill or CLI (`tine denoise ...`). All `tine.exe` release-size checks enforce `< 30 MiB`.
+
+### D-038 · 2026-11-19 · Accepted — Voice quality core upgrades (fast dB math, VAD-assisted gate, 110 Hz compressor sidechain HPF)
+
+**Decision:** Consolidate fast allocation-free `f32` dB math in `tine_dsp::primitives::db`, assist Stage 2b's downward expander threshold up to `+10 dB` when Stage 2a neural VAD probability drops below `0.35` (when `denoise_mix > 0`), and insert a 2nd-order 110 Hz Butterworth high-pass filter into Stage 5's compressor level-detector sidechain without mutating the main audio path.
+
+**Why:** Fast IEEE-754 bit-manipulation `fast_lin_to_db` / `fast_db_to_lin` eliminates transcendental bottlenecks; VAD-assisted gating catches transient desk/keyboard clicks without closing on quiet trailing speech syllables; and high-passing the compressor sidechain stops low-end proximity rumble and plosives from ducking the upper vocal presence band.
+
+**Consequences:** `pipeline_480_48khz` executes in ~41.5 µs (-10.9 %) and `pipeline_480_44_1khz` in ~54.5 µs (-18.4 %). Golden regression fixtures were re-blessed once to reflect the improved compressor low-end transparency.
+
+### D-039 · 2026-11-19 · Accepted — Event-driven WASAPI session wake, `1.58 ms` `Off` low-latency mode, Keep-Warm PTT, and Mic Check / Raw-Mic detector
+
+**Decision:**
+1. Route `DenoiseEngine::Off` (`BypassDenoiser`) directly in `CleanupStage` with zero framing FIFO/resampler delay, cutting total pipeline latency to **76 samples (`1.58 ms` @ 48 kHz)**; skip neural inference in `CleanupStage` once `denoise_mix` settles at `0.0` (while keeping `dry_delay` constant and making `RnnoiseDenoiser::reset()` zero-alloc via 4-frame silent drain).
+2. Replace `tine-listener-gate` blind polling with `IAudioSessionNotification` (paired with immediate `GetSessionEnumerator()` activation) + `IAudioSessionEvents` (`OnStateChanged` / `OnSessionDisconnected`) waking a `SessionWake` condvar (2 s / 5 s fallback).
+3. Add persisted `AppSettings::park_when_unused` (`Keep Warm (PTT)` toggle across UI Pro rack, tray, CLI, pipe) to defeat idle parking for instant push-to-talk.
+4. Expose active direct-capture app names (`raw_mic_apps`, 2 s cache -> dismissible UI banner) and a 5 s sample-aligned Raw vs Tine A/B `MicCheckRunner` modal.
+
+**Consequences:** Competitive FPS gamers get a 1.58 ms low-latency DSP chain (~17.3 µs/frame), push-to-talk wakes immediately without cold-start dropout, and first-time users can verify real voice quality and detect apps still using their raw microphone.
+
+### D-040 · 2026-11-19 · Accepted — Click-free 5 ms RT mute, global Win32 hotkeys, USB/sleep auto-recovery, and pre-packaging signing order
+
+**Decision:** Add a lock-free `AtomicBool`-driven 5 ms linear post-DSP/pre-monitor RT mute ramp (`VirtualCableProcessor`), global Win32 `RegisterHotKey` watcher (`Ctrl+Shift+M` mute, `Ctrl+Shift+B` bypass, with `MOD_NOREPEAT`), `DeviceEvent::StateChanged` + `PowerWatcher` (`PowerRegisterSuspendResumeNotification`) driven `RecoveryState` with 300 ms USB settle / 600 ms resume settle, and sign `target\release\tine.exe` *before* MSI and portable ZIP packaging in `.github/workflows/release.yml` (verified by `scripts/verify-signing.ps1`).
+
+**Consequences:** `tine-engine::virtual_cable::rt` stays 100 % allocation-free and click-free on mute toggles, hotkeys and USB replug/sleep resume recover automatically without manual restarts, and released MSIs and portable ZIPs distribute signed executables when signing secrets are active.
+
+### D-041 · 2026-11-20 · Accepted — Multi-vendor virtual-cable discovery, GitHub build provenance, and SignPath Foundation traction strategy
+
+**Decision:**
+1. Expand `tine-engine::apo_admin` virtual-cable discovery and `is_virtual_cable_capture` beyond `CABLE Input`/`VB-Audio` to auto-discover **Hi-Fi Cable**, **Cables A–D**, **VoiceMeeter VAIO/AUX**, and **Virtual Audio Cable (VAC)** (`Line 1 (Virtual Audio Cable)`), while continuing to exclude `SteelSeries Sonar` and generic non-cable virtual devices.
+2. Generalize `tine-engine::listeners::capture_name_for_sink` so case-insensitive `Input` → `Output` mapping and same-name cables (e.g., `Line 1 (Virtual Audio Cable)`) pair accurately for listener gating (resolves `R-25`), and surface the paired capture device name directly in `tine apo status|install|repair`.
+3. Add GitHub Artifact Build Provenance (`actions/attest-build-provenance@v2` with `id-token: write` and `attestations: write`) to `.github/workflows/release.yml` alongside `SHA256SUMS.txt`, replacing the premature SignPath Foundation badge in `README.md` with accurate build-provenance verification instructions.
+
+**Why:** SignPath Foundation declined our initial 2026-11-20 OSS request strictly on public visibility signals (GitHub stars, contributors, external community references) and invited us to reapply once the project gains broader recognition. Because v0.1 already routes in user-space through existing WHQL-signed virtual audio cables (`D-018`) rather than an in-house kernel driver or `audiodg.exe` APO, SignPath rejection does not block release or audio functionality. Cryptographic build provenance + broad virtual-cable compatibility lets v0.1 ship immediately and earn the community traction required for SignPath Foundation (or fund Azure Artifact Signing) without stalling.
+
+**Consequences:** `R-25` is resolved; `R-02` reflects the interim provenance mitigation (`gh attestation verify`) and SignPath re-application / Azure Artifact Signing path; users are no longer restricted solely to standard `CABLE Input` naming.
+
+

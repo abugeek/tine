@@ -19,7 +19,7 @@ default = []
 ui-tooling = ["tine-ui/tooling", "rune/tooling"]
 
 [dependencies]
-tine-dsp = { workspace = true, features = ["std"] }
+tine-dsp = { workspace = true, features = ["std", "deepfilter"] }
 tine-engine.workspace = true
 tine-protocol.workspace = true
 tine-ui.workspace = true
@@ -38,8 +38,11 @@ windows = { workspace = true, features = [
     "Win32_System_Console",
     "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
+    "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [lints]

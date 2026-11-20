@@ -1,16 +1,12 @@
 # Release build (T23). Fires on a pushed v* tag (or manual dispatch).
 #
-# NOTE (R-14): GitHub Actions billing has kept every workflow run from
-# starting on this repo, so this pipeline is a reviewed-by-inspection
-# artifact until the maintainer fixes the billing/spending limit: it mirrors
-# the proven step shapes from ci.yml, and the MSI build itself was dry-run
-# locally with the same pinned WiX versions (see packaging/README.md).
+# R-14 resolved: the repository is now public, so GitHub Actions runs on
+# push/PR/tag builds without billing blocks.
 #
-# Publishing stays with the maintainer: on a v* tag this workflow creates a
-# *draft* GitHub Release (D-030 signing runbook in
-# docs/tasks/done/T23-packaging-release.md); the maintainer reviews and
-# publishes. Unsigned beta artifacts are expected until signing lands (R-02):
-# SHA-256 sums are always attached, and the README documents SmartScreen.
+# On a v* tag this workflow builds, tests, packages the MSI and portable/PDB
+# ZIPs, attests GitHub build provenance, and publishes the GitHub Release
+# (`draft: false`). Unsigned beta artifacts include SHA-256 sums and
+# provenance attestations until Authenticode signing secrets are configured.
 
 name: Release
 
@@ -26,6 +22,8 @@ on:
 
 permissions:
   contents: write # draft release + artifact upload
+  id-token: write # GitHub build provenance attestation
+  attestations: write # GitHub build provenance attestation
 
 env:
   CARGO_TERM_COLOR: always
@@ -92,9 +90,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $exe = Get-Item "target\release\tine.exe"
           "{0:N0} bytes ({1:N2} MiB)" -f $exe.Length, ($exe.Length / 1MB) | Write-Host
-          # Release gate: 24 MiB (R-21: tine.exe measures 20.63 MiB and the
-          # main 20 MB CI budget is an open maintainer decision).
-          if ($exe.Length -ge 24MB) { Write-Error "tine.exe exceeds the 24 MiB release gate!"; exit 1 }
+          # Release gate: 30 MiB (D-037: bumped from 24 MiB to accommodate the
+          # ~5 MiB embedded DeepFilterNet3 model weights).
+          if ($exe.Length -ge 30MB) { Write-Error "tine.exe exceeds the 30 MiB release gate!"; exit 1 }
 
       - name: Install WiX v5 CLI (user-profile dotnet tool)
         shell: pwsh
@@ -107,13 +105,27 @@ jobs:
           wix extension add -g WixToolset.Util.wixext/5.0.2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Sign tine.exe before packaging (skipped unless TINE_SIGNING_ENABLED=true)
+        if: ${{ env.TINE_SIGNING_ENABLED == 'true' }}
+        shell: pwsh
+        run: |
+          # TINE_SIGN_COMMAND (repo secret) is a signtool.exe command line
+          # covered by the runbook (SignPath Foundation / Azure Trusted
+          # Signing). Signing `tine.exe` MUST happen before building the MSI and
+          # portable ZIP so both packages distribute signed binaries.
+          $ErrorActionPreference = "Stop"
+          $cmd = "$env:TINE_SIGN_COMMAND `"target\release\tine.exe`""
+          Invoke-Expression $cmd
+          if ($LASTEXITCODE -ne 0) { Write-Error "signing failed for target\release\tine.exe"; exit 1 }
+          pwsh -File scripts\verify-signing.ps1 -Path target\release\tine.exe
+
       - name: Build the MSI
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $env:DOTNET_ROLL_FORWARD = "LatestMajor"
-          # build-msi.ps1 re-runs cargo with -p tine-app; keep the release dir
-          # to reuse the tree (cargo is incremental, this is a fast no-op).
+          # build-msi.ps1 re-runs cargo with -p tine-app; -SkipBuild keeps the
+          # already-built (and signed, when enabled) target\release\tine.exe intact.
           pwsh -File packaging\build-msi.ps1 -Version "${{ steps.ver.outputs.version }}" -SkipBuild
 
       - name: Build the portable zip and the PDB zip (dev use)
@@ -123,29 +135,26 @@ jobs:
           $v = "${{ steps.ver.outputs.version }}"
           New-Item -ItemType Directory -Force -Path portable | Out-Null
           Copy-Item target\release\tine.exe portable\
+          Copy-Item scripts\setup-virtual-cable.ps1 portable\
+          Copy-Item README.md portable\
           Copy-Item LICENSE-MIT portable\
           Copy-Item LICENSE-APACHE portable\
           Compress-Archive -Path portable\* -DestinationPath "tine-$v-portable-win-x64.zip" -Force
           Compress-Archive -Path target\release\tine.pdb -DestinationPath "tine-$v-pdb-win-x64.zip" -Force
           Get-ChildItem *.zip | ForEach-Object { Write-Host "$($_.Name) $($_.Length) bytes" }
 
-      - name: Sign artifacts (skipped unless TINE_SIGNING_ENABLED=true)
+      - name: Sign MSI (skipped unless TINE_SIGNING_ENABLED=true)
         if: ${{ env.TINE_SIGNING_ENABLED == 'true' }}
         shell: pwsh
         run: |
-          # TINE_SIGN_COMMAND (repo secret) is a signtool.exe command line
-          # covered by the runbook (SignPath Foundation / Azure Trusted
-          # Signing). Signing must happen BEFORE hashing; the sums below
-          # always cover the final files.
           $ErrorActionPreference = "Stop"
           $v = "${{ steps.ver.outputs.version }}"
-          $files = @("packaging\out\tine-$v-x64.msi", "target\release\tine.exe")
-          foreach ($f in $files) {
-            Write-Host "signing $f"
-            $cmd = "$env:TINE_SIGN_COMMAND `"$f`""
-            Invoke-Expression $cmd
-            if ($LASTEXITCODE -ne 0) { Write-Error "signing failed for $f"; exit 1 }
-          }
+          $msi = "packaging\out\tine-$v-x64.msi"
+          Write-Host "signing $msi"
+          $cmd = "$env:TINE_SIGN_COMMAND `"$msi`""
+          Invoke-Expression $cmd
+          if ($LASTEXITCODE -ne 0) { Write-Error "signing failed for $msi"; exit 1 }
+          pwsh -File scripts\verify-signing.ps1 -Path $msi
 
       - name: Generate SHA-256 sums
         shell: pwsh
@@ -163,6 +172,14 @@ jobs:
           }
           $sums | Set-Content -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt
+
+      - name: Attest build provenance (cryptographic origin proof)
+        uses: actions/attest-build-provenance@v2
+        continue-on-error: true
+        with:
+          subject-path: |
+            packaging/out/tine-*-x64.msi
+            tine-*-portable-win-x64.zip
 
       - name: Extract release notes from CHANGELOG.md
         shell: pwsh
@@ -202,21 +219,21 @@ jobs:
             packaging/out/tine-*-x64.msi
             tine-*-portable-win-x64.zip
             tine-*-pdb-win-x64.zip
+            scripts/setup-virtual-cable.ps1
             SHA256SUMS.txt
             RELEASE_NOTES.md
           if-no-files-found: error
 
-      # Draft release on v* tags only. Publishing (review + "Publish") is the
-      # maintainer's action, as is the signing setup (runbook).
-      - name: Create draft GitHub Release
+      - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          draft: false
           name: Tine ${{ steps.ver.outputs.version }}
           body_path: RELEASE_NOTES.md
           files: |
             packaging/out/tine-*-x64.msi
             tine-*-portable-win-x64.zip
             tine-*-pdb-win-x64.zip
+            scripts/setup-virtual-cable.ps1
             SHA256SUMS.txt

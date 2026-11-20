@@ -1,4 +1,4 @@
-//! `rune::Tray` wrapper: icon generation, flat menu with checked-state-in-label
+//! `rune::Tray` wrapper: brand-mark icons per state, flat menu with checked-state-in-label
 //! (rune trays are flat: `Action` and `Separator` only), and tooltip.
 //!
 //! `rune::Tray` exposes no `set_icon`, so the icon variant is selected at
@@ -12,9 +12,11 @@ use tine_protocol::presets::Archetype;
 /// Which icon variant the tray shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayVariant {
-    /// DSP processing (accent).
+    /// DSP processing (ember capsule).
     Active,
-    /// Bypassed (amber).
+    /// Microphone muted (grey capsule + crimson slash).
+    Muted,
+    /// Bypassed (grey capsule).
     Bypassed,
     /// Lost link / error (red).
     Error,
@@ -29,10 +31,14 @@ pub struct TraySnapshot {
     pub endpoint_id: Option<String>,
     /// Any processing state linked?
     pub linked: bool,
+    /// Click-free RT mic mute enabled.
+    pub muted: bool,
     /// Bypass A/B state.
     pub bypass: bool,
     /// "Hear Myself" monitor enabled.
     pub monitor: bool,
+    /// Keep-Warm (PTT) mode: prevents idle parking when no app captures.
+    pub keep_warm: bool,
     /// Current archetype.
     pub archetype: Archetype,
     /// HKCU Run autostart enabled.
@@ -47,8 +53,10 @@ impl TraySnapshot {
             mic_name: "No microphone selected".to_owned(),
             endpoint_id: None,
             linked: false,
+            muted: false,
             bypass: false,
             monitor: false,
+            keep_warm: false,
             archetype: Archetype::default(),
             autostart: false,
         }
@@ -57,10 +65,11 @@ impl TraySnapshot {
     /// The icon variant for the current state.
     #[must_use]
     pub fn variant(&self) -> TrayVariant {
-        match (self.linked, self.bypass) {
-            (false, _) => TrayVariant::Error,
-            (true, true) => TrayVariant::Bypassed,
-            (true, false) => TrayVariant::Active,
+        match (self.linked, self.muted, self.bypass) {
+            (false, _, _) => TrayVariant::Error,
+            (true, true, _) => TrayVariant::Muted,
+            (true, false, true) => TrayVariant::Bypassed,
+            (true, false, false) => TrayVariant::Active,
         }
     }
 
@@ -74,6 +83,8 @@ impl TraySnapshot {
         };
         let state = if !self.linked {
             "inactive"
+        } else if self.muted {
+            "muted"
         } else if self.bypass {
             "bypassed"
         } else {
@@ -87,10 +98,14 @@ impl TraySnapshot {
 pub mod menu_id {
     /// Open the UI window.
     pub const OPEN: &str = "open";
-    /// Toggle A/B bypass.
+    /// Toggle RT output mute (`Ctrl+Shift+M`).
+    pub const MUTE: &str = "mute";
+    /// Toggle A/B bypass (`Ctrl+Shift+B`).
     pub const BYPASS: &str = "bypass";
     /// Toggle "Hear Myself".
     pub const MONITOR: &str = "monitor";
+    /// Toggle Keep Warm (PTT) idle parking override.
+    pub const KEEP_WARM: &str = "keep_warm";
     /// Toggle HKCU Run autostart.
     pub const AUTOSTART: &str = "autostart";
     /// Archetype items: id prefix, e.g. `arch:dynamic`.
@@ -102,8 +117,18 @@ pub mod menu_id {
 /// Builds the flat tray menu (checked state in the label text).
 #[must_use]
 pub fn build_menu(s: &TraySnapshot) -> Vec<TrayItem> {
+    let mute_label = if s.muted {
+        "✓ Muted (Ctrl+Shift+M)"
+    } else {
+        "Mute Mic (Ctrl+Shift+M)"
+    };
     let bypass_label = if s.bypass { "Bypassed" } else { "✓ Processing" };
     let monitor_label = if s.monitor { "✓ Hear Myself" } else { "Hear Myself" };
+    let keep_warm_label = if s.keep_warm {
+        "✓ Keep Warm (PTT)"
+    } else {
+        "Keep Warm (PTT)"
+    };
     let autostart_label = if s.autostart {
         "✓ Start with Windows"
     } else {
@@ -111,8 +136,10 @@ pub fn build_menu(s: &TraySnapshot) -> Vec<TrayItem> {
     };
     let mut items = vec![
         TrayItem::action(menu_id::OPEN, "Open Tine"),
+        TrayItem::action(menu_id::MUTE, mute_label),
         TrayItem::action(menu_id::BYPASS, bypass_label),
         TrayItem::action(menu_id::MONITOR, monitor_label),
+        TrayItem::action(menu_id::KEEP_WARM, keep_warm_label),
         TrayItem::Separator,
     ];
     for a in [
@@ -135,45 +162,39 @@ pub fn build_menu(s: &TraySnapshot) -> Vec<TrayItem> {
     items
 }
 
-/// Tuning-fork silhouette test (24×24 pixel space): two prongs, a bridge,
-/// a stem. Plain range checks so the test stays `const`.
-const fn fork_glyph(x: u32, y: u32) -> bool {
-    let in_prong = x >= 6 && x <= 8;
-    let in_prong_r = x >= 15 && x <= 17;
-    let in_bridge_span = x >= 6 && x <= 17;
-    let in_bridge_h = y >= 13 && y <= 15;
-    let in_stem_h = x >= 11 && x <= 12;
-    let in_body = y >= 3 && y <= 13;
-    let in_stem = y >= 15 && y <= 21;
-    let prong_l = in_prong && in_body;
-    let prong_r = in_prong_r && in_body;
-    let bridge = in_bridge_span && in_bridge_h;
-    let stem = in_stem_h && in_stem;
-    prong_l || prong_r || bridge || stem
-}
+/// Tray glyph edge length in pixels (pre-rendered by `scripts/brand/render_icons.py`).
+const GLYPH_PX: u32 = 32;
 
-/// Generates the tuning-fork glyph pixels in the variant's palette
-/// (runtime-generated RGBA, 24×24 — no external asset needed).
+/// The brand mark per tray state, as raw RGBA (no decoder needed in the parent).
+static GLYPH_ACTIVE: &[u8] = include_bytes!("../../../assets/brand/tray-active-32.rgba");
+static GLYPH_BYPASSED: &[u8] = include_bytes!("../../../assets/brand/tray-bypassed-32.rgba");
+static GLYPH_ERROR: &[u8] = include_bytes!("../../../assets/brand/tray-error-32.rgba");
+
+/// The tray glyph for `variant`: the Tine mark (fork + mic capsule) whose capsule
+/// shows the state: ember while processing, grey when bypassed, red (dimmed fork)
+/// when the link is lost.
 #[must_use]
 pub fn fork_pixels(variant: TrayVariant) -> (u32, u32, Vec<u8>) {
-    const W: u32 = 24;
-    const H: u32 = 24;
-    let rgb: [u8; 3] = match variant {
-        TrayVariant::Active => [0x38, 0xBD, 0xF8],   // accent cyan
-        TrayVariant::Bypassed => [0xFB, 0xBF, 0x24], // amber
-        TrayVariant::Error => [0xF8, 0x71, 0x71],    // red
-    };
-    let mut rgba = vec![0u8; (W * H * 4) as usize];
-    for i in 0..W * H {
-        if fork_glyph(i % W, i / W) {
-            let base = (i * 4) as usize;
-            rgba[base] = rgb[0];
-            rgba[base + 1] = rgb[1];
-            rgba[base + 2] = rgb[2];
-            rgba[base + 3] = 0xFF;
+    if variant == TrayVariant::Muted {
+        let mut rgba = GLYPH_BYPASSED.to_vec();
+        for y in 6..26_usize {
+            for x in 6..26_usize {
+                if x.abs_diff(y) <= 1 {
+                    let idx = (y * GLYPH_PX as usize + x) * 4;
+                    if let Some(px) = rgba.get_mut(idx..idx + 4) {
+                        px.copy_from_slice(&[235, 72, 72, 255]);
+                    }
+                }
+            }
         }
+        return (GLYPH_PX, GLYPH_PX, rgba);
     }
-    (W, H, rgba)
+    let rgba = match variant {
+        TrayVariant::Active => GLYPH_ACTIVE,
+        TrayVariant::Bypassed => GLYPH_BYPASSED,
+        TrayVariant::Error | TrayVariant::Muted => GLYPH_ERROR,
+    };
+    (GLYPH_PX, GLYPH_PX, rgba.to_vec())
 }
 
 /// Wraps [`fork_pixels`] into a `rune::TrayIcon`.
@@ -212,8 +233,10 @@ mod tests {
             mic_name: "Fifine AM8".to_owned(),
             endpoint_id: Some("ep-1".to_owned()),
             linked: true,
+            muted: false,
             bypass: false,
             monitor: true,
+            keep_warm: true,
             archetype: Archetype::Headset,
             autostart: true,
         };
@@ -227,6 +250,7 @@ mod tests {
             .collect();
         assert!(labels.contains(&"✓ Processing"));
         assert!(labels.contains(&"✓ Hear Myself"));
+        assert!(labels.contains(&"✓ Keep Warm (PTT)"));
         assert!(labels.contains(&"✓ Gaming Headset / Boom"));
         assert!(labels.contains(&"✓ Start with Windows"));
         assert!(labels.contains(&"Open Tine"));
@@ -278,6 +302,8 @@ mod tests {
         assert_eq!(s.variant(), TrayVariant::Active);
         s.bypass = true;
         assert_eq!(s.variant(), TrayVariant::Bypassed);
+        s.muted = true;
+        assert_eq!(s.variant(), TrayVariant::Muted);
     }
 
     #[test]
@@ -289,24 +315,28 @@ mod tests {
         assert_eq!(s.tooltip(), "Tine — Shure SM7B (processing)");
         s.bypass = true;
         assert_eq!(s.tooltip(), "Tine — Shure SM7B (bypassed)");
+        s.muted = true;
+        assert_eq!(s.tooltip(), "Tine — Shure SM7B (muted)");
     }
 
     #[test]
-    fn icons_match_the_variant_palette() {
-        for (variant, leading) in [
-            (TrayVariant::Active, 0x38u8),
-            (TrayVariant::Bypassed, 0xFB),
-            (TrayVariant::Error, 0xF8),
+    fn icons_are_distinct_per_variant() {
+        let mut seen = Vec::new();
+        for variant in [
+            TrayVariant::Active,
+            TrayVariant::Muted,
+            TrayVariant::Bypassed,
+            TrayVariant::Error,
         ] {
             let (w, h, rgba) = super::fork_pixels(variant);
-            assert_eq!((w, h), (24, 24));
-            assert_eq!(rgba.len(), 24 * 24 * 4);
-            // Alpha is every 4th byte (offset 3); red is every 4th from 0.
-            assert!(rgba.iter().skip(3).step_by(4).all(|&a| a == 0 || a == 0xFF));
-            assert!(
-                rgba.iter().step_by(4).any(|&r| r == leading),
-                "no {leading:#x} pixels for {variant:?}"
-            );
+            assert_eq!((w, h), (32, 32));
+            assert_eq!(rgba.len(), 32 * 32 * 4);
+            // Rounded plate: transparent corners, opaque centre.
+            assert_eq!(rgba[3], 0, "corner must be transparent");
+            let centre = ((16 * 32 + 16) * 4 + 3) as usize;
+            assert_eq!(rgba[centre], 0xFF, "plate must be opaque");
+            assert!(!seen.contains(&rgba), "{variant:?} glyph duplicates another state");
+            seen.push(rgba);
             let _ = super::make_icon(variant);
         }
     }

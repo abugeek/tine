@@ -669,6 +669,24 @@ fn autotune_wizard_applies_calibration_through_apply_intent() {
     );
     assert!(cal.derived.denoise_mix >= 0.5, "noisy room drives a high AI mix");
 
+    // PreviewCalibration updates bridge.params() for different VoiceStyles before Apply.
+    app.bridge.dispatch(Intent::PreviewCalibration {
+        style: tine_dsp::calibrator::VoiceStyle::Broadcast,
+        keep_pins: true,
+        audition_raw: None,
+    });
+    let preview_broadcast = *app.bridge.params();
+    app.bridge.dispatch(Intent::PreviewCalibration {
+        style: tine_dsp::calibrator::VoiceStyle::Crisp,
+        keep_pins: true,
+        audition_raw: None,
+    });
+    let preview_crisp = *app.bridge.params();
+    assert_ne!(
+        preview_broadcast, preview_crisp,
+        "Broadcast and Crisp calibration previews must produce distinct DSP parameters"
+    );
+
     // Apply { keep_pins: false }: calibration lands in the profile, pins
     // the calibration now drives are cleared.
     app.bridge.dispatch(Intent::ApplyCalibration { keep_pins: false });

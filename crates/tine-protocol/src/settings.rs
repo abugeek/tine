@@ -3,10 +3,23 @@
 #[cfg(feature = "serde")]
 mod serde_settings {
     use crate::ids::SCHEMA_VERSION;
+    use crate::params::DenoiseEngine;
     use crate::presets::{FieldError, ValidationError};
 
     const fn legacy_onboarded() -> bool {
         true
+    }
+
+    const fn default_true() -> bool {
+        true
+    }
+
+    fn default_hotkey_mute() -> String {
+        "Ctrl+Shift+M".to_owned()
+    }
+
+    fn default_hotkey_bypass() -> String {
+        "Ctrl+Shift+B".to_owned()
     }
 
     /// Global user settings persisted in `%APPDATA%\Tine\settings.json`.
@@ -25,6 +38,11 @@ mod serde_settings {
         pub monitor_enabled: bool,
         /// Whether the Surgical Pro Rack drawer is expanded.
         pub pro_drawer_open: bool,
+        /// Selected denoiser backend (`rnnoise`, `deepfilter`, or `off`).
+        pub denoise_engine: DenoiseEngine,
+        /// When `true`, parks the audio routing loop when no app uses the virtual mic (`false` = Keep Warm PTT).
+        #[serde(default = "default_true")]
+        pub park_when_unused: bool,
         /// Whether Tine launches on Windows login.
         pub autostart: bool,
         /// Whether Tine starts minimized to the system tray.
@@ -36,6 +54,12 @@ mod serde_settings {
         pub window_width: u32,
         /// Last window height in logical pixels.
         pub window_height: u32,
+        /// Global Win32 hotkey to toggle mic mute (empty string disables).
+        #[serde(default = "default_hotkey_mute")]
+        pub hotkey_mute: String,
+        /// Global Win32 hotkey to toggle DSP A/B bypass (empty string disables).
+        #[serde(default = "default_hotkey_bypass")]
+        pub hotkey_bypass: String,
     }
 
     impl Default for AppSettings {
@@ -46,11 +70,15 @@ mod serde_settings {
                 monitor_device_id: None,
                 monitor_enabled: false,
                 pro_drawer_open: false,
+                denoise_engine: DenoiseEngine::default(),
+                park_when_unused: true,
                 autostart: false,
                 start_minimized: false,
                 onboarding_completed: false,
                 window_width: 1280,
                 window_height: 800,
+                hotkey_mute: default_hotkey_mute(),
+                hotkey_bypass: default_hotkey_bypass(),
             }
         }
     }
@@ -106,6 +134,23 @@ mod serde_settings {
             let serialized = serde_json::to_string(&defaults)?;
             let round_tripped: AppSettings = serde_json::from_str(&serialized)?;
             assert!(!round_tripped.onboarding_completed);
+            assert_eq!(round_tripped.denoise_engine, DenoiseEngine::Rnnoise);
+
+            let dfn_json = r#"{"schema":1,"denoise_engine":"deepfilter"}"#;
+            let dfn: AppSettings = serde_json::from_str(dfn_json)?;
+            assert_eq!(dfn.denoise_engine, DenoiseEngine::DeepFilterNet3);
+            assert!(dfn.park_when_unused, "missing park_when_unused must default to true");
+
+            let ptt_json = r#"{"schema":1,"park_when_unused":false}"#;
+            let ptt: AppSettings = serde_json::from_str(ptt_json)?;
+            assert!(!ptt.park_when_unused);
+            assert_eq!(ptt.hotkey_mute, "Ctrl+Shift+M");
+            assert_eq!(ptt.hotkey_bypass, "Ctrl+Shift+B");
+
+            let hk_json = r#"{"schema":1,"hotkey_mute":"Alt+M","hotkey_bypass":""}"#;
+            let hk: AppSettings = serde_json::from_str(hk_json)?;
+            assert_eq!(hk.hotkey_mute, "Alt+M");
+            assert_eq!(hk.hotkey_bypass, "");
 
             Ok(())
         }

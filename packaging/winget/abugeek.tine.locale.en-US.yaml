@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: abugeek.tine
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Abdulloh
+PublisherUrl: https://github.com/abugeek
+PackageName: Tine
+PackageUrl: https://github.com/abugeek/tine
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/abugeek/tine/blob/main/LICENSE-MIT
+ShortDescription: Ultra-lightweight, native, open-source Rust microphone DSP engine for Windows
+Tags:
+  - audio
+  - dsp
+  - equalizer
+  - microphone
+  - noise-suppression
+  - rnnoise
+  - deepfilternet
+  - voice
+  - windows
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

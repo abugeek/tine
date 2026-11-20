@@ -84,6 +84,15 @@ pub enum PipeRequest {
     },
     /// Discard the pending Auto-Tune results.
     CalibrateDiscard,
+    /// Preview pending Auto-Tune results with the chosen voice style (live DSP + recorded voice loop).
+    CalibratePreview {
+        /// Voice style id (`auto`, `broadcast`, `natural`, `crisp`, `keep`).
+        style: String,
+        /// Whether pinned Pro parameters are kept.
+        keep_pins: bool,
+        /// `Some(false)` = loop Tuned recording, `Some(true)` = loop Raw recording, `None` = stop loop.
+        audition_raw: Option<bool>,
+    },
     /// Persist whether the Surgical Pro Rack drawer is expanded.
     SetProDrawerOpen {
         /// `true` when the Pro drawer is open.
@@ -93,6 +102,32 @@ pub enum PipeRequest {
     OnboardingDone,
     /// Re-run the D-018 virtual-cable routing loop against the active endpoint.
     RouterFollow,
+    /// Switch Stage 2 denoiser backend (`rnnoise` | `deepfilter` | `off`).
+    SetDenoiseEngine {
+        /// Machine identifier (`rnnoise`, `deepfilter`, or `off`).
+        engine: String,
+    },
+    /// Enable or disable automatic idle parking (`false` = Keep Warm for PTT).
+    SetParkWhenUnused {
+        /// `true` to park automatically when idle; `false` to stay hot continuously.
+        enabled: bool,
+    },
+    /// Start the 5-second Mic Check A/B recording and audition flow.
+    MicCheckStart,
+    /// Query current Mic Check recording/playback state.
+    MicCheckQuery,
+    /// Switch Mic Check playback between Tine processed (`false`) and raw mic (`true`).
+    MicCheckSetMode {
+        /// `true` to audition the unprocessed mic; `false` for Tine processed audio.
+        raw: bool,
+    },
+    /// Stop any running Mic Check recording/playback session.
+    MicCheckStop,
+    /// Set or toggle click-free 5 ms RT output mute (`None` toggles).
+    Mute {
+        /// `Some(true)` to mute, `Some(false)` to unmute, `None` to toggle.
+        on: Option<bool>,
+    },
 }
 
 /// Server reply. `code` doubles as the CLI exit code: 0 ok, 1 failure,
@@ -220,9 +255,21 @@ mod tests {
             PipeRequest::CalibrateCancel,
             PipeRequest::CalibrateApply { keep_pins: true },
             PipeRequest::CalibrateDiscard,
+            PipeRequest::CalibratePreview {
+                style: "broadcast".to_owned(),
+                keep_pins: true,
+                audition_raw: Some(false),
+            },
             PipeRequest::SetProDrawerOpen { open: true },
             PipeRequest::OnboardingDone,
             PipeRequest::RouterFollow,
+            PipeRequest::SetDenoiseEngine {
+                engine: "deepfilter".to_owned(),
+            },
+            PipeRequest::MicCheckStart,
+            PipeRequest::MicCheckQuery,
+            PipeRequest::MicCheckSetMode { raw: true },
+            PipeRequest::MicCheckStop,
         ];
         for req in &cases {
             let json = serde_json::to_string(req).unwrap_or_default();

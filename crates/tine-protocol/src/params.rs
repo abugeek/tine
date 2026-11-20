@@ -109,6 +109,73 @@ impl FilterType {
     }
 }
 
+/// Selectable neural/passthrough denoiser engine for Stage 2 (`D-037`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum DenoiseEngine {
+    /// Lightweight `RNNoise` (`nnnoiseless`, ~42 µs/frame, 1036-sample total DSP latency @ 48 kHz).
+    #[default]
+    Rnnoise,
+    /// Full-band `DeepFilterNet3` ("Studio Clean", ~48 kHz, 1996-sample total DSP latency @ 48 kHz).
+    #[cfg_attr(feature = "serde", serde(alias = "deepfilter"))]
+    DeepFilterNet3,
+    /// Denoiser disabled ("Low-Latency", 76-sample / 1.58 ms total DSP latency @ 48 kHz; expander still runs).
+    Off,
+}
+
+impl DenoiseEngine {
+    /// All available denoiser engines in UI display order.
+    pub const ALL: [Self; 3] = [Self::Rnnoise, Self::DeepFilterNet3, Self::Off];
+
+    /// Machine identifier used in CLI, pipe JSON, and `settings.json`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rnnoise => "rnnoise",
+            Self::DeepFilterNet3 => "deepfilter",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parses a user/CLI/wire denoiser engine identifier (case-insensitive).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        let s = name.trim();
+        if s.eq_ignore_ascii_case("rnnoise") || s.eq_ignore_ascii_case("rnn") || s.eq_ignore_ascii_case("standard") {
+            Some(Self::Rnnoise)
+        } else if s.eq_ignore_ascii_case("deepfilter")
+            || s.eq_ignore_ascii_case("deep_filter_net3")
+            || s.eq_ignore_ascii_case("deepfilternet3")
+            || s.eq_ignore_ascii_case("dfn3")
+            || s.eq_ignore_ascii_case("studio")
+            || s.eq_ignore_ascii_case("studio_clean")
+        {
+            Some(Self::DeepFilterNet3)
+        } else if s.eq_ignore_ascii_case("off")
+            || s.eq_ignore_ascii_case("bypass")
+            || s.eq_ignore_ascii_case("none")
+            || s.eq_ignore_ascii_case("low_latency")
+            || s.eq_ignore_ascii_case("low-latency")
+            || s.eq_ignore_ascii_case("lowlat")
+        {
+            Some(Self::Off)
+        } else {
+            None
+        }
+    }
+
+    /// Concise label shown in header pills and dropdowns.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Rnnoise => "RNNoise",
+            Self::DeepFilterNet3 => "Studio Clean",
+            Self::Off => "Low-Lat",
+        }
+    }
+}
+
 /// Measurement unit for a parameter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Unit {

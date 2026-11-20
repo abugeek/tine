@@ -7,17 +7,20 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use thiserror::Error;
 use tine_protocol::presets::Archetype;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, HANDLE, RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
-    AudioSessionStateActive, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_UNPLUGGED,
-    EDataFlow, ERole, IAudioSessionControl2, IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
-    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Vtbl, MMDeviceEnumerator,
-    PKEY_AudioEndpoint_FormFactor, eCapture, eRender,
+    AudioSessionDisconnectReason, AudioSessionState, AudioSessionStateActive, DEVICE_STATE, DEVICE_STATE_ACTIVE,
+    DEVICE_STATE_DISABLED, DEVICE_STATE_UNPLUGGED, EDataFlow, ERole, IAudioSessionControl, IAudioSessionControl2,
+    IAudioSessionEvents, IAudioSessionEvents_Vtbl, IAudioSessionManager2, IAudioSessionNotification,
+    IAudioSessionNotification_Vtbl, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, IMMNotificationClient,
+    IMMNotificationClient_Vtbl, MMDeviceEnumerator, PKEY_AudioEndpoint_FormFactor, eCapture, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PropVariantClear, PropVariantToStringAlloc, PropVariantToUInt32,
@@ -25,8 +28,11 @@ use windows::Win32::System::Com::StructuredStorage::{
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, STGM_READ,
 };
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
-use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, PWSTR};
+use windows::core::{BOOL, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, PWSTR};
 
 /// Errors returned by Win32 / COM / WASAPI wrappers.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -432,7 +438,14 @@ pub enum DeviceEvent {
     Removed(String),
     /// The default audio endpoint changed (carries the new default endpoint ID, if any).
     DefaultChanged(String),
-    /// An endpoint's state or properties changed.
+    /// An endpoint became active (`true`) or disabled/unplugged/not-present (`false`).
+    StateChanged {
+        /// Windows `MMDevice` endpoint identifier.
+        id: String,
+        /// `true` when the new state is `DEVICE_STATE_ACTIVE`.
+        active: bool,
+    },
+    /// An endpoint's properties changed.
     PropertyChanged(String),
 }
 
@@ -518,13 +531,14 @@ impl NotificationClient {
     unsafe extern "system" fn on_device_state_changed(
         this: *mut c_void,
         pwstrdeviceid: PCWSTR,
-        _dwnewstate: DEVICE_STATE,
+        dwnewstate: DEVICE_STATE,
     ) -> HRESULT {
         // SAFETY: `this` is a valid `NotificationClient` pointer for the duration of the callback.
         let obj = unsafe { &*this.cast::<Self>() };
-        let _ = obj
-            .tx
-            .send(DeviceEvent::PropertyChanged(pcwstr_to_string(pwstrdeviceid)));
+        let _ = obj.tx.send(DeviceEvent::StateChanged {
+            id: pcwstr_to_string(pwstrdeviceid),
+            active: dwnewstate == DEVICE_STATE_ACTIVE,
+        });
         S_OK
     }
 
@@ -681,6 +695,7 @@ pub struct CaptureSession {
 pub struct CaptureSessionWatcher {
     enumerator: IMMDeviceEnumerator,
     cached: Option<(String, IAudioSessionManager2)>,
+    cached_by_id: Option<(String, IAudioSessionManager2)>,
     _com: ComInit,
 }
 
@@ -698,6 +713,7 @@ impl CaptureSessionWatcher {
         Ok(Self {
             enumerator,
             cached: None,
+            cached_by_id: None,
             _com: com,
         })
     }
@@ -722,6 +738,58 @@ impl CaptureSessionWatcher {
                 Err(e)
             }
         }
+    }
+
+    /// Sessions on the capture endpoint identified by Windows `MMDevice` ID `endpoint_id`.
+    ///
+    /// Returns `Ok(None)` when `endpoint_id` is empty or the endpoint cannot be resolved.
+    pub fn sessions_by_id(&mut self, endpoint_id: &str) -> Result<Option<Vec<CaptureSession>>, WinError> {
+        if endpoint_id.is_empty() {
+            return Ok(None);
+        }
+        if self.cached_by_id.as_ref().is_none_or(|(id, _)| id != endpoint_id) {
+            let wide: Vec<u16> = endpoint_id.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: `enumerator` is valid and `wide` is NUL-terminated UTF-16.
+            let Ok(device) = (unsafe { self.enumerator.GetDevice(PCWSTR(wide.as_ptr())) }) else {
+                self.cached_by_id = None;
+                return Ok(None);
+            };
+            // SAFETY: `device` is active on this COM thread.
+            let manager: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None) }
+                .map_err(|e| WinError::com("IMMDevice::Activate(IAudioSessionManager2)", e))?;
+            self.cached_by_id = Some((endpoint_id.to_owned(), manager));
+        }
+        let Some((_, manager)) = self.cached_by_id.as_ref() else {
+            return Ok(None);
+        };
+        match read_sessions(manager) {
+            Ok(list) => Ok(Some(list)),
+            Err(e) => {
+                self.cached_by_id = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// Attaches an event-driven WASAPI session hook (`IAudioSessionNotification` +
+    /// `IAudioSessionEvents`) to the first active capture endpoint matching `pick`.
+    ///
+    /// Returns `Ok(None)` if no matching active capture endpoint is currently present.
+    ///
+    /// # Errors
+    /// [`WinError::Com`] if resolving the endpoint or registering notifications fails.
+    pub fn attach_event_hook(
+        &mut self,
+        pick: &dyn Fn(&str) -> bool,
+        wake: Arc<SessionWake>,
+    ) -> Result<Option<CableSessionEventHook>, WinError> {
+        if self.cached.as_ref().is_none_or(|(name, _)| !pick(name)) {
+            self.cached = self.resolve(pick)?;
+        }
+        let Some((_, manager)) = self.cached.as_ref() else {
+            return Ok(None);
+        };
+        CableSessionEventHook::register(manager.clone(), wake).map(Some)
     }
 
     fn resolve(&self, pick: &dyn Fn(&str) -> bool) -> Result<Option<(String, IAudioSessionManager2)>, WinError> {
@@ -778,4 +846,373 @@ fn read_sessions(manager: &IAudioSessionManager2) -> Result<Vec<CaptureSession>,
         out.push(CaptureSession { pid, active });
     }
     Ok(out)
+}
+
+/// Resolves a friendly application name for process ID `pid`, or `None` when
+/// the process cannot be queried (exited or protected system process).
+#[must_use]
+pub fn process_name_for_pid(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: Querying limited process metadata by PID; handle is wrapped in `Handle`.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let handle = Handle::new(raw)?;
+    let mut buf = [0u16; 260];
+    let mut len = u32::try_from(buf.len()).unwrap_or(260);
+    // SAFETY: `handle` is open with `PROCESS_QUERY_LIMITED_INFORMATION` and `buf` has capacity `len`.
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle.as_raw(),
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &raw mut len,
+        )
+    }
+    .ok()?;
+    let path = String::from_utf16_lossy(buf.get(..len as usize)?);
+    let stem = std::path::Path::new(&path).file_stem()?.to_str()?;
+    Some(friendly_app_name(stem))
+}
+
+fn friendly_app_name(stem: &str) -> String {
+    match stem.to_ascii_lowercase().as_str() {
+        "discord" | "discordptb" | "discordcanary" => "Discord".to_owned(),
+        "obs64" | "obs32" | "obs" => "OBS Studio".to_owned(),
+        "ms-teams" | "teams" => "Teams".to_owned(),
+        "zoom" => "Zoom".to_owned(),
+        "cs2" => "CS2".to_owned(),
+        "valorant-win64-shipping" => "Valorant".to_owned(),
+        "chrome" => "Chrome".to_owned(),
+        "msedge" => "Edge".to_owned(),
+        "firefox" => "Firefox".to_owned(),
+        "audacity" => "Audacity".to_owned(),
+        _ => stem.to_owned(),
+    }
+}
+
+/// Coalescing condition-variable wake signal shared between WASAPI session COM callbacks
+/// and the listener gate worker thread.
+pub struct SessionWake {
+    pending: Mutex<bool>,
+    cvar: Condvar,
+}
+
+impl SessionWake {
+    /// Creates a new unsignaled [`SessionWake`].
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending: Mutex::new(false),
+            cvar: Condvar::new(),
+        })
+    }
+
+    /// Marks an event pending and wakes the waiting listener gate thread.
+    pub fn notify(&self) {
+        let mut guard = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = true;
+        self.cvar.notify_one();
+    }
+
+    /// Blocks until [`Self::notify`] is called or `timeout` elapses, consuming any pending wake.
+    /// Returns `true` if woken by a notification before timing out.
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let mut guard = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *guard {
+            *guard = false;
+            return true;
+        }
+        let (mut guard, res) = self
+            .cvar
+            .wait_timeout_while(guard, timeout, |pending| !*pending)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let signaled = *guard || !res.timed_out();
+        *guard = false;
+        signaled
+    }
+}
+
+#[repr(C)]
+struct SessionNotificationClient {
+    vtable: *const IAudioSessionNotification_Vtbl,
+    ref_count: AtomicU32,
+    wake: Arc<SessionWake>,
+}
+
+impl SessionNotificationClient {
+    const VTABLE: IAudioSessionNotification_Vtbl = IAudioSessionNotification_Vtbl {
+        base__: IUnknown_Vtbl {
+            QueryInterface: Self::query_interface,
+            AddRef: Self::add_ref,
+            Release: Self::release,
+        },
+        OnSessionCreated: Self::on_session_created,
+    };
+
+    fn into_com(wake: Arc<SessionWake>) -> IAudioSessionNotification {
+        let boxed = Box::new(Self {
+            vtable: &Self::VTABLE,
+            ref_count: AtomicU32::new(1),
+            wake,
+        });
+        let raw = Box::into_raw(boxed).cast::<c_void>();
+        // SAFETY: `raw` points to a valid `#[repr(C)]` `SessionNotificationClient` with
+        // `IAudioSessionNotification_Vtbl` as its first field and initial ref_count == 1.
+        unsafe { IAudioSessionNotification::from_raw(raw) }
+    }
+
+    unsafe extern "system" fn query_interface(
+        this: *mut c_void,
+        iid: *const GUID,
+        interface: *mut *mut c_void,
+    ) -> HRESULT {
+        if interface.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `iid` and `interface` are valid pointers per COM `QueryInterface` contract.
+        unsafe {
+            *interface = std::ptr::null_mut();
+            if iid.is_null() {
+                return E_POINTER;
+            }
+            let iid_ref = &*iid;
+            if *iid_ref == <IUnknown as Interface>::IID || *iid_ref == <IAudioSessionNotification as Interface>::IID {
+                let _ = Self::add_ref(this);
+                *interface = this;
+                return S_OK;
+            }
+        }
+        E_NOINTERFACE
+    }
+
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        // SAFETY: `this` is a valid `SessionNotificationClient` pointer.
+        let obj = unsafe { &*this.cast::<Self>() };
+        obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        // SAFETY: `this` is a valid `SessionNotificationClient` pointer.
+        let obj = unsafe { &*this.cast::<Self>() };
+        let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            // SAFETY: Last reference dropped; `this` was allocated via `Box::into_raw`.
+            unsafe { drop(Box::from_raw(this.cast::<Self>())) };
+            0
+        } else {
+            prev - 1
+        }
+    }
+
+    unsafe extern "system" fn on_session_created(this: *mut c_void, _new_session: *mut c_void) -> HRESULT {
+        // SAFETY: `this` is valid for the duration of the COM callback.
+        let obj = unsafe { &*this.cast::<Self>() };
+        obj.wake.notify();
+        S_OK
+    }
+}
+
+#[repr(C)]
+struct SessionEventsClient {
+    vtable: *const IAudioSessionEvents_Vtbl,
+    ref_count: AtomicU32,
+    wake: Arc<SessionWake>,
+}
+
+impl SessionEventsClient {
+    const VTABLE: IAudioSessionEvents_Vtbl = IAudioSessionEvents_Vtbl {
+        base__: IUnknown_Vtbl {
+            QueryInterface: Self::query_interface,
+            AddRef: Self::add_ref,
+            Release: Self::release,
+        },
+        OnDisplayNameChanged: Self::on_display_name_changed,
+        OnIconPathChanged: Self::on_icon_path_changed,
+        OnSimpleVolumeChanged: Self::on_simple_volume_changed,
+        OnChannelVolumeChanged: Self::on_channel_volume_changed,
+        OnGroupingParamChanged: Self::on_grouping_param_changed,
+        OnStateChanged: Self::on_state_changed,
+        OnSessionDisconnected: Self::on_session_disconnected,
+    };
+
+    fn into_com(wake: Arc<SessionWake>) -> IAudioSessionEvents {
+        let boxed = Box::new(Self {
+            vtable: &Self::VTABLE,
+            ref_count: AtomicU32::new(1),
+            wake,
+        });
+        let raw = Box::into_raw(boxed).cast::<c_void>();
+        // SAFETY: `raw` points to a valid `#[repr(C)]` `SessionEventsClient` with
+        // `IAudioSessionEvents_Vtbl` as its first field and initial ref_count == 1.
+        unsafe { IAudioSessionEvents::from_raw(raw) }
+    }
+
+    unsafe extern "system" fn query_interface(
+        this: *mut c_void,
+        iid: *const GUID,
+        interface: *mut *mut c_void,
+    ) -> HRESULT {
+        if interface.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `iid` and `interface` are valid pointers per COM `QueryInterface` contract.
+        unsafe {
+            *interface = std::ptr::null_mut();
+            if iid.is_null() {
+                return E_POINTER;
+            }
+            let iid_ref = &*iid;
+            if *iid_ref == <IUnknown as Interface>::IID || *iid_ref == <IAudioSessionEvents as Interface>::IID {
+                let _ = Self::add_ref(this);
+                *interface = this;
+                return S_OK;
+            }
+        }
+        E_NOINTERFACE
+    }
+
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        // SAFETY: `this` is a valid `SessionEventsClient` pointer.
+        let obj = unsafe { &*this.cast::<Self>() };
+        obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        // SAFETY: `this` is a valid `SessionEventsClient` pointer.
+        let obj = unsafe { &*this.cast::<Self>() };
+        let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            // SAFETY: Last reference dropped; `this` was allocated via `Box::into_raw`.
+            unsafe { drop(Box::from_raw(this.cast::<Self>())) };
+            0
+        } else {
+            prev - 1
+        }
+    }
+
+    unsafe extern "system" fn on_display_name_changed(_this: *mut c_void, _name: PCWSTR, _ctx: *const GUID) -> HRESULT {
+        S_OK
+    }
+
+    unsafe extern "system" fn on_icon_path_changed(_this: *mut c_void, _path: PCWSTR, _ctx: *const GUID) -> HRESULT {
+        S_OK
+    }
+
+    unsafe extern "system" fn on_simple_volume_changed(
+        _this: *mut c_void,
+        _vol: f32,
+        _mute: BOOL,
+        _ctx: *const GUID,
+    ) -> HRESULT {
+        S_OK
+    }
+
+    unsafe extern "system" fn on_channel_volume_changed(
+        _this: *mut c_void,
+        _count: u32,
+        _vols: *const f32,
+        _changed: u32,
+        _ctx: *const GUID,
+    ) -> HRESULT {
+        S_OK
+    }
+
+    unsafe extern "system" fn on_grouping_param_changed(
+        _this: *mut c_void,
+        _grouping: *const GUID,
+        _ctx: *const GUID,
+    ) -> HRESULT {
+        S_OK
+    }
+
+    unsafe extern "system" fn on_state_changed(this: *mut c_void, _new_state: AudioSessionState) -> HRESULT {
+        // SAFETY: `this` is valid for the duration of the COM callback.
+        let obj = unsafe { &*this.cast::<Self>() };
+        obj.wake.notify();
+        S_OK
+    }
+
+    unsafe extern "system" fn on_session_disconnected(
+        this: *mut c_void,
+        _reason: AudioSessionDisconnectReason,
+    ) -> HRESULT {
+        // SAFETY: `this` is valid for the duration of the COM callback.
+        let obj = unsafe { &*this.cast::<Self>() };
+        obj.wake.notify();
+        S_OK
+    }
+}
+
+/// RAII registration of `IAudioSessionNotification` and `IAudioSessionEvents` on
+/// an endpoint's [`IAudioSessionManager2`], waking [`SessionWake`] immediately on
+/// session creation, state change (`Inactive <-> Active`), or disconnect.
+pub struct CableSessionEventHook {
+    manager: IAudioSessionManager2,
+    session_notif: IAudioSessionNotification,
+    events_client: IAudioSessionEvents,
+    watched: Vec<IAudioSessionControl>,
+}
+
+impl CableSessionEventHook {
+    fn register(manager: IAudioSessionManager2, wake: Arc<SessionWake>) -> Result<Self, WinError> {
+        let session_notif = SessionNotificationClient::into_com(Arc::clone(&wake));
+        let events_client = SessionEventsClient::into_com(wake);
+        // SAFETY: `manager` and `session_notif` are valid COM pointers on this MTA thread.
+        unsafe { manager.RegisterSessionNotification(&session_notif) }
+            .map_err(|e| WinError::com("IAudioSessionManager2::RegisterSessionNotification", e))?;
+        // Per Windows WASAPI contract, `GetSessionEnumerator` must be invoked after
+        // `RegisterSessionNotification` so session creation notifications become active.
+        // SAFETY: `manager` is valid; result is inspected on `refresh_sessions` below.
+        let _ = unsafe { manager.GetSessionEnumerator() };
+        let mut hook = Self {
+            manager,
+            session_notif,
+            events_client,
+            watched: Vec::new(),
+        };
+        hook.refresh_sessions();
+        Ok(hook)
+    }
+
+    /// Re-enumerates current sessions on the manager and attaches [`IAudioSessionEvents`]
+    /// to each session so push-to-talk / stream pause transitions trigger immediate wakes.
+    pub fn refresh_sessions(&mut self) {
+        self.clear_watched();
+        // SAFETY: `self.manager` is valid on this COM thread.
+        let Ok(list) = (unsafe { self.manager.GetSessionEnumerator() }) else {
+            return;
+        };
+        // SAFETY: `list` is a valid `IAudioSessionEnumerator`.
+        let Ok(count) = (unsafe { list.GetCount() }) else {
+            return;
+        };
+        for idx in 0..count {
+            // SAFETY: `idx < count` and `list` is valid.
+            let Ok(control) = (unsafe { list.GetSession(idx) }) else {
+                continue;
+            };
+            // SAFETY: `control` and `self.events_client` are valid COM pointers.
+            if unsafe { control.RegisterAudioSessionNotification(&self.events_client) }.is_ok() {
+                self.watched.push(control);
+            }
+        }
+    }
+
+    fn clear_watched(&mut self) {
+        for control in self.watched.drain(..) {
+            // SAFETY: Both `control` and `self.events_client` were paired in `refresh_sessions`.
+            let _ = unsafe { control.UnregisterAudioSessionNotification(&self.events_client) };
+        }
+    }
+}
+
+impl Drop for CableSessionEventHook {
+    fn drop(&mut self) {
+        self.clear_watched();
+        // SAFETY: `self.session_notif` was registered on `self.manager` in `register`.
+        let _ = unsafe { self.manager.UnregisterSessionNotification(&self.session_notif) };
+    }
 }

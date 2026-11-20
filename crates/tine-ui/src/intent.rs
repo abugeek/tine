@@ -1,6 +1,7 @@
 //! User intents emitted by UI interactions toward the engine control plane.
 
-use tine_protocol::params::ParamId;
+use tine_dsp::calibrator::VoiceStyle;
+use tine_protocol::params::{DenoiseEngine, ParamId};
 use tine_protocol::presets::Archetype;
 
 use crate::model::Macro;
@@ -12,6 +13,10 @@ pub enum Intent {
     SelectEndpoint(String),
     /// Switch the microphone hardware archetype preset.
     SetArchetype(Archetype),
+    /// Switch the Stage 2 denoiser engine (`Rnnoise`, `DeepFilterNet3`, `Off`).
+    SetDenoiseEngine(DenoiseEngine),
+    /// Enable or disable automatic idle parking (`false` = Keep Warm for PTT).
+    SetParkWhenUnused(bool),
     /// Move a Golden Line macro node (`0.0..=1.0`).
     SetMacro(Macro, f32),
     /// Set a Pro-mode parameter directly (pins it).
@@ -22,6 +27,8 @@ pub enum Intent {
     UnpinAll,
     /// Toggle global A/B bypass.
     ToggleBypass,
+    /// Set click-free RT output mute (`true` = muted).
+    SetMuted(bool),
     /// Toggle "Hear Myself" local monitor.
     ToggleMonitor,
     /// Pick the playback device for "Hear Myself".
@@ -30,6 +37,15 @@ pub enum Intent {
     StartAutoTune,
     /// Cancel an in-progress Auto-Tune wizard.
     CancelAutoTune,
+    /// Preview pending Auto-Tune calibration + voice style on live DSP and recorded voice loop.
+    PreviewCalibration {
+        /// Selected post-calibration voice style.
+        style: VoiceStyle,
+        /// Whether to preserve existing Pro-mode pinned parameters.
+        keep_pins: bool,
+        /// `Some(false)` to audition Tuned voice, `Some(true)` to audition Raw voice, `None` to stop audition loop.
+        audition_raw: Option<bool>,
+    },
     /// Apply Auto-Tune calibration results.
     ApplyCalibration {
         /// Whether to preserve existing Pro-mode pinned parameters.
@@ -45,6 +61,12 @@ pub enum Intent {
     OpenSettings,
     /// Set the Pro Rack drawer's open state (persisted by the engine).
     SetProDrawerOpen(bool),
+    /// Start the 5-second Raw vs Tine Mic Check A/B recording.
+    StartMicCheck,
+    /// Switch Mic Check playback mode (`true` = Raw Mic, `false` = Tine Processed).
+    SetMicCheckMode(bool),
+    /// Stop and close the Mic Check modal.
+    StopMicCheck,
     /// Request closing the UI window.
     CloseWindow,
 }

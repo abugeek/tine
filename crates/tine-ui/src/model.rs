@@ -1,7 +1,7 @@
 //! Engine-agnostic UI view model types.
 
-use tine_protocol::params::{DspParams, ParamId};
-use tine_protocol::presets::{Archetype, MacroPositions, PinSet};
+use tine_protocol::params::{DenoiseEngine, DspParams, ParamId};
+use tine_protocol::presets::{Archetype, Calibration, MacroPositions, PinSet};
 
 /// A physical microphone endpoint entry shown in the header selector.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +168,32 @@ pub enum AutoTuneStep {
     Failed(CalFailureUi),
 }
 
+/// Built-in 5-second Mic Check (Raw vs Tine A/B playback) state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum MicCheckStep {
+    /// Mic Check modal is closed.
+    #[default]
+    Idle,
+    /// Capturing 5 seconds of raw audio.
+    Recording {
+        /// Normalized progress (`0.0..=1.0`).
+        progress: f32,
+        /// Live input level in dBFS.
+        level_db: f32,
+    },
+    /// Playing back the sample-aligned A/B loop.
+    Playing {
+        /// `true` when auditioning Raw Mic, `false` for Tine Processed.
+        raw: bool,
+        /// Normalized playback loop position (`0.0..=1.0`).
+        progress: f32,
+        /// Total snippet duration in seconds.
+        duration_s: f32,
+    },
+    /// Recording or playback failed with a message.
+    Failed(String),
+}
+
 /// Auto-Tune wizard state mirrored from the engine.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoTuneUi {
@@ -259,7 +285,7 @@ impl Macro {
 }
 
 /// Authoritative UI model pushed from the engine control plane.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiModel {
     /// Available capture endpoints.
     pub endpoints: Vec<EndpointRow>,
@@ -277,14 +303,55 @@ pub struct UiModel {
     pub params: DspParams,
     /// Global A/B bypass state (`true` = raw mic).
     pub bypass: bool,
+    /// Click-free RT output mute state (`true` = muted).
+    pub muted: bool,
+    /// Active Stage 2 denoiser backend (`Rnnoise`, `DeepFilterNet3`, or `Off`).
+    pub denoise_engine: DenoiseEngine,
+    /// Automatic idle parking enabled (`false` = Keep Warm for PTT).
+    pub park_when_unused: bool,
     /// "Hear Myself" monitor state.
     pub monitor: MonitorUi,
     /// Completed Auto-Tune calibration results awaiting Apply/Discard.
     pub calibration: Option<CalibrationUi>,
+    /// Full calibration struct for pending Auto-Tune results (carries tilt/crest metrics).
+    pub pending_calibration: Option<Calibration>,
+    /// Currently active Auto-Tune calibration applied to this microphone profile.
+    pub active_calibration: Option<Calibration>,
     /// Auto-Tune wizard progress state.
     pub autotune: AutoTuneUi,
+    /// Built-in 5-second Mic Check A/B modal state.
+    pub mic_check: MicCheckStep,
     /// Whether to show the first-run onboarding overlay.
     pub first_run: bool,
     /// Optional dismissible status or error banner shown in the main view.
     pub status_banner: Option<String>,
+    /// Other apps currently recording directly from the physical mic instead of `CABLE Output`.
+    pub raw_mic_apps: Vec<String>,
+}
+
+impl Default for UiModel {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            selected: None,
+            apo: ApoBadge::default(),
+            archetype: Archetype::default(),
+            macros: MacroPositions::default(),
+            pins: PinSet::default(),
+            params: DspParams::default(),
+            bypass: false,
+            muted: false,
+            denoise_engine: DenoiseEngine::default(),
+            park_when_unused: true,
+            monitor: MonitorUi::default(),
+            calibration: None,
+            pending_calibration: None,
+            active_calibration: None,
+            autotune: AutoTuneUi::default(),
+            mic_check: MicCheckStep::default(),
+            first_run: false,
+            status_banner: None,
+            raw_mic_apps: Vec::new(),
+        }
+    }
 }

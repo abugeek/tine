@@ -3,10 +3,12 @@
 use alloc::boxed::Box;
 use alloc::vec;
 
-use tine_protocol::params::{DspParams, ParamId};
+use tine_protocol::params::{DenoiseEngine, DspParams, ParamId};
 use tine_protocol::telemetry::flags;
 
-use crate::denoise::{Denoiser, RnnoiseDenoiser};
+#[cfg(feature = "deepfilter")]
+use crate::denoise::DeepFilterDenoiser;
+use crate::denoise::{BypassDenoiser, Denoiser, RnnoiseDenoiser};
 use crate::meter::{MeterSink, MeterStage, StageMeters, TapSink};
 use crate::primitives::db::db_to_lin;
 use crate::primitives::delay::DelayLine;
@@ -47,7 +49,30 @@ impl DspPipeline {
     /// All heap allocations happen here.
     #[must_use]
     pub fn new(sample_rate: f32, max_block: usize) -> Self {
-        Self::with_denoiser(sample_rate, max_block, Box::new(RnnoiseDenoiser::new()))
+        Self::for_engine(sample_rate, max_block, DenoiseEngine::Rnnoise)
+    }
+
+    /// Constructs and prepares a new [`DspPipeline`] using the selected [`DenoiseEngine`].
+    ///
+    /// Falls back to [`RnnoiseDenoiser`] if [`DenoiseEngine::DeepFilterNet3`] is requested
+    /// without the `deepfilter` crate feature enabled.
+    #[must_use]
+    pub fn for_engine(sample_rate: f32, max_block: usize, engine: DenoiseEngine) -> Self {
+        let denoiser: Box<dyn Denoiser> = match engine {
+            DenoiseEngine::Rnnoise => Box::new(RnnoiseDenoiser::new()),
+            DenoiseEngine::DeepFilterNet3 => {
+                #[cfg(feature = "deepfilter")]
+                {
+                    Box::new(DeepFilterDenoiser::new())
+                }
+                #[cfg(not(feature = "deepfilter"))]
+                {
+                    Box::new(RnnoiseDenoiser::new())
+                }
+            }
+            DenoiseEngine::Off => Box::new(BypassDenoiser),
+        };
+        Self::with_denoiser(sample_rate, max_block, denoiser)
     }
 
     /// Constructs and prepares a new [`DspPipeline`] with a custom [`Denoiser`]

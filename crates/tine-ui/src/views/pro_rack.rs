@@ -20,6 +20,7 @@ use tine_protocol::presets::PinSet;
 use crate::intent::Intent;
 use crate::state::{AppState, ProFieldEdit};
 use crate::theme::{TineTheme, radii, spacing, typography};
+use crate::views::kit::{self, Tone, glyph};
 
 /// One pipeline stage section of the rack.
 #[derive(Clone, Copy, Debug)]
@@ -352,15 +353,74 @@ pub fn commit_value(id: ParamId, input: &str) -> FieldCommit {
     }
 }
 
-/// Parses and applies the active numeric field: writes the value into
-/// `model.params`, pins it (D-007: a Pro edit pins the parameter), emits
-/// `SetParam`, and leaves an inline clamped/out-of-range message when needed.
+/// Plain-English beginner explanation for every parameter in `SPECS`, shown in
+/// both the Pro Controls coach banner and the main console's hint bar.
+#[must_use]
+pub const fn param_hint(id: ParamId) -> &'static str {
+    match id {
+        ParamId::Bypass => "Switches all Tine voice processing on or off (A/B compare with raw mic).",
+        ParamId::InputGainDb => "Input volume before processing. Aim for -18 dBFS speech on the meter.",
+        ParamId::HpfEnabled => "Turns on the low-cut filter to block desk thumps, AC hum, and rumble.",
+        ParamId::HpfFreqHz => "Cuts deep bass rumble below this frequency (80-110 Hz is ideal for voice).",
+        ParamId::DenoiseMix => "Blends AI noise removal. 100% removes max noise; 50-80% keeps natural tone.",
+        ParamId::GateEnabled => "Automatically quiets the mic during pauses so background noise vanishes.",
+        ParamId::GateThresholdDb => "Volume below which the gate closes. Set just above your quiet room floor.",
+        ParamId::GateRatio => "How strongly room noise gets turned down when you stop speaking.",
+        ParamId::GateHysteresisDb => "Closing margin that stops the gate from chattering mid-sentence.",
+        ParamId::GateAttackMs => "How fast the gate opens on speech. Keep fast (0.5-2 ms) to catch first words.",
+        ParamId::GateReleaseMs => "How smoothly the gate fades closed after a pause so word tails stay intact.",
+        ParamId::EqType(b) => match b.as_u8() {
+            0 => "Filter shape for Band 1 (Low-Shelf boosts or trims deep bass warmth).",
+            1 => "Filter shape for Band 2 (Peaking scoops out hollow room/desk mud).",
+            2 => "Filter shape for Band 3 (Peaking fixes nasal or boxy midrange).",
+            3 => "Filter shape for Band 4 (Peaking lifts crisp vocal clarity).",
+            _ => "Filter shape for Band 5 (High-Shelf adds airy studio brightness).",
+        },
+        ParamId::EqFreqHz(b) => match b.as_u8() {
+            0 => "Band 1 center frequency. Move Band 1 Gain off 0 dB to hear changes.",
+            1 => "Band 2 target frequency (250-400 Hz targets hollow/muddy voice tone).",
+            2 => "Band 3 target frequency (800-1200 Hz targets nasal/headset honk).",
+            3 => "Band 4 target frequency (3-5 kHz lifts vocal articulation and edge).",
+            _ => "Band 5 target frequency (7-12 kHz controls breathy studio sparkle).",
+        },
+        ParamId::EqGainDb(b) => match b.as_u8() {
+            0 => "Boost (+) for chest warmth or cut (-) to trim boomy proximity bass.",
+            1 => "Cut (-) to clear out muddy, boxy, or tubby low-mid frequencies.",
+            2 => "Cut (-) to tame nasal headset honk, or boost (+) for mid presence.",
+            3 => "Boost (+) so your voice cuts clearly through games, calls, and music.",
+            _ => "Boost (+) for bright studio air, or cut (-) to soften harsh treble.",
+        },
+        ParamId::EqQ(b) => match b.as_u8() {
+            0 => "Width/slope of Band 1. Lower Q is gentle; higher Q is tighter.",
+            1 => "Width of Band 2 mud cut. Higher Q targets a narrow boxy resonance.",
+            2 => "Width of Band 3 midrange curve. Higher Q targets a narrow nasal peak.",
+            3 => "Width of Band 4 clarity curve (~1.0 gives a smooth vocal lift).",
+            _ => "Slope of Band 5 air shelf (~0.7 gives a smooth natural tilt).",
+        },
+        ParamId::DeesserEnabled => "Tames sharp 'S', 'SH', and 'T' sounds without dulling your voice.",
+        ParamId::DeesserFreqHz => "Sibilance frequency to listen for (typically 6-8 kHz for sharp 'S').",
+        ParamId::DeesserThreshDb => "Brightness level where the de-esser catches harsh 'S' peaks.",
+        ParamId::DeesserAmountDb => "Max reduction on harsh 'S' sounds (3-8 dB sounds smooth and natural).",
+        ParamId::CompEnabled => "Evens out volume so whispers stay clear and loud laughs never clip.",
+        ParamId::CompThreshDb => "Loudness where leveling begins. Lowering this smooths out more speech.",
+        ParamId::CompRatio => "Compression firmness above Threshold (3:1 is natural; 5:1+ is radio-tight).",
+        ParamId::CompAttackMs => "How fast leveling grabs loud transients (3-10 ms keeps natural punch).",
+        ParamId::CompReleaseMs => "How smoothly volume recovers after loud words (100-200 ms feels natural).",
+        ParamId::CompKneeDb => "Softness of compression onset. Higher dB blends smoothly without pumping.",
+        ParamId::CompMakeupDb => "Manual volume boost after compression (editing turns Auto Makeup off).",
+        ParamId::CompAutoMakeup => "Automatically restores loudness lost during compression.",
+        ParamId::LimiterCeilingDb => "Hard safety ceiling so output never distorts or clips in Discord/OBS.",
+        ParamId::LimiterTruePeak => "Catches inter-sample peaks with 4x oversampling for strict broadcast safety.",
+    }
+}
+
+/// Parses and applies the active numeric field: routes through
+/// `set_param_optimistic` (pins per D-007 and auto-enables inactive stages) and
+/// leaves an inline clamped/out-of-range message when needed.
 fn commit_field(s: &mut AppState, id: ParamId, input: &str) {
     match commit_value(id, input) {
         FieldCommit::Applied { value, clamped } => {
-            s.model.params.set(id, value);
-            s.model.pins.pin(id);
-            s.emit(Intent::SetParam(id, value));
+            s.set_param_optimistic(id, value);
             s.ui.pro_field.close();
             if clamped {
                 s.ui.pro_field.message = Some(format!(
@@ -377,11 +437,9 @@ fn commit_field(s: &mut AppState, id: ParamId, input: &str) {
     }
 }
 
-/// Sets a parameter from the rack: optimistic local write + pin + `SetParam` intent.
+/// Sets a parameter from the rack: optimistic local write + auto-enable + pin + `SetParam`.
 fn set_param(s: &mut AppState, id: ParamId, v: f32) {
-    s.model.params.set(id, v);
-    s.model.pins.pin(id);
-    s.emit(Intent::SetParam(id, s.model.params.get(id)));
+    s.set_param_optimistic(id, v);
 }
 
 /// Renders the Pro Rack drawer.
@@ -395,47 +453,58 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>, t: TineTheme) -> El {
         "Pro Controls ▾"
     };
 
-    let toggle = pill_button("pro/toggle", "button", toggle_label, s.ui.pro_drawer_open, t, |s| {
-        let open = !s.ui.pro_drawer_open;
-        s.ui.pro_drawer_open = open;
-        s.ui.pro_field.close();
-        s.emit(Intent::SetProDrawerOpen(open));
-    });
+    let open = s.ui.pro_drawer_open;
+    let toggle = kit::button(
+        "pro/toggle",
+        "button",
+        toggle_label,
+        if open { Tone::Selected } else { Tone::Secondary },
+        Some(&glyph::SLIDERS),
+        t,
+        |s| {
+            let open = !s.ui.pro_drawer_open;
+            s.ui.pro_drawer_open = open;
+            s.ui.pro_field.close();
+            s.emit(Intent::SetProDrawerOpen(open));
+        },
+    );
 
-    let mut container = col()
-        .key("pro-drawer")
+    let tel = &s.live.telemetry;
+    let mut header = row()
+        .key("pro/header")
         .w_full()
-        .px(spacing::MD)
-        .py(spacing::MD)
         .gap(spacing::SM)
-        .radius(radii::LG)
-        .fill(t.surface)
-        .border(1.0, t.border)
-        .child(
-            row().key("pro/header").w_full().gap(spacing::MD).child(toggle).child(
-                text(format!(
-                    "Gate {:.1} dB  |  De-Ess {:.1} dB  |  Comp {:.1} dB",
-                    s.live.telemetry.gate_attenuation_db,
-                    s.live.telemetry.deesser_reduction_db,
-                    s.live.telemetry.comp_gain_reduction_db,
-                ))
-                .font(typography::CAPTION)
-                .color(t.text_dim),
-            ),
-        );
+        .center()
+        .child(toggle)
+        .child(el().key("pro/header-spacer").grow(1.0));
+    // Collapsed: compact live readouts. Open: the drawer's own meters show the same
+    // values as bars, so the chips would only repeat them.
+    if !open {
+        header = header
+            .child(gr_chip("pro/chip-gate", "Gate", tel.gate_attenuation_db, t))
+            .child(gr_chip("pro/chip-deess", "De-Ess", tel.deesser_reduction_db, t))
+            .child(gr_chip("pro/chip-comp", "Comp", tel.comp_gain_reduction_db, t));
+    }
+    let mut container = kit::card("pro-drawer", t)
+        .px(spacing::LG)
+        .py(if open { spacing::SM } else { spacing::MD })
+        .gap(if open { 6.0 } else { spacing::SM })
+        .child(header);
 
     if s.ui.pro_drawer_open {
         // Bounded drawer: takes the leftover window height (the canvas keeps its
-        // 200 pt minimum) so the rack scrolls inside it instead of off-window.
+        // 196 pt compact height) so the rack scrolls inside it instead of off-window.
         container = container
             .grow(1.0)
             .min_h(0.0)
             .child(drawer_header(s, t))
+            .child(coach_banner(s, t))
             .child(gr_row(s, t))
             .child(
                 rack_scroll(s, cx, t).transition(
                     Transition::move_edge(rune::Edge::Bottom)
                         .combined(Transition::opacity())
+                        .hold_layout()
                         .springs(SpringPair::new(Spring::SNAPPY, Spring::SMOOTH)),
                 ),
             );
@@ -444,11 +513,63 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>, t: TineTheme) -> El {
     container
 }
 
+/// Live beginner coach banner in Pro Controls: explains the hovered control or
+/// how Pro pins & stages work when idle.
+fn coach_banner(s: &AppState, t: TineTheme) -> El {
+    let (badge, hint) = match s.ui.hovered_param {
+        Some(id) => (id.spec().label, param_hint(id)),
+        None => (
+            "PRO TIP",
+            "Hover or drag any slider to tune it. Custom edits show 'pinned' — click 'pinned' or 'Unpin all' to relink.",
+        ),
+    };
+    row()
+        .key("pro/coach-banner")
+        .role("status")
+        .label(format!("{badge}: {hint}"))
+        .w_full()
+        .h(26.0)
+        .px(spacing::SM)
+        .gap(spacing::SM)
+        .center()
+        .radius(radii::SM)
+        .fill(t.surface_raised)
+        .border(1.0, t.border)
+        .child(
+            row()
+                .key("pro/coach-badge")
+                .h(18.0)
+                .px(6.0)
+                .center()
+                .radius(radii::SM)
+                .fill(if s.ui.hovered_param.is_some() {
+                    t.deck_blue_soft
+                } else {
+                    t.accent_soft
+                })
+                .child(
+                    text(badge)
+                        .font(typography::EYEBROW)
+                        .color(if s.ui.hovered_param.is_some() {
+                            t.deck_blue_text
+                        } else {
+                            t.accent_text
+                        }),
+                ),
+        )
+        .child(
+            row()
+                .key("pro/coach-text-wrap")
+                .grow(1.0)
+                .child(text(hint).key("pro/coach-text").font(typography::CAPTION).color(t.text)),
+        )
+}
+
 /// Rack header: title, pinned count and the global **Unpin all**.
 fn drawer_header(s: &AppState, t: TineTheme) -> El {
     let pin_count = pinned_params(&s.model.pins).len();
 
-    let mut unpin = pill_button("pro/unpin-all", "button", "Unpin All", true, t, |s| {
+    let mut unpin = pill_button("pro/unpin-all", "button", "Unpin all", true, t, |s| {
         s.model.pins.clear();
         s.ui.pro_field.close();
         s.emit(Intent::UnpinAll);
@@ -457,25 +578,35 @@ fn drawer_header(s: &AppState, t: TineTheme) -> El {
         unpin = unpin.disabled(true);
     }
 
+    let keep_warm = !s.model.park_when_unused;
+    let ptt_toggle = pill_button("pro/ptt-toggle", "switch", "Keep Warm (PTT)", keep_warm, t, |s| {
+        let next_park = !s.model.park_when_unused;
+        s.model.park_when_unused = next_park;
+        s.emit(Intent::SetParkWhenUnused(next_park));
+    })
+    .checked(keep_warm);
+
     row()
         .key("pro/rack-header")
         .w_full()
         .gap(spacing::MD)
+        .center()
         .child(
-            text("Surgical Pro Rack — Stages 1–6")
-                .font(typography::LABEL)
+            text("Surgical Pro Rack · stages 1–6")
+                .font(typography::HEADING)
                 .color(t.text),
         )
         .child(el().key("pro/rack-spacer").grow(1.0))
         .child(
             text(if pin_count == 0 {
-                String::from("No pinned parameters — macros drive everything")
+                String::from("No custom pins — 4 main knobs drive everything")
             } else {
-                format!("{pin_count} pinned (D-007)")
+                format!("{pin_count} pinned · click 'pinned' or move main knob to relink")
             })
             .font(typography::CAPTION)
             .color(t.text_dim),
         )
+        .child(ptt_toggle)
         .child(unpin)
 }
 
@@ -498,9 +629,9 @@ fn gr_row(s: &AppState, t: TineTheme) -> El {
                     .w(90.0)
                     .h(8.0)
                     .radius(radii::SM)
-                    .fill(t.surface_raised)
+                    .fill(t.well)
                     .border(1.0, t.border)
-                    .child(canvas(track_fill(90.0, 8.0, norm, t.meter_amber)).key(format!("{key}/fill"))),
+                    .child(canvas(track_fill(90.0, 8.0, norm, t.accent)).key(format!("{key}/fill"))),
             )
             .child(
                 text(format!("{:.1} dB", -db))
@@ -603,6 +734,23 @@ fn rack_scroll(s: &AppState, cx: &mut Cx<AppState>, t: TineTheme) -> El {
         .child(body)
 }
 
+/// A compact live gain-reduction readout chip for the drawer header.
+fn gr_chip(key: &'static str, name: &'static str, db: f32, t: TineTheme) -> El {
+    row()
+        .key(key)
+        .role("status")
+        .label(format!("{name} {db:.1} dB"))
+        .h(24.0)
+        .px(spacing::SM)
+        .gap(6.0)
+        .center()
+        .radius(radii::PILL)
+        .fill(t.well)
+        .border(1.0, t.border)
+        .child(text(name).font(typography::EYEBROW).color(t.text_dim))
+        .child(text(format!("{db:.1} dB")).font(typography::CAPTION).color(t.text))
+}
+
 /// Unpins every pinned parameter in `stage` and emits `Intent::Unpin(id)` for each.
 fn unpin_section(s: &mut AppState, stage: Stage) {
     for id in section_params(stage) {
@@ -618,7 +766,7 @@ fn stage_subtitle(number: u8) -> &'static str {
     match number {
         1 => "Mic gain & low-rumble cut",
         2 => "AI noise removal & silence gate",
-        3 => "Tone shaping (warmth, mud, clarity, air)",
+        3 => "Tone shaping — move Gain off 0 dB first, then adjust Freq & Width (Q)",
         4 => "Tames harsh 'S' and 'T' sounds",
         5 => "Evens out whispers & loud speech",
         6 => "Brickwall ceiling to prevent clipping",
@@ -626,8 +774,101 @@ fn stage_subtitle(number: u8) -> &'static str {
     }
 }
 
+fn band_role(band: Band) -> (&'static str, &'static str) {
+    match band.as_u8() {
+        0 => ("Band 1 · Low Warmth", "Chest warmth (+) or trim boomy bass (−)"),
+        1 => ("Band 2 · Mud & Boxiness", "Cuts hollow room or desk mud (−)"),
+        2 => (
+            "Band 3 · Nasal / Midrange",
+            "Fixes honky mids (−) or adds vocal body (+)",
+        ),
+        3 => ("Band 4 · Vocal Clarity", "Brings speech forward through game/music (+)"),
+        _ => ("Band 5 · Air & Sparkle", "Adds crisp studio brightness (+)"),
+    }
+}
+
+fn filter_type_short(ft: FilterType) -> &'static str {
+    FILTER_OPTIONS
+        .iter()
+        .find(|(t, _)| *t == ft)
+        .map_or("Peaking", |(_, n)| *n)
+}
+
+/// Beginner-friendly Band card for Stage 3: groups Gain, Freq, Filter Type, and Q together.
+fn eq_band_card(s: &AppState, cx: &mut Cx<AppState>, band: Band, t: TineTheme) -> El {
+    let idx = band.index();
+    let (title, role_desc) = band_role(band);
+    let ft = s.model.params.eq_type[idx];
+    let freq = s.model.params.eq_freq_hz[idx];
+    let gain = s.model.params.eq_gain_db[idx];
+    let is_gain_shape = matches!(ft, FilterType::LowShelf | FilterType::HighShelf | FilterType::Peaking);
+
+    let (status_text, status_color) = if is_gain_shape && gain.abs() < 0.05 {
+        (String::from("0.0 dB · Flat (move Gain to activate)"), t.text_dim)
+    } else if is_gain_shape {
+        (
+            format!("{gain:+.1} dB @ {}", value_text(ParamId::EqFreqHz(band), freq)),
+            t.accent_text,
+        )
+    } else {
+        (
+            format!(
+                "{} @ {}",
+                filter_type_short(ft),
+                value_text(ParamId::EqFreqHz(band), freq)
+            ),
+            t.accent_text,
+        )
+    };
+
+    let band_header = row()
+        .key(format!("pro/eq-band/{idx}/header"))
+        .w_full()
+        .gap(spacing::SM)
+        .center()
+        .child(text(title).font(typography::LABEL).color(t.text))
+        .child(text(role_desc).font(typography::CAPTION).color(t.text_dim))
+        .child(el().key(format!("pro/eq-band/{idx}/spacer")).grow(1.0))
+        .child(text(status_text).font(typography::CAPTION).color(status_color));
+
+    let left = col()
+        .key(format!("pro/eq-band/{idx}/col-l"))
+        .w_full()
+        .grow(1.0)
+        .gap(2.0)
+        .child(param_row(s, cx, ParamId::EqGainDb(band), t))
+        .child(param_row(s, cx, ParamId::EqFreqHz(band), t));
+
+    let right = col()
+        .key(format!("pro/eq-band/{idx}/col-r"))
+        .w_full()
+        .grow(1.0)
+        .gap(2.0)
+        .child(param_row(s, cx, ParamId::EqType(band), t))
+        .child(param_row(s, cx, ParamId::EqQ(band), t));
+
+    col()
+        .key(format!("pro/eq-band/{idx}"))
+        .w_full()
+        .gap(spacing::XS)
+        .px(spacing::SM)
+        .py(spacing::XS + 2.0)
+        .radius(radii::SM)
+        .fill(t.surface)
+        .border(1.0, t.border)
+        .child(band_header)
+        .child(
+            row()
+                .key(format!("pro/eq-band/{idx}/grid"))
+                .w_full()
+                .gap(spacing::MD)
+                .child(left)
+                .child(right),
+        )
+}
+
 /// One stage section: header (title, optional enable switch, optional section
-/// "Unpin all") and a two-column body of generated control rows.
+/// "Unpin all") and a grouped body of generated control rows.
 fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> El {
     let mut header = row()
         .key(format!("pro/sec/{}/header", stage.id()))
@@ -635,10 +876,19 @@ fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> E
         .gap(spacing::MD)
         .center()
         .child(
-            text(format!("{} · {}", stage.number, stage.title))
-                .font(typography::LABEL)
-                .color(t.text),
+            row()
+                .key("pro/sec-badge")
+                .size(20.0, 20.0)
+                .center()
+                .radius(radii::SM)
+                .fill(t.accent_soft)
+                .child(
+                    text(format!("{}", stage.number))
+                        .font(typography::CAPTION)
+                        .color(t.accent_text),
+                ),
         )
+        .child(text(stage.title).font(typography::LABEL).color(t.text))
         .child(
             text(stage_subtitle(stage.number))
                 .font(typography::CAPTION)
@@ -648,27 +898,43 @@ fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> E
     if let Some(enable) = stage.enable {
         let spec = enable.spec();
         let on = s.model.params.get(enable) >= 0.5;
-        header = header.child(el().key("pro/sec-spacer").grow(1.0)).child(
+        let mut spacer_area = row().key("pro/sec-spacer").grow(1.0);
+        if !on {
+            spacer_area = spacer_area.child(
+                text("Off (drag any slider below to auto-enable)")
+                    .font(typography::CAPTION)
+                    .color(t.text_dim),
+            );
+        }
+        header = header.child(spacer_area).child(
             row()
                 .key(control_key(enable))
                 .role("switch")
                 .checked(on)
                 .label(format!("{} {}", spec.label, if on { "on" } else { "off" }))
                 .focusable(true)
-                .h(22.0)
-                .w(58.0)
+                .h(24.0)
+                .w(64.0)
+                .gap(6.0)
                 .center()
                 .radius(radii::PILL)
-                .fill(if on { t.accent } else { t.surface_raised })
-                .border(1.0, t.border)
+                .cursor(rune::Cursor::Pointer)
+                .on_hover_change(move |s: &mut AppState, inside: bool, _tx: &mut Tx| {
+                    if inside {
+                        s.ui.hovered_param = Some(enable);
+                    } else if s.ui.hovered_param == Some(enable) {
+                        s.ui.hovered_param = None;
+                    }
+                })
                 .on_press(move |s: &mut AppState| {
                     let next = if s.model.params.get(enable) >= 0.5 { 0.0 } else { 1.0 };
                     set_param(s, enable, next);
                 })
+                .child(kit::switch_track(format!("switch-track/{}", spec.key), on, t))
                 .child(
-                    text(if on { "ON" } else { "OFF" })
+                    text(if on { "On" } else { "Off" })
                         .font(typography::CAPTION)
-                        .color(if on { t.text_on_accent } else { t.text_dim }),
+                        .color(if on { t.text } else { t.text_dim }),
                 ),
         );
     }
@@ -689,15 +955,32 @@ fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> E
         ));
     }
 
-    // Two-column body: rows split alternately so the rack stays compact.
-    let rows = section_rows(s, cx, stage, t);
-    let half = rows.len().div_ceil(2);
-    let (left, right) = rows.split_at(half);
-    let mk_col = |parts: &[El], side: &'static str| {
-        parts.iter().fold(
-            col().key(format!("pro/sec-col-{side}")).w_full().grow(1.0).gap(2.0),
-            |acc, item| acc.child(item.clone()),
-        )
+    let body = if stage.number == 3 {
+        let mut bands_col = col()
+            .key(format!("pro/sec/{}/body", stage.id()))
+            .w_full()
+            .gap(spacing::XS);
+        for band in EQ_BANDS {
+            bands_col = bands_col.child(eq_band_card(s, cx, band, t));
+        }
+        bands_col
+    } else {
+        // Two-column body: rows split cleanly so the rack stays compact.
+        let rows = section_rows(s, cx, stage, t);
+        let half = rows.len().div_ceil(2);
+        let (left, right) = rows.split_at(half);
+        let mk_col = |parts: &[El], side: &'static str| {
+            parts.iter().fold(
+                col().key(format!("pro/sec-col-{side}")).w_full().grow(1.0).gap(2.0),
+                |acc, item| acc.child(item.clone()),
+            )
+        };
+        row()
+            .key(format!("pro/sec/{}/body", stage.id()))
+            .w_full()
+            .gap(spacing::MD)
+            .child(mk_col(left, "l"))
+            .child(mk_col(right, "r"))
     };
 
     col()
@@ -707,17 +990,10 @@ fn section(s: &AppState, cx: &mut Cx<AppState>, stage: Stage, t: TineTheme) -> E
         .radius(radii::MD)
         .fill(t.surface_raised)
         .border(1.0, t.border)
-        .px(spacing::SM)
+        .px(spacing::MD)
         .py(spacing::SM)
         .child(header)
-        .child(
-            row()
-                .key(format!("pro/sec/{}/body", stage.id()))
-                .w_full()
-                .gap(spacing::MD)
-                .child(mk_col(left, "l"))
-                .child(mk_col(right, "r")),
-        )
+        .child(body)
 }
 
 /// One control row per body parameter of the section (the enable switch is drawn in
@@ -739,25 +1015,12 @@ fn pill_button(
     t: TineTheme,
     on_press: impl Fn(&mut AppState) + 'static,
 ) -> El {
-    let label_str = label.into();
-    // Identical styling to the T19 header/root pills (byte-stable collapsed drawer).
-    let bg = if active { t.accent } else { t.surface_raised };
-    let fg = if active { t.text_on_accent } else { t.text };
-
-    row()
-        .key(key)
-        .role(role)
-        .label(label_str.clone())
-        .focusable(true)
-        .h(30.0)
-        .px(spacing::MD)
-        .center()
-        .radius(radii::PILL)
-        .fill(bg)
-        .border(1.0, t.border)
-        .on_press(on_press)
-        .child(text(label_str).font(typography::LABEL).color(fg))
+    let tone = if active { Tone::Selected } else { Tone::Secondary };
+    kit::button(key, role, label, tone, None, t, on_press)
 }
+
+/// Width of a parameter row's label cell (fits "pinned" + the longest label).
+const LABEL_CELL_W: f32 = 172.0;
 
 /// One generated control row: pin indicator (when pinned) + label + control.
 fn param_row(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) -> El {
@@ -769,17 +1032,33 @@ fn param_row(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) -> 
         .w_full()
         .gap(spacing::SM)
         .center()
-        .h(30.0);
+        .h(30.0)
+        .on_hover_change(move |s: &mut AppState, inside: bool, _tx: &mut Tx| {
+            if inside {
+                s.ui.hovered_param = Some(id);
+            } else if s.ui.hovered_param == Some(id) {
+                s.ui.hovered_param = None;
+            }
+        });
 
+    // Fixed-width label cell (pin pill + name) so every slider in a column starts
+    // at the same x.
+    let mut cell = row()
+        .key(format!("pro/param-label/{}", spec.key))
+        .w(LABEL_CELL_W)
+        .gap(spacing::XS)
+        .center();
     if pinned {
-        head = head.child(unpin_pill(id, t));
+        cell = cell.child(unpin_pill(id, t));
     }
-
-    head = head.child(
-        text(spec.label)
-            .font(typography::CAPTION)
-            .color(if pinned { t.accent } else { t.text_dim }),
-    );
+    cell = cell
+        .child(
+            text(spec.label)
+                .font(typography::CAPTION)
+                .color(if pinned { t.accent_text } else { t.text_dim }),
+        )
+        .child(el().key("pro/param-label-pad").grow(1.0));
+    head = head.child(cell);
 
     let control = control_body(s, cx, id, t);
     head.child(control)
@@ -831,6 +1110,11 @@ fn control_body(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) 
                             .color(t.text_dim),
                     );
             } else {
+                let readout = if id == ParamId::CompMakeupDb && s.model.params.comp_auto_makeup {
+                    String::from("Auto")
+                } else {
+                    value_text(id, s.model.params.get(id))
+                };
                 body = body.child(
                     row()
                         .key(format!("field/{}", spec.key))
@@ -844,8 +1128,9 @@ fn control_body(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) 
                         .w(104.0)
                         .center()
                         .radius(radii::SM)
-                        .fill(t.surface_raised)
+                        .fill(t.well)
                         .border(1.0, t.border)
+                        .hover(t.surface_hover)
                         .focusable(false)
                         .cursor(rune::Cursor::Pointer)
                         .on_press(move |s: &mut AppState| {
@@ -853,11 +1138,7 @@ fn control_body(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) 
                                 s.ui.pro_field = ProFieldEdit::open(id, &s.model);
                             }
                         })
-                        .child(
-                            text(value_text(id, s.model.params.get(id)))
-                                .font(typography::CAPTION)
-                                .color(t.text_dim),
-                        ),
+                        .child(text(readout).font(typography::CAPTION).color(t.text)),
                 );
             }
 
@@ -896,8 +1177,8 @@ fn unpin_pill(id: ParamId, t: TineTheme) -> El {
         .px(spacing::SM)
         .center()
         .radius(radii::PILL)
-        .fill(t.accent_glow)
-        .border(1.0, t.accent)
+        .fill(t.accent_soft)
+        .border(1.0, t.accent_glow)
         .on_press(move |s: &mut AppState| {
             s.model.pins.unpin(id);
             if s.ui.pro_field.param == Some(id) {
@@ -905,7 +1186,7 @@ fn unpin_pill(id: ParamId, t: TineTheme) -> El {
             }
             s.emit(Intent::Unpin(id));
         })
-        .child(text("pinned").font(typography::CAPTION).color(t.accent))
+        .child(text("pinned").font(typography::CAPTION).color(t.accent_text))
 }
 
 /// Boolean parameter row: pill switch labelled by the spec.
@@ -919,20 +1200,21 @@ fn switch_row(s: &AppState, id: ParamId, t: TineTheme) -> El {
         .checked(on)
         .label(format!("{} {}", spec.label, if on { "on" } else { "off" }))
         .focusable(true)
-        .h(22.0)
+        .h(24.0)
         .w(64.0)
+        .gap(6.0)
         .center()
         .radius(radii::PILL)
-        .fill(if on { t.accent } else { t.surface_raised })
-        .border(1.0, t.border)
+        .cursor(rune::Cursor::Pointer)
         .on_press(move |s: &mut AppState| {
             let next = if s.model.params.get(id) >= 0.5 { 0.0 } else { 1.0 };
             set_param(s, id, next);
         })
+        .child(kit::switch_track(format!("switch-track/{}", spec.key), on, t))
         .child(
-            text(if on { "ON" } else { "OFF" })
+            text(if on { "On" } else { "Off" })
                 .font(typography::CAPTION)
-                .color(if on { t.text_on_accent } else { t.text_dim }),
+                .color(if on { t.text } else { t.text_dim }),
         )
 }
 
@@ -957,8 +1239,9 @@ fn select_row(s: &AppState, id: ParamId, t: TineTheme) -> El {
         .px(spacing::SM)
         .center()
         .radius(radii::SM)
-        .fill(t.surface_raised)
+        .fill(t.well)
         .border(1.0, t.border)
+        .hover(t.surface_hover)
         .on_press_tx(move |s: &mut AppState, tx: &mut rune::Tx| {
             if !popup_menu_supported() {
                 // Without native menus cycle Low-Shelf → Peaking → High-Shelf.
@@ -991,14 +1274,14 @@ fn select_row(s: &AppState, id: ParamId, t: TineTheme) -> El {
 }
 
 /// Log/linear slider: a focusable `role="slider"` with native arrow stepping
-/// (`on_step`), Home/End limits, double-click reset, and pointer jump/scrub
-/// through `on_drag` mapped onto the spec's taper.
+/// (`on_step`), Home/End limits, double-click reset/unpin, and pointer jump/scrub
+/// through `on_drag` mapped onto the spec's taper using element-local coordinates.
 fn slider_el(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) -> El {
     let spec = id.spec();
     let value = s.model.params.get(id);
     let pos = to_pos(value, spec);
 
-    // Settled track rect from the previous layout pass, for pointer mapping.
+    // Settled track rect from the previous layout pass, as fallback only.
     let track = cx.layout(&control_key(id));
 
     let mut sl = row()
@@ -1008,10 +1291,8 @@ fn slider_el(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) -> 
         .range_value(f64::from(value), f64::from(spec.min), f64::from(spec.max))
         .range_step(f64::from(spec.step))
         .grow(1.0)
-        .h(18.0)
-        .radius(radii::SM)
-        .fill(t.surface_raised)
-        .border(1.0, t.border)
+        .h(22.0)
+        .center()
         .cursor(rune::Cursor::Pointer)
         .on_step(move |s: &mut AppState, delta: i32, _tx: &mut Tx| {
             let spec = id.spec();
@@ -1023,26 +1304,31 @@ fn slider_el(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) -> 
             set_param(s, id, if to_max { spec.max } else { spec.min });
         })
         .on_double_press(move |s: &mut AppState| {
-            set_param(s, id, id.spec().default);
+            s.reset_param_or_unpin(id);
         })
         .on_drag(move |s: &mut AppState, d: &mut Drag, _tx: &mut Tx| {
             let spec = id.spec();
+            let pos_from_drag = |d: &Drag| -> Option<f32> {
+                if d.w > 1.0 {
+                    Some((d.x / d.w).clamp(0.0, 1.0))
+                } else {
+                    track.map(|[x, _y, w, _h]| ((d.window_point()[0] - x) / w.max(1.0)).clamp(0.0, 1.0))
+                }
+            };
             match d.phase {
                 Phase::Down => {
                     d.data = s.model.params.get(id);
-                    if let Some([x, _y, w, _h]) = track {
-                        let p = ((d.window_point()[0] - x) / w.max(1.0)).clamp(0.0, 1.0);
+                    s.ui.hovered_param = Some(id);
+                    if let Some(p) = pos_from_drag(d) {
                         set_param(s, id, from_pos(p, spec));
                     }
                 }
                 Phase::Move => {
-                    let p = track.map(|[x, _y, w, _h]| ((d.window_point()[0] - x) / w.max(1.0)).clamp(0.0, 1.0));
-                    if let Some(p) = p {
+                    if let Some(p) = pos_from_drag(d) {
                         set_param(s, id, from_pos(p, spec));
                     } else {
-                        // No settled layout yet: relative drag fallback.
-                        let scale = (spec.max - spec.min) / 240.0;
-                        set_param(s, id, d.data + d.dx * scale);
+                        let p = (to_pos(d.data, spec) + d.dx / 200.0).clamp(0.0, 1.0);
+                        set_param(s, id, from_pos(p, spec));
                     }
                 }
                 Phase::Up => {
@@ -1056,12 +1342,26 @@ fn slider_el(s: &AppState, cx: &mut Cx<AppState>, id: ParamId, t: TineTheme) -> 
     sl = sl.child(
         el().key(format!("slider/{}/fill", spec.key))
             .grow(pos.max(0.001))
-            .h(18.0)
-            .fill(t.accent),
+            .h(6.0)
+            .radius(3.0)
+            .fill(t.accent)
+            .linear_gradient(std::f32::consts::FRAC_PI_2, [(0.0, t.accent_hi), (1.0, t.accent)]),
+    );
+    sl = sl.child(
+        el().key(format!("slider/{}/knob", spec.key))
+            .size(14.0, 14.0)
+            .radius(7.0)
+            .fill(t.knob_outer)
+            .border(2.0, t.deck_blue)
+            .shadow(1.0, 4.0, kit::oklcha_black(0.28)),
     );
     sl = sl.child(
         el().key(format!("slider/{}/rest", spec.key))
-            .grow((1.0 - pos).max(0.001)),
+            .grow((1.0 - pos).max(0.001))
+            .h(6.0)
+            .radius(3.0)
+            .fill(t.well)
+            .border(1.0, t.border),
     );
 
     sl

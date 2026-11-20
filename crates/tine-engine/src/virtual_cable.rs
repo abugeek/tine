@@ -23,6 +23,59 @@ use crate::monitor::MonitorFeed;
 /// Inter-stream ring capacity between capture+DSP and playback (32,768 samples ≈ 682 ms @ 48 kHz).
 const AUDIO_RING_CAP: usize = 32_768;
 
+/// Pre-DSP raw capture ring capacity for the 5-second Mic Check feature (≈ 682 ms @ 48 kHz).
+pub const RAW_CAPTURE_RING_CAP: usize = 32_768;
+
+/// Lock-free pre-DSP raw audio feed shared with [`crate::mic_check::MicCheckRunner`].
+#[derive(Clone)]
+pub struct RawCaptureFeed {
+    pub(crate) ring: Arc<SpscRing<RAW_CAPTURE_RING_CAP>>,
+    pub(crate) enabled: Arc<std::sync::atomic::AtomicBool>,
+    rate_hz: u32,
+}
+
+impl RawCaptureFeed {
+    /// Creates a new disconnected [`RawCaptureFeed`] (for offline tests).
+    #[must_use]
+    pub fn new(rate_hz: u32) -> Self {
+        Self {
+            ring: Arc::new(SpscRing::new()),
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rate_hz,
+        }
+    }
+
+    pub(crate) fn with_parts(
+        rate_hz: u32,
+        ring: Arc<SpscRing<RAW_CAPTURE_RING_CAP>>,
+        enabled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self { ring, enabled, rate_hz }
+    }
+
+    /// Negotiated capture sample rate in Hz.
+    #[must_use]
+    pub const fn rate_hz(&self) -> u32 {
+        self.rate_hz
+    }
+
+    /// Enables or disables writing pre-DSP samples from the RT callback.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Drains any queued samples left over in the ring.
+    pub fn drain(&self) {
+        let mut scratch = [0.0_f32; 1024];
+        while self.ring.pop_slice(&mut scratch) > 0 {}
+    }
+
+    /// Pops up to `buf.len()` pre-DSP mono samples.
+    pub fn pop_slice(&self, buf: &mut [f32]) -> usize {
+        self.ring.pop_slice(buf)
+    }
+}
+
 /// Default maximum block size preallocated for [`tine_dsp::DspPipeline`].
 const DEFAULT_DSP_MAX_BLOCK: usize = 8192;
 
@@ -46,10 +99,11 @@ pub mod rt {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use tine_dsp::{DspPipeline, MeterSink, TapSink};
-    use tine_protocol::params::DspParams;
+    use tine_protocol::params::{DenoiseEngine, DspParams};
     use tine_protocol::sync::{ParamBlock, SpscRing, Triple};
     use tine_protocol::telemetry::AudioTelemetryFrame;
 
+    use super::{RAW_CAPTURE_RING_CAP, RawCaptureFeed};
     use crate::monitor::{MONITOR_RING_CAP, MonitorFeed};
 
     /// `MeterSink` publishing ~60 Hz telemetry frames into a lock-free [`Triple`].
@@ -87,6 +141,11 @@ pub mod rt {
         monitor_ring: Arc<SpscRing<MONITOR_RING_CAP>>,
         monitor_on: Arc<AtomicBool>,
         block_frames: Arc<AtomicU32>,
+        raw_ring: Arc<SpscRing<RAW_CAPTURE_RING_CAP>>,
+        raw_on: Arc<AtomicBool>,
+        muted: Arc<AtomicBool>,
+        mute_gain: f32,
+        mute_step: f32,
     }
 
     impl<const TAP_N: usize> VirtualCableProcessor<TAP_N> {
@@ -113,12 +172,63 @@ pub mod rt {
             tap: Arc<SpscRing<TAP_N>>,
             monitor_feed: &MonitorFeed,
         ) -> Self {
+            Self::with_monitor_and_engine(
+                sample_rate,
+                max_block,
+                params,
+                telemetry,
+                tap,
+                monitor_feed,
+                DenoiseEngine::Rnnoise,
+            )
+        }
+
+        /// Allocates and prepares the [`DspPipeline`] for the selected [`DenoiseEngine`]
+        /// once outside the real-time thread, wiring the post-DSP monitor tap to `monitor_feed`.
+        #[must_use]
+        pub fn with_monitor_and_engine(
+            sample_rate: f32,
+            max_block: usize,
+            params: Arc<ParamBlock>,
+            telemetry: Arc<Triple<AudioTelemetryFrame>>,
+            tap: Arc<SpscRing<TAP_N>>,
+            monitor_feed: &MonitorFeed,
+            engine: DenoiseEngine,
+        ) -> Self {
+            Self::with_monitor_engine_and_mute(
+                sample_rate,
+                max_block,
+                params,
+                telemetry,
+                tap,
+                monitor_feed,
+                engine,
+                Arc::new(AtomicBool::new(false)),
+            )
+        }
+
+        /// Allocates and prepares the [`DspPipeline`] for `engine` outside the RT thread,
+        /// sharing `muted` for click-free 5 ms output muting.
+        #[must_use]
+        #[allow(clippy::too_many_arguments)]
+        pub fn with_monitor_engine_and_mute(
+            sample_rate: f32,
+            max_block: usize,
+            params: Arc<ParamBlock>,
+            telemetry: Arc<Triple<AudioTelemetryFrame>>,
+            tap: Arc<SpscRing<TAP_N>>,
+            monitor_feed: &MonitorFeed,
+            engine: DenoiseEngine,
+            muted: Arc<AtomicBool>,
+        ) -> Self {
             let mut cached_params = DspParams::DEFAULT;
             let mut last_gen = 0u64;
             params.load_if_changed(&mut last_gen, &mut cached_params);
+            let is_muted = muted.load(Ordering::Acquire);
+            let ramp_samples = (0.005_f64 * f64::from(sample_rate.max(8_000.0))).max(1.0);
 
             Self {
-                pipeline: DspPipeline::new(sample_rate, max_block),
+                pipeline: DspPipeline::for_engine(sample_rate, max_block, engine),
                 params,
                 cached_params,
                 last_gen,
@@ -127,6 +237,11 @@ pub mod rt {
                 monitor_ring: Arc::clone(&monitor_feed.ring),
                 monitor_on: Arc::clone(&monitor_feed.enabled),
                 block_frames: Arc::clone(&monitor_feed.block_frames),
+                raw_ring: Arc::new(SpscRing::new()),
+                raw_on: Arc::new(AtomicBool::new(false)),
+                muted,
+                mute_gain: if is_muted { 0.0 } else { 1.0 },
+                mute_step: (1.0 / ramp_samples) as f32,
             }
         }
 
@@ -148,12 +263,48 @@ pub mod rt {
             )
         }
 
+        /// Builds a [`RawCaptureFeed`] sharing this processor's pre-DSP capture tap.
+        #[must_use]
+        pub fn raw_capture_feed(&self, rate_hz: u32) -> RawCaptureFeed {
+            RawCaptureFeed::with_parts(rate_hz, Arc::clone(&self.raw_ring), Arc::clone(&self.raw_on))
+        }
+
+        /// Returns a clone of the shared mute flag controlling this processor's 5 ms output ramp.
+        #[must_use]
+        pub fn mute_handle(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.muted)
+        }
+
         /// Processes one mono `f32` capture block in-place (zero allocations, zero locks).
         #[inline]
         pub fn process_block(&mut self, block: &mut [f32]) {
+            if self.raw_on.load(Ordering::Relaxed) {
+                let _ = self.raw_ring.push_slice(block);
+            }
             self.params.load_if_changed(&mut self.last_gen, &mut self.cached_params);
             self.pipeline
                 .process(block, &self.cached_params, &mut self.meters, &mut self.tap);
+
+            // Apply 5 ms click-free output mute after DSP/meters so UI input meter
+            // keeps reflecting speech while muted ("You are muted" feedback).
+            let muted = self.muted.load(Ordering::Relaxed);
+            if muted || (self.mute_gain - 1.0).abs() > 1e-6 {
+                let target = if muted { 0.0_f32 } else { 1.0_f32 };
+                let step = self.mute_step;
+                let mut gain = self.mute_gain;
+                for s in block.iter_mut() {
+                    if (gain - target).abs() <= step {
+                        gain = target;
+                    } else if gain < target {
+                        gain += step;
+                    } else {
+                        gain -= step;
+                    }
+                    *s *= gain;
+                }
+                self.mute_gain = gain;
+            }
+
             if self.monitor_on.load(Ordering::Relaxed) {
                 let _ = self.monitor_ring.push_slice(block);
                 let frames = u32::try_from(block.len()).unwrap_or(u32::MAX);
@@ -211,18 +362,62 @@ pub struct VirtualCableRouter {
     capture: CaptureStream,
     playback: PlaybackStream,
     monitor_feed: MonitorFeed,
+    raw_feed: RawCaptureFeed,
+    muted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl VirtualCableRouter {
     /// Starts continuous capture from `input_id`, processes mono `f32` through
-    /// [`tine_dsp::DspPipeline`], publishes telemetry to `telemetry` and post-DSP
-    /// samples to `tap`, and plays the result to `output_id`.
+    /// [`tine_dsp::DspPipeline`] with default `RNNoise`, publishes telemetry to
+    /// `telemetry` and post-DSP samples to `tap`, and plays the result to `output_id`.
     pub fn start<const TAP_N: usize>(
         input_id: &DeviceRef,
         output_id: &DeviceRef,
         params: Arc<ParamBlock>,
         telemetry: Arc<Triple<AudioTelemetryFrame>>,
         tap: Arc<SpscRing<TAP_N>>,
+    ) -> Result<Self, AudioIoError> {
+        Self::start_with_engine(
+            input_id,
+            output_id,
+            params,
+            telemetry,
+            tap,
+            tine_protocol::params::DenoiseEngine::Rnnoise,
+        )
+    }
+
+    /// Starts continuous capture from `input_id`, processes mono `f32` through
+    /// [`tine_dsp::DspPipeline`] configured with `engine`, publishes telemetry to
+    /// `telemetry` and post-DSP samples to `tap`, and plays the result to `output_id`.
+    pub fn start_with_engine<const TAP_N: usize>(
+        input_id: &DeviceRef,
+        output_id: &DeviceRef,
+        params: Arc<ParamBlock>,
+        telemetry: Arc<Triple<AudioTelemetryFrame>>,
+        tap: Arc<SpscRing<TAP_N>>,
+        engine: tine_protocol::params::DenoiseEngine,
+    ) -> Result<Self, AudioIoError> {
+        Self::start_with_engine_and_mute(
+            input_id,
+            output_id,
+            params,
+            telemetry,
+            tap,
+            engine,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    /// Same as [`Self::start_with_engine`], binding a shared RT `muted` flag.
+    pub fn start_with_engine_and_mute<const TAP_N: usize>(
+        input_id: &DeviceRef,
+        output_id: &DeviceRef,
+        params: Arc<ParamBlock>,
+        telemetry: Arc<Triple<AudioTelemetryFrame>>,
+        tap: Arc<SpscRing<TAP_N>>,
+        engine: tine_protocol::params::DenoiseEngine,
+        muted: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, AudioIoError> {
         let target_rate = resolve_input_rate(input_id).unwrap_or(FALLBACK_SAMPLE_RATE);
         let slot = Arc::new(rt::ProcessorSlot::<TAP_N>::new());
@@ -246,14 +441,19 @@ impl VirtualCableRouter {
         // Construct `DspPipeline` with the actual hardware capture rate negotiated by
         // `open_capture`, then publish it lock-free to the capture callback.
         let actual_in_rate = capture.sample_rate();
-        let processor = Box::new(VirtualCableProcessor::new(
+        let monitor_stub = MonitorFeed::new(0, 0);
+        let processor = Box::new(VirtualCableProcessor::with_monitor_engine_and_mute(
             actual_in_rate as f32,
             DEFAULT_DSP_MAX_BLOCK,
             params,
             telemetry,
             tap,
+            &monitor_stub,
+            engine,
+            Arc::clone(&muted),
         ));
         let monitor_feed = processor.monitor_feed(actual_in_rate);
+        let raw_feed = processor.raw_capture_feed(actual_in_rate);
         slot.publish(processor);
 
         let playback = open_playback(output_id, audio_ring, actual_in_rate)?;
@@ -262,13 +462,32 @@ impl VirtualCableRouter {
             capture,
             playback,
             monitor_feed,
+            raw_feed,
+            muted,
         })
+    }
+
+    /// Sets the lock-free 5 ms ramped RT output mute flag.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns whether the RT output mute is currently enabled.
+    #[must_use]
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns a [`MonitorFeed`] handle wired to this router's post-DSP output.
     #[must_use]
     pub fn monitor_feed(&self) -> MonitorFeed {
         self.monitor_feed.clone()
+    }
+
+    /// Returns a [`RawCaptureFeed`] handle wired to this router's pre-DSP capture input.
+    #[must_use]
+    pub fn raw_capture_feed(&self) -> RawCaptureFeed {
+        self.raw_feed.clone()
     }
 
     /// Stops both capture and playback streams and releases audio resources.
@@ -328,7 +547,9 @@ fn resolve_input_rate(input_id: &DeviceRef) -> Option<u32> {
     let inputs = list_inputs().ok()?;
     let matched = match input_id {
         DeviceRef::Default => inputs.iter().find(|d| d.is_default),
-        DeviceRef::Id(target) => inputs.iter().find(|d| d.id == *target),
+        DeviceRef::Id(target) => inputs
+            .iter()
+            .find(|d| d.id == *target || d.id.ends_with(target.as_str())),
         DeviceRef::Name(query) => {
             let q = query.to_ascii_lowercase();
             inputs

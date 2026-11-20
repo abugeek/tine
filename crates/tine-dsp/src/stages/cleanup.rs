@@ -8,7 +8,7 @@ use tine_protocol::params::{DspParams, ParamId};
 use super::Stage;
 use crate::denoise::{Denoiser, RnnoiseDenoiser};
 use crate::meter::StageMeters;
-use crate::primitives::db::{db_to_lin, lin_to_db};
+use crate::primitives::db::{fast_db_to_lin, fast_lin_to_db};
 use crate::primitives::delay::DelayLine;
 use crate::primitives::envelope::PeakEnvelope;
 use crate::primitives::fifo::FrameFifo;
@@ -22,7 +22,7 @@ const EXPANDER_KNEE_DB: f32 = 6.0;
 /// Minimum expander gain floor in dB.
 const EXPANDER_FLOOR_DB: f32 = -80.0;
 
-/// Smoother time constant (ms) for denoiser wet/dry mix.
+/// Smoother time constant (ms) for denoiser wet/dry mix and VAD threshold boost.
 const SMOOTH_MS: f32 = 10.0;
 
 /// Fast peak detector attack time (ms) so plosives/consonants pass unclipped.
@@ -33,6 +33,25 @@ const DETECTOR_RELEASE_MS: f32 = 15.0;
 
 /// Hold time (ms) before the expander begins closing on breathy word tails.
 const GATE_HOLD_MS: f32 = 60.0;
+
+/// VAD probability below which non-speech gate threshold boost ramps up.
+const VAD_SPEECH_LOW: f32 = 0.35;
+
+/// Maximum gate threshold boost (dB) applied when VAD indicates non-speech.
+const MAX_VAD_BOOST_DB: f32 = 10.0;
+
+/// Fast asymmetric smoothing on speech onset (per 10 ms frame).
+const VAD_ATTACK_ALPHA: f32 = 0.85;
+
+/// Gentle asymmetric smoothing on speech release (per 10 ms frame).
+const VAD_RELEASE_ALPHA: f32 = 0.15;
+
+#[inline]
+fn smooth_vad(prev: f32, raw: f32) -> f32 {
+    let v = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 1.0 };
+    let alpha = if v > prev { VAD_ATTACK_ALPHA } else { VAD_RELEASE_ALPHA };
+    (prev + alpha * (v - prev)).clamp(0.0, 1.0)
+}
 
 #[inline]
 fn clamp_param(id: ParamId, v: f32) -> f32 {
@@ -59,6 +78,8 @@ fn coeff_from_ms(ms: f32, fs: f32) -> f32 {
 pub(crate) struct CleanupStage {
     fs: f32,
     denoise: Box<dyn Denoiser>,
+    passthrough: bool,
+    denoise_idle: bool,
     in_fifo: FrameFifo,
     out_fifo: FrameFifo,
     resampler: Option<NativeRateResampler>,
@@ -68,6 +89,8 @@ pub(crate) struct CleanupStage {
     wet_buf: Box<[f32]>,
     mix_smoother: Smoother,
     latency_samples: u32,
+    vad_prob: f32,
+    vad_boost_smoother: Smoother,
 
     // Stage 2b: downward expander
     detector: PeakEnvelope,
@@ -93,14 +116,21 @@ impl CleanupStage {
     }
 
     pub fn with_denoiser(denoise: Box<dyn Denoiser>) -> Self {
+        let passthrough = denoise.is_passthrough();
         let frame_len = denoise.frame_len().max(1);
         let native_rate = denoise.native_rate().max(1) as f32;
         let algo_latency = denoise.algo_latency();
-        let initial_latency = (frame_len as u32).saturating_add(algo_latency);
+        let initial_latency = if passthrough {
+            0
+        } else {
+            (frame_len as u32).saturating_add(algo_latency)
+        };
 
         let mut s = Self {
             fs: native_rate,
             denoise,
+            passthrough,
+            denoise_idle: false,
             in_fifo: FrameFifo::new(frame_len, 512),
             out_fifo: FrameFifo::new(frame_len, frame_len + 512),
             resampler: None,
@@ -110,6 +140,8 @@ impl CleanupStage {
             wet_buf: vec![0.0; 512].into_boxed_slice(),
             mix_smoother: Smoother::new(SMOOTH_MS, 48_000.0, DspParams::DEFAULT.denoise_mix),
             latency_samples: initial_latency,
+            vad_prob: 1.0,
+            vad_boost_smoother: Smoother::new(SMOOTH_MS, 48_000.0, 0.0),
             detector: PeakEnvelope::new(DETECTOR_ATTACK_MS, DETECTOR_RELEASE_MS, 48_000.0),
             gate_open: false,
             gain_env: 0.0,
@@ -134,8 +166,9 @@ impl Stage for CleanupStage {
         };
         let max_block = max_block.max(1);
         self.fs = fs_safe;
+        self.passthrough = self.denoise.is_passthrough();
+        self.denoise_idle = false;
 
-        self.denoise.warm_up();
         let frame_len = self.denoise.frame_len().max(1);
         let native_rate = self.denoise.native_rate().max(1);
         let algo_latency = self.denoise.algo_latency();
@@ -145,28 +178,39 @@ impl Stage for CleanupStage {
         self.wet_buf = vec![0.0; max_block].into_boxed_slice();
         self.mix_smoother = Smoother::new(SMOOTH_MS, fs_safe, DspParams::DEFAULT.denoise_mix);
 
-        let is_native_rate = (fs_safe - native_rate as f32).abs() < 1.0;
-        if is_native_rate {
+        if self.passthrough {
             self.resampler = None;
-            self.in_fifo = FrameFifo::new(frame_len, max_block);
-            self.out_fifo = FrameFifo::new(frame_len, frame_len + max_block);
-            self.out_fifo.push_zeros(frame_len);
-            self.latency_samples = (frame_len as u32).saturating_add(algo_latency);
-        } else if let Some(resampler) = NativeRateResampler::new(fs_safe, native_rate, frame_len, max_block) {
-            let scaled_algo = ((f64::from(algo_latency) * f64::from(fs_safe)) / f64::from(native_rate) + 0.5) as u32;
-            self.latency_samples = resampler.latency().saturating_add(scaled_algo);
-            self.resampler = Some(resampler);
+            self.in_fifo.reset();
+            self.out_fifo.reset();
+            self.latency_samples = 0;
         } else {
-            self.resampler = None;
-            self.in_fifo = FrameFifo::new(frame_len, max_block);
-            self.out_fifo = FrameFifo::new(frame_len, frame_len + max_block);
-            self.out_fifo.push_zeros(frame_len);
-            self.latency_samples = (frame_len as u32).saturating_add(algo_latency);
+            self.denoise.warm_up();
+            let is_native_rate = (fs_safe - native_rate as f32).abs() < 1.0;
+            if is_native_rate {
+                self.resampler = None;
+                self.in_fifo = FrameFifo::new(frame_len, max_block);
+                self.out_fifo = FrameFifo::new(frame_len, frame_len + max_block);
+                self.out_fifo.push_zeros(frame_len);
+                self.latency_samples = (frame_len as u32).saturating_add(algo_latency);
+            } else if let Some(resampler) = NativeRateResampler::new(fs_safe, native_rate, frame_len, max_block) {
+                let scaled_algo =
+                    ((f64::from(algo_latency) * f64::from(fs_safe)) / f64::from(native_rate) + 0.5) as u32;
+                self.latency_samples = resampler.latency().saturating_add(scaled_algo);
+                self.resampler = Some(resampler);
+            } else {
+                self.resampler = None;
+                self.in_fifo = FrameFifo::new(frame_len, max_block);
+                self.out_fifo = FrameFifo::new(frame_len, frame_len + max_block);
+                self.out_fifo.push_zeros(frame_len);
+                self.latency_samples = (frame_len as u32).saturating_add(algo_latency);
+            }
         }
 
         self.dry_delay = DelayLine::new(self.latency_samples as usize);
         self.frame_in.fill(0.0);
         self.frame_out.fill(0.0);
+        self.vad_prob = 1.0;
+        self.vad_boost_smoother = Smoother::new(SMOOTH_MS, fs_safe, 0.0);
 
         self.last_attack_ms = DspParams::DEFAULT.gate_attack_ms;
         self.last_release_ms = DspParams::DEFAULT.gate_release_ms;
@@ -180,10 +224,11 @@ impl Stage for CleanupStage {
     }
 
     fn reset(&mut self) {
+        self.denoise_idle = false;
         self.denoise.reset();
         self.in_fifo.reset();
         self.out_fifo.reset();
-        if self.resampler.is_none() {
+        if !self.passthrough && self.resampler.is_none() {
             self.out_fifo.push_zeros(self.denoise.frame_len().max(1));
         }
         if let Some(resampler) = self.resampler.as_mut() {
@@ -193,6 +238,8 @@ impl Stage for CleanupStage {
         self.frame_out.fill(0.0);
         self.dry_delay.reset();
         self.mix_smoother.snap();
+        self.vad_prob = 1.0;
+        self.vad_boost_smoother.snap_to(0.0);
         self.detector.reset();
         self.gate_open = false;
         self.gain_env = 0.0;
@@ -209,37 +256,67 @@ impl Stage for CleanupStage {
             return;
         };
 
-        // Stage 2a: Always run denoiser so latency and CPU stay constant across mix changes.
-        if let Some(resampler) = self.resampler.as_mut() {
-            let denoise = &mut self.denoise;
-            resampler.process_frames(buf, wet_slice, |in_frame, out_frame| {
-                let _vad = denoise.process_frame(in_frame, out_frame);
-            });
-        } else {
-            self.in_fifo.push_slice(buf);
-            while self.in_fifo.pop_frame(&mut self.frame_in) {
-                let _vad = self.denoise.process_frame(&self.frame_in, &mut self.frame_out);
-                self.out_fifo.push_slice(&self.frame_out);
-            }
-            let popped = self.out_fifo.pop_slice(wet_slice);
-            if popped < n
-                && let Some(tail) = wet_slice.get_mut(popped..)
-            {
-                tail.fill(0.0);
-            }
-        }
-
         let mix_target = clamp_param(ParamId::DenoiseMix, p.denoise_mix);
         self.mix_smoother.set_target(mix_target);
         let delay = self.latency_samples as usize;
 
-        for (sample, &wet) in buf.iter_mut().zip(wet_slice.iter()) {
-            let dry = self.dry_delay.push_read(*sample, delay);
-            let mix = self.mix_smoother.next();
-            *sample = dry * (1.0 - mix) + wet * mix;
+        if self.passthrough {
+            // Low-latency mode (`DenoiseEngine::Off`): zero framing/resampler/delay.
+            self.denoise_idle = false;
+            self.vad_prob = 1.0;
+        } else if mix_target <= 1e-6 && self.mix_smoother.current() <= 1e-6 {
+            // Zero-mix skip: bypass neural inference while preserving `latency_samples` alignment.
+            self.denoise_idle = true;
+            self.vad_prob = 1.0;
+            self.mix_smoother.set_target(0.0);
+            for sample in buf.iter_mut() {
+                *sample = self.dry_delay.push_read(*sample, delay);
+                let _ = self.mix_smoother.next();
+            }
+        } else {
+            if self.denoise_idle {
+                self.denoise_idle = false;
+                self.denoise.reset();
+                self.in_fifo.reset();
+                self.out_fifo.reset();
+                if let Some(resampler) = self.resampler.as_mut() {
+                    resampler.reset();
+                } else {
+                    self.out_fifo.push_zeros(self.denoise.frame_len().max(1));
+                }
+            }
+
+            let mut vad_prob = self.vad_prob;
+            if let Some(resampler) = self.resampler.as_mut() {
+                let denoise = &mut self.denoise;
+                resampler.process_frames(buf, wet_slice, |in_frame, out_frame| {
+                    let vad = denoise.process_frame(in_frame, out_frame);
+                    vad_prob = smooth_vad(vad_prob, vad);
+                });
+            } else {
+                self.in_fifo.push_slice(buf);
+                while self.in_fifo.pop_frame(&mut self.frame_in) {
+                    let vad = self.denoise.process_frame(&self.frame_in, &mut self.frame_out);
+                    vad_prob = smooth_vad(vad_prob, vad);
+                    self.out_fifo.push_slice(&self.frame_out);
+                }
+                let popped = self.out_fifo.pop_slice(wet_slice);
+                if popped < n
+                    && let Some(tail) = wet_slice.get_mut(popped..)
+                {
+                    tail.fill(0.0);
+                }
+            }
+            self.vad_prob = vad_prob;
+
+            for (sample, &wet) in buf.iter_mut().zip(wet_slice.iter()) {
+                let dry = self.dry_delay.push_read(*sample, delay);
+                let mix = self.mix_smoother.next();
+                *sample = dry * (1.0 - mix) + wet * mix;
+            }
         }
 
-        // Stage 2b: Soft-knee hysteresis downward expander.
+        // Stage 2b: Soft-knee hysteresis downward expander with VAD-assisted threshold boost.
         let attack_ms = clamp_param(ParamId::GateAttackMs, p.gate_attack_ms);
         let release_ms = clamp_param(ParamId::GateReleaseMs, p.gate_release_ms);
         if (attack_ms - self.last_attack_ms).abs() > 1e-4 || (release_ms - self.last_release_ms).abs() > 1e-4 {
@@ -256,6 +333,14 @@ impl Stage for CleanupStage {
         let half_knee = EXPANDER_KNEE_DB * 0.5;
         let close_threshold = threshold - hysteresis;
 
+        let vad_boost_target =
+            if !self.passthrough && !self.denoise_idle && mix_target > 0.01 && self.vad_prob < VAD_SPEECH_LOW {
+                mix_target * MAX_VAD_BOOST_DB * ((VAD_SPEECH_LOW - self.vad_prob) / VAD_SPEECH_LOW)
+            } else {
+                0.0
+            };
+        self.vad_boost_smoother.set_target(vad_boost_target);
+
         let mut gate_open = self.gate_open;
         let mut gain_env = self.gain_env;
         let mut hold_counter = self.hold_counter;
@@ -266,17 +351,21 @@ impl Stage for CleanupStage {
 
         for sample in buf.iter_mut() {
             let env = self.detector.process_sample(*sample);
+            let boost = self.vad_boost_smoother.next();
+            let eff_open = threshold + boost;
+            let eff_close = close_threshold + boost;
+
             let target_gain_db = if p.gate_enabled {
-                let level_db = lin_to_db(env);
+                let level_db = fast_lin_to_db(env);
                 if gate_open {
-                    if level_db < close_threshold {
+                    if level_db < eff_close {
                         gate_open = false;
                     }
-                } else if level_db >= threshold {
+                } else if level_db >= eff_open {
                     gate_open = true;
                 }
 
-                let eff_thresh = if gate_open { close_threshold } else { threshold };
+                let eff_thresh = if gate_open { eff_close } else { eff_open };
                 let gain_db = if level_db >= eff_thresh + half_knee {
                     0.0
                 } else if level_db > eff_thresh - half_knee {
@@ -303,7 +392,7 @@ impl Stage for CleanupStage {
             if gain_env < min_gain_env_db {
                 min_gain_env_db = gain_env;
             }
-            *sample *= db_to_lin(gain_env);
+            *sample *= fast_db_to_lin(gain_env);
         }
 
         self.gate_open = gate_open;

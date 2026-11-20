@@ -6,7 +6,7 @@ use tine_protocol::presets::{Archetype, MacroPositions};
 use crate::fake::scene_live_frame;
 use crate::model::{
     ApoBadge, AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, EndpointRow, Macro,
-    MonitorUi, UiModel,
+    MicCheckStep, MonitorUi, UiModel,
 };
 use crate::state::AppState;
 
@@ -44,11 +44,20 @@ fn base_model() -> UiModel {
     }
 }
 
-/// Default Golden Line view with active APO and live speech-like metering.
+/// Default Tine Deck 2.3 view (Dark Mode) with active cable and live speech-like metering.
 #[must_use]
 pub fn make_golden_line() -> AppState {
     let mut s = AppState::from_model(base_model());
+    s.resolve_params_optimistic();
     s.live = scene_live_frame(1.4, false);
+    s
+}
+
+/// Default Tine Deck 2.3 view in Light Mode ("Decky Daylight") with live speech-like metering.
+#[must_use]
+pub fn make_golden_line_light() -> AppState {
+    let mut s = make_golden_line();
+    s.ui.theme_mode = crate::theme::ThemeMode::Light;
     s
 }
 
@@ -243,8 +252,24 @@ pub fn make_onboarding_finish() -> AppState {
     s
 }
 
+/// 5-second Mic Check modal during A/B loop audition playback.
+#[must_use]
+pub fn make_mic_check_playing() -> AppState {
+    let mut s = make_golden_line();
+    s.model.mic_check = MicCheckStep::Playing {
+        raw: false,
+        progress: 0.42,
+        duration_s: 5.0,
+    };
+    s
+}
+
 fn apply_golden_line(s: &mut AppState) {
     *s = make_golden_line();
+}
+
+fn apply_golden_line_light(s: &mut AppState) {
+    *s = make_golden_line_light();
 }
 
 fn apply_pro_drawer_open(s: &mut AppState) {
@@ -311,12 +336,17 @@ fn apply_onboarding_finish(s: &mut AppState) {
     *s = make_onboarding_finish();
 }
 
+fn apply_mic_check_playing(s: &mut AppState) {
+    *s = make_mic_check_playing();
+}
+
 /// Named scene callback type matching [`rune::AppSpec::scenes`].
 pub type SceneEntry = (&'static str, fn(&mut AppState));
 
 /// Scene registry passed to [`rune::AppSpec::scenes`].
 pub const SCENES: &[SceneEntry] = &[
     ("golden_line", apply_golden_line),
+    ("golden_line_light", apply_golden_line_light),
     ("golden_line_tooltip", apply_golden_line_tooltip),
     ("pro_drawer_open", apply_pro_drawer_open),
     ("auto_tune_wizard", apply_auto_tune_wizard),
@@ -333,4 +363,5 @@ pub const SCENES: &[SceneEntry] = &[
     ("onboarding_install_error", apply_onboarding_install_error),
     ("onboarding_autotune", apply_onboarding_autotune),
     ("onboarding_finish", apply_onboarding_finish),
+    ("mic_check_playing", apply_mic_check_playing),
 ];

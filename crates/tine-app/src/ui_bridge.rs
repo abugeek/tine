@@ -47,15 +47,15 @@ use tine_engine::paths::EnginePaths;
 use tine_engine::persist;
 use tine_engine::shm_client::ShmClient;
 use tine_engine::visualizer::{EngineSignals, UiFrame, Visualizer};
-use tine_protocol::params::{DspParams, ParamId, SPECS, Unit};
-use tine_protocol::presets::{Archetype, EndpointProfile, MacroPositions};
+use tine_protocol::params::{DenoiseEngine, DspParams, ParamId, SPECS, Unit};
+use tine_protocol::presets::{Archetype, Calibration, CalibrationOverrides, EndpointProfile, MacroPositions};
 use tine_protocol::sync::Triple;
 use tine_protocol::telemetry::AudioTelemetryFrame;
 use tine_ui::state::LiveFrame;
 use tine_ui::views::autotune::{autotune_from_progress, calibration_from_report};
 use tine_ui::{
     ApoBadge, AppState, AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, EndpointRow,
-    Intent, IntentSink, Macro as UiMacro, MonitorUi, UiModel,
+    Intent, IntentSink, Macro as UiMacro, MicCheckStep, MonitorUi, UiModel,
 };
 
 use crate::proto::{PipeRequest, PipeResponse};
@@ -113,10 +113,9 @@ pub fn live_from_meters(data: &Value) -> Option<LiveFrame> {
     Some(LiveFrame { telemetry, spectrum })
 }
 
-/// Wire period of the child's Auto-Tune wizard poll (progress driven at
-/// ≥ 10 Hz while a run is in flight; one query round-trips over the
-/// pipe, so the cadence is well below its 2 s status twin).
-const WIZARD_PERIOD: Duration = Duration::from_millis(100);
+/// Wire period of the child's Auto-Tune wizard poll (~30 Hz so countdown rings
+/// and live level meters glide smoothly alongside Rune spring motion).
+const WIZARD_PERIOD: Duration = Duration::from_millis(33);
 
 /// Parses the wire phase name (`Debug` form of `CalPhase`).
 fn phase_from_wire(s: &str) -> CalPhase {
@@ -180,7 +179,21 @@ pub fn autotune_ui_from_state(data: &Value) -> Option<(AutoTuneUi, Option<Calibr
                 live_level_db: data.get("level_db").and_then(Value::as_f64).unwrap_or(-90.0) as f32,
                 voiced_ms: data.get("voiced_ms").and_then(Value::as_u64).unwrap_or_default() as u32,
             };
-            Some((autotune_from_progress(&progress, None), None, false))
+            let mut ui = autotune_from_progress(&progress, None);
+            if let Some(rem) = data.get("remaining_secs").and_then(Value::as_f64).map(|x| x as f32) {
+                match &mut ui.step {
+                    AutoTuneStep::Prepare { remaining_secs }
+                    | AutoTuneStep::Silence { remaining_secs }
+                    | AutoTuneStep::Speak { remaining_secs } => {
+                        *remaining_secs = rem.max(0.0);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(overall) = data.get("overall_progress").and_then(Value::as_f64).map(|x| x as f32) {
+                ui.progress = overall.clamp(0.0, 1.0);
+            }
+            Some((ui, None, false))
         }
         "report-pending" => {
             let calibration = data.get("report").and_then(calibration_from_state);
@@ -205,6 +218,44 @@ pub fn autotune_ui_from_state(data: &Value) -> Option<(AutoTuneUi, Option<Calibr
         }
         _ => None, // unknown future flow: skip this frame
     }
+}
+
+/// Reconstructs the full [`Calibration`] (including `tilt_db`, `crest_db`, and
+/// `noise_peak_db`) from the `calibrate_query` `report-pending` payload.
+#[must_use]
+pub fn pending_calibration_from_state(data: &Value, archetype: Archetype) -> Option<Calibration> {
+    if data.get("flow").and_then(Value::as_str) != Some("report-pending") {
+        return None;
+    }
+    let report = data.get("report")?;
+    let get = |k: &str| report.get(k).and_then(Value::as_f64).map(|x| x as f32);
+    let base = builtin_preset(archetype).base;
+    let find_after = |target: &str, fallback: f32| {
+        report
+            .get("changes")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
+            })
+            .and_then(|e| e.get("after").and_then(Value::as_f64))
+            .map_or(fallback, |x| x as f32)
+    };
+    let noise_rms_db = get("noise_rms_db").unwrap_or(SPECTRUM_FLOOR_DB);
+    Some(Calibration {
+        noise_rms_db,
+        noise_peak_db: get("noise_peak_db").unwrap_or(noise_rms_db),
+        speech_rms_db: get("speech_rms_db").unwrap_or(SPECTRUM_FLOOR_DB),
+        crest_db: get("crest_db").unwrap_or(12.0),
+        tilt_db: get("tilt_db").unwrap_or(0.0),
+        derived: CalibrationOverrides {
+            input_gain_db: find_after("input_gain_db", base.input_gain_db),
+            gate_threshold_db: find_after("gate_threshold_db", base.gate_threshold_db),
+            denoise_mix: find_after("denoise_mix", base.denoise_mix),
+            comp_thresh_db: find_after("comp_thresh_db", base.comp_thresh_db),
+            comp_makeup_db: find_after("comp_makeup_db", base.comp_makeup_db),
+        },
+    })
 }
 
 /// Results-card view model from the wire report (SPECS-keyed changes
@@ -751,6 +802,8 @@ impl EngineBridge {
             .map_or_else(String::new, |e| e.as_str().to_owned());
         let selected = self.endpoints.iter().position(|e| e.id == endpoint_id);
         let calibration = self.pending.as_ref().map(calibration_from_report);
+        let pending_calibration = self.pending.as_ref().map(|r| r.calibration);
+        let active_calibration = model.and_then(|m| m.profile.calibration);
         UiModel {
             endpoints: endpoint_rows(&self.endpoints),
             selected,
@@ -760,6 +813,9 @@ impl EngineBridge {
             pins: profile.pins,
             params: self.params,
             bypass: model.is_some_and(|m| m.bypass),
+            muted: crate::services::is_muted(),
+            denoise_engine: DenoiseEngine::default(),
+            park_when_unused: true,
             monitor: MonitorUi {
                 enabled: model.is_some_and(|m| m.monitor.enabled),
                 device_name: model.and_then(|m| m.monitor.output_device.clone()),
@@ -767,10 +823,39 @@ impl EngineBridge {
                 estimated_latency_ms: self.monitor_latency_ms,
             },
             calibration,
+            pending_calibration,
+            active_calibration,
             autotune: self.autotune_ui.clone(),
+            mic_check: MicCheckStep::Idle,
             first_run: self.first_run(),
             status_banner: None,
+            raw_mic_apps: Vec::new(),
         }
+    }
+
+    fn preview_params_for(
+        archetype: Archetype,
+        cal: &Calibration,
+        style: tine_dsp::calibrator::VoiceStyle,
+        keep_pins: bool,
+        macros: MacroPositions,
+        mut pins: tine_protocol::presets::PinSet,
+        current: &DspParams,
+    ) -> DspParams {
+        let macros = tine_dsp::calibrator::recommend_macros(cal, archetype, style, macros);
+        if !keep_pins {
+            for id in tine_dsp::calibrator::CHANGED_PARAMS {
+                pins.unpin(id);
+            }
+            if style != tine_dsp::calibrator::VoiceStyle::KeepCurrent {
+                for m in tine_dsp::macros::Macro::ALL {
+                    for &id in tine_dsp::macros::MacroMapper::drives(m) {
+                        pins.unpin(id);
+                    }
+                }
+            }
+        }
+        tine_dsp::macros::MacroMapper::apply(builtin_preset(archetype), Some(cal), macros, pins, current).clamped()
     }
 
     /// Dispatches one user intent (the in-process `IntentSink` mapping).
@@ -785,6 +870,21 @@ impl EngineBridge {
                 }
             }
             Intent::SetArchetype(a) => self.send(Command::SetArchetype(a)),
+            Intent::SetDenoiseEngine(engine) => {
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                settings.denoise_engine = engine;
+                if let Err(e) = persist::save_settings(&settings, &self.paths) {
+                    self.surface(&format!("Failed to save denoiser engine: {e}"));
+                }
+            }
+            Intent::SetParkWhenUnused(enabled) => {
+                let mut settings = persist::load_settings(&self.paths).into_value();
+                settings.park_when_unused = enabled;
+                if let Err(e) = persist::save_settings(&settings, &self.paths) {
+                    self.surface(&format!("Failed to save keep-warm setting: {e}"));
+                }
+                crate::services::set_park_when_unused(enabled);
+            }
             Intent::SetMacro(m, v) => self.send(Command::SetMacro(engine_macro(m), v)),
             Intent::SetParam(id, v) => self.send(Command::SetParam(id, v)),
             Intent::Unpin(id) => self.send(Command::Unpin(id)),
@@ -792,6 +892,9 @@ impl EngineBridge {
             Intent::ToggleBypass => {
                 let next = self.model.as_ref().is_none_or(|m| !m.bypass);
                 self.send(Command::SetBypass(next));
+            }
+            Intent::SetMuted(muted) => {
+                let _ = crate::services::set_muted(muted);
             }
             Intent::ToggleMonitor => {
                 let on = self.model.as_ref().is_none_or(|m| !m.monitor.enabled);
@@ -804,6 +907,28 @@ impl EngineBridge {
                 if let Some(h) = self.autotune.as_mut() {
                     h.cancel();
                 }
+                if let Some(resolved) = self.model.as_deref().map(resolve) {
+                    self.params = resolved;
+                }
+            }
+            Intent::PreviewCalibration {
+                style,
+                keep_pins,
+                audition_raw: _,
+            } => {
+                if let (Some(report), Some(model)) = (self.pending.as_ref(), self.model.as_deref()) {
+                    let mut resolved = Self::preview_params_for(
+                        model.profile.archetype,
+                        &report.calibration,
+                        style,
+                        keep_pins,
+                        model.profile.macros,
+                        model.profile.pins,
+                        &self.params,
+                    );
+                    resolved.bypass = model.bypass;
+                    self.params = resolved;
+                }
             }
             Intent::ApplyCalibration { keep_pins } => {
                 if let Some(report) = self.pending.take() {
@@ -815,6 +940,9 @@ impl EngineBridge {
             Intent::DiscardCalibration => {
                 self.pending = None;
                 self.autotune_ui = AutoTuneUi::default();
+                if let Some(resolved) = self.model.as_deref().map(resolve) {
+                    self.params = resolved;
+                }
                 tracing::info!(target: "tine::bridge", "auto-tune results discarded");
             }
             Intent::InstallApo | Intent::RepairApo => {
@@ -837,11 +965,12 @@ impl EngineBridge {
                     }
                 }
             }
-            Intent::OpenSettings => {
+            Intent::OpenSettings
+            | Intent::CloseWindow
+            | Intent::StartMicCheck
+            | Intent::SetMicCheckMode(_)
+            | Intent::StopMicCheck => {
                 tracing::debug!(target: "tine::bridge", intent = ?intent, "local-only intent");
-            }
-            Intent::CloseWindow => {
-                tracing::debug!(target: "tine::bridge", "close requested (handled by the window host)");
             }
         }
     }
@@ -1060,7 +1189,11 @@ impl IntentSink for ChildSink {
 /// the endpoint ids the picker indexes into.
 struct ChildModel {
     bypass: bool,
+    muted: bool,
+    denoise_engine: DenoiseEngine,
+    park_when_unused: bool,
     monitor_on: bool,
+    archetype: Archetype,
     endpoint_id: String,
     endpoints: Vec<String>,
     output_devices: Vec<String>,
@@ -1073,7 +1206,11 @@ impl ChildModel {
     fn new() -> Self {
         Self {
             bypass: false,
+            muted: false,
+            denoise_engine: DenoiseEngine::default(),
+            park_when_unused: true,
             monitor_on: false,
+            archetype: Archetype::default(),
             endpoint_id: String::new(),
             endpoints: apo_admin::list_capture_endpoints()
                 .map(|list| list.into_iter().map(|e| e.id).collect::<Vec<_>>())
@@ -1117,10 +1254,14 @@ fn initial_ui_model() -> UiModel {
     let mut profile = EndpointProfile::new("", Archetype::default());
     let mut monitor = MonitorUi::default();
     let mut endpoint_id = String::new();
+    let mut denoise_engine = DenoiseEngine::default();
+    let mut park_when_unused = true;
     if let Ok(paths) = EnginePaths::system() {
         let settings = persist::load_settings(&paths).into_value();
         first_run = !settings.onboarding_completed;
         endpoint_id = settings.selected_endpoint_id.unwrap_or_default();
+        denoise_engine = settings.denoise_engine;
+        park_when_unused = settings.park_when_unused;
         monitor.enabled = settings.monitor_enabled;
         monitor.device_name = settings.monitor_device_id;
         profile = persist::load_profile(&endpoint_id, &paths).into_value();
@@ -1140,10 +1281,26 @@ fn initial_ui_model() -> UiModel {
             .map(str::to_owned)
             .unwrap_or(endpoint_id);
         monitor.enabled = s.get("monitor").and_then(Value::as_bool).unwrap_or(monitor.enabled);
+        if let Some(engine) = s
+            .get("denoise_engine")
+            .and_then(Value::as_str)
+            .and_then(DenoiseEngine::from_name)
+        {
+            denoise_engine = engine;
+        }
+        park_when_unused = s
+            .get("park_when_unused")
+            .and_then(Value::as_bool)
+            .unwrap_or(park_when_unused);
     }
     let bypass = status
         .as_ref()
         .and_then(|s| s.get("bypass"))
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
+    let muted = status
+        .as_ref()
+        .and_then(|s| s.get("muted"))
         .and_then(Value::as_bool)
         .unwrap_or_default();
     let app_model = AppModel {
@@ -1174,13 +1331,28 @@ fn initial_ui_model() -> UiModel {
         pins: profile.pins,
         params,
         bypass,
+        muted,
+        denoise_engine,
+        park_when_unused,
         monitor,
         calibration: None,
+        pending_calibration: None,
+        active_calibration: profile.calibration,
         autotune: AutoTuneUi::default(),
+        mic_check: MicCheckStep::Idle,
         first_run,
         status_banner: None,
+        raw_mic_apps: status
+            .as_ref()
+            .and_then(|s| s.get("raw_mic_apps"))
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default(),
     }
 }
+
+/// Resource id of the app's icon group (`assets/brand/tine.ico`, linked by `build.rs`).
+pub const APP_ICON_ID: u16 = 1;
 
 /// Runs the `--ui` child (called from `main` for `tine --ui`): the real
 /// `tine-ui` window wired to the parent's control plane through the
@@ -1193,13 +1365,19 @@ pub fn run_ui_child() {
     tracing::info!(target: "tine::ui", "UI child starting");
 
     let model = initial_ui_model();
-    let initial_bypass = model.bypass;
-    let initial_monitor_on = model.monitor.enabled;
-    let initial_endpoint_id = model
-        .selected
-        .and_then(|idx| model.endpoints.get(idx))
-        .map(|e| e.id.clone())
-        .unwrap_or_default();
+    let initial_seed = ChildInit {
+        bypass: model.bypass,
+        muted: model.muted,
+        denoise_engine: model.denoise_engine,
+        park_when_unused: model.park_when_unused,
+        monitor_on: model.monitor.enabled,
+        archetype: model.archetype,
+        endpoint_id: model
+            .selected
+            .and_then(|idx| model.endpoints.get(idx))
+            .map(|e| e.id.clone())
+            .unwrap_or_default(),
+    };
     ONBOARDING_PERSISTED.store(!model.first_run, Ordering::Release);
     if model.first_run {
         tracing::info!(target: "tine::ui", "first run detected: onboarding overlay shown");
@@ -1215,6 +1393,9 @@ pub fn run_ui_child() {
         spec.on_key = Some(child_on_key);
         spec
     };
+    // Title bar, taskbar and Alt+Tab icon from the exe's own icon group (linked by build.rs).
+    #[cfg(windows)]
+    rune::set_app_icon_resource(APP_ICON_ID);
     let app = rune::App::new(spec)
         .args(std::env::args_os().skip(2).map(|a| a.to_string_lossy().into_owned()))
         .on_visibility(on_visibility)
@@ -1225,13 +1406,7 @@ pub fn run_ui_child() {
     if std::thread::Builder::new()
         .name("tine-ui-bridge".to_owned())
         .spawn(move || {
-            child_worker(
-                &worker_handle,
-                &rx_intents,
-                initial_bypass,
-                initial_monitor_on,
-                initial_endpoint_id,
-            );
+            child_worker(&worker_handle, &rx_intents, initial_seed);
         })
         .is_err()
     {
@@ -1276,48 +1451,129 @@ fn coalesce_intents(first: Intent, rx: &Receiver<Intent>) -> Vec<Intent> {
     batch
 }
 
+fn mic_check_step_from_wire(data: &Value) -> Option<(MicCheckStep, bool)> {
+    match data.get("flow").and_then(Value::as_str)? {
+        "idle" => Some((MicCheckStep::Idle, false)),
+        "recording" => Some((
+            MicCheckStep::Recording {
+                progress: data.get("progress").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                level_db: data.get("level_db").and_then(Value::as_f64).unwrap_or(-60.0) as f32,
+            },
+            true,
+        )),
+        "playing" => Some((
+            MicCheckStep::Playing {
+                raw: data.get("raw").and_then(Value::as_bool).unwrap_or(false),
+                progress: data.get("progress").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                duration_s: data.get("duration_s").and_then(Value::as_f64).unwrap_or(5.0) as f32,
+            },
+            true,
+        )),
+        "failed" => Some((
+            MicCheckStep::Failed(
+                data.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Mic Check failed.")
+                    .to_owned(),
+            ),
+            false,
+        )),
+        _ => None,
+    }
+}
+
+struct ChildInit {
+    bypass: bool,
+    muted: bool,
+    denoise_engine: DenoiseEngine,
+    park_when_unused: bool,
+    monitor_on: bool,
+    archetype: Archetype,
+    endpoint_id: String,
+}
+
 /// The child's bridge worker: intent dispatch to the pipe (admin requests
-/// run here, on this worker thread), the Auto-Tune wizard's ~10 Hz
+/// run here, on this worker thread), the Auto-Tune wizard's ~30 Hz
 /// progress poll while a run is in flight, plus timed `status`/`meters`
 /// polls that post coalesced, visibility-gated updates to the Rune state.
-fn child_worker(
-    handle: &rune::AppHandle<AppState>,
-    rx_intents: &Receiver<Intent>,
-    initial_bypass: bool,
-    initial_monitor_on: bool,
-    initial_endpoint_id: String,
-) {
+fn child_worker(handle: &rune::AppHandle<AppState>, rx_intents: &Receiver<Intent>, init: ChildInit) {
     let pipe = single_instance::pipe_name_for_user();
     let mut model = ChildModel::new();
-    model.bypass = initial_bypass;
-    model.monitor_on = initial_monitor_on;
-    model.endpoint_id = initial_endpoint_id;
+    model.bypass = init.bypass;
+    model.muted = init.muted;
+    model.denoise_engine = init.denoise_engine;
+    model.park_when_unused = init.park_when_unused;
+    model.monitor_on = init.monitor_on;
+    model.archetype = init.archetype;
+    model.endpoint_id = init.endpoint_id;
     let mut autotune_active = false;
+    let mut mic_check_active = false;
+    let mut wizard_smooth_db: Option<f32> = None;
     let epoch = Instant::now();
     let mut last_status = epoch.checked_sub(STATUS_PERIOD).unwrap_or(epoch);
     let mut last_meters = epoch.checked_sub(METERS_PERIOD).unwrap_or(epoch);
     let mut last_wizard = epoch.checked_sub(WIZARD_PERIOD).unwrap_or(epoch);
+    let mut last_mic_check = epoch.checked_sub(Duration::from_millis(50)).unwrap_or(epoch);
     loop {
         // 1. Pending intents take priority (coalesced so rapid slider drags stay instant).
-        let woke = match rx_intents.recv_timeout(METERS_PERIOD) {
+        let (woke, started_mc, stopped_mc) = match rx_intents.recv_timeout(METERS_PERIOD) {
             Ok(first) => {
                 let mut started = false;
+                let mut mc_start = false;
+                let mut mc_stop = false;
                 for intent in coalesce_intents(first, rx_intents) {
+                    match intent {
+                        Intent::StartMicCheck => mc_start = true,
+                        Intent::StopMicCheck => {
+                            mc_start = false;
+                            mc_stop = true;
+                        }
+                        _ => {}
+                    }
                     if child_dispatch(handle, &pipe, &mut model, &intent) {
                         started = true;
                     }
                 }
-                started
+                (started, mc_start, mc_stop)
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (false, false, false),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         };
         if woke {
             autotune_active = true;
+            wizard_smooth_db = None;
             last_wizard = epoch.checked_sub(WIZARD_PERIOD).unwrap_or(epoch);
         }
+        if started_mc {
+            mic_check_active = true;
+            last_mic_check = epoch.checked_sub(Duration::from_millis(50)).unwrap_or(epoch);
+        } else if stopped_mc {
+            mic_check_active = false;
+        }
         let now = Instant::now();
-        // 2. Wizard progress at ~10 Hz while the parent calibrates (the
+        if mic_check_active && now.duration_since(last_mic_check) >= Duration::from_millis(50) {
+            last_mic_check = now;
+            if let Ok(PipeResponse {
+                ok: true,
+                data: Some(data),
+                ..
+            }) = single_instance::send_request(&pipe, &PipeRequest::MicCheckQuery)
+            {
+                if let Some((step, keep_polling)) = mic_check_step_from_wire(&data) {
+                    mic_check_active = keep_polling;
+                    handle.update_if(move |s, _| {
+                        if s.model.mic_check == step {
+                            return false;
+                        }
+                        s.model.mic_check = step;
+                        true
+                    });
+                }
+            } else {
+                mic_check_active = false;
+            }
+        }
+        // 2. Wizard progress at ~30 Hz while the parent calibrates (the
         //    poll stops on the first terminal frame).
         if autotune_active && now.duration_since(last_wizard) >= WIZARD_PERIOD {
             last_wizard = now;
@@ -1327,13 +1583,45 @@ fn child_worker(
                 ..
             }) = single_instance::send_request(&pipe, &PipeRequest::CalibrateQuery)
             {
-                if let Some((ui, calibration, terminal)) = autotune_ui_from_state(&data) {
+                if let Some((mut ui, calibration, terminal)) = autotune_ui_from_state(&data) {
+                    let pending_cal = pending_calibration_from_state(&data, model.archetype);
+                    if matches!(
+                        ui.step,
+                        AutoTuneStep::Prepare { .. } | AutoTuneStep::Silence { .. } | AutoTuneStep::Speak { .. }
+                    ) {
+                        let raw_db = ui.level_db;
+                        let smoothed = match wizard_smooth_db {
+                            None => raw_db,
+                            Some(prev) => {
+                                let alpha = if raw_db > prev { 0.45 } else { 0.16 };
+                                prev + alpha * (raw_db - prev)
+                            }
+                        };
+                        wizard_smooth_db = Some(smoothed);
+                        ui.level_db = smoothed;
+                    }
                     if terminal {
                         autotune_active = false;
+                        wizard_smooth_db = None;
                     }
-                    handle.update_if(move |s, _| {
+                    handle.update_if(move |s, tx| {
                         s.model.autotune = ui;
                         s.model.calibration = calibration;
+                        s.model.pending_calibration = pending_cal;
+                        if let Some(cal) = pending_cal {
+                            let mut resolved = EngineBridge::preview_params_for(
+                                s.model.archetype,
+                                &cal,
+                                s.ui.autotune_style,
+                                s.ui.autotune_keep_pins,
+                                s.model.macros,
+                                s.model.pins,
+                                &s.model.params,
+                            );
+                            resolved.bypass = s.model.bypass;
+                            s.model.params = resolved;
+                        }
+                        tx.animated();
                         true
                     });
                 }
@@ -1342,6 +1630,7 @@ fn child_worker(
                 // last rendered step stays on screen.
                 tracing::warn!(target: "tine::ui", "auto-tune progress unavailable; wizard poll stopped");
                 autotune_active = false;
+                wizard_smooth_db = None;
             }
         }
         // 3. Meters at ≤ 60 Hz while the window is visible, coalesced: a
@@ -1377,9 +1666,11 @@ fn child_worker(
 /// close after Apply / Discard; the render thread applies it when idle).
 fn close_wizard(handle: &rune::AppHandle<AppState>) {
     let ui = AutoTuneUi::default();
-    handle.update_if(move |s, _| {
+    handle.update_if(move |s, tx| {
         s.model.autotune = ui;
         s.model.calibration = None;
+        s.model.pending_calibration = None;
+        tx.animated();
         true
     });
 }
@@ -1418,6 +1709,10 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
         Intent::SetArchetype(a) => Some(PipeRequest::Archetype {
             name: a.id().to_owned(),
         }),
+        Intent::SetDenoiseEngine(engine) => Some(PipeRequest::SetDenoiseEngine {
+            engine: engine.as_str().to_owned(),
+        }),
+        Intent::SetParkWhenUnused(enabled) => Some(PipeRequest::SetParkWhenUnused { enabled: *enabled }),
         Intent::SetMacro(m, v) => Some(PipeRequest::Macro {
             name: m.label().to_lowercase(),
             value: *v,
@@ -1429,6 +1724,7 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
         Intent::Unpin(id) => param_key(*id).map(|key| PipeRequest::Unpin { key: key.to_owned() }),
         Intent::UnpinAll => Some(PipeRequest::UnpinAll),
         Intent::ToggleBypass => Some(PipeRequest::Bypass { on: !model.bypass }),
+        Intent::SetMuted(muted) => Some(PipeRequest::Mute { on: Some(*muted) }),
         Intent::ToggleMonitor => Some(PipeRequest::Monitor {
             on: !model.monitor_on,
             device: None,
@@ -1439,22 +1735,38 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
         }),
         Intent::StartAutoTune => Some(PipeRequest::Calibrate),
         Intent::CancelAutoTune => Some(PipeRequest::CalibrateCancel),
+        Intent::PreviewCalibration {
+            style,
+            keep_pins,
+            audition_raw,
+        } => Some(PipeRequest::CalibratePreview {
+            style: style.as_str().to_owned(),
+            keep_pins: *keep_pins,
+            audition_raw: *audition_raw,
+        }),
         Intent::ApplyCalibration { keep_pins } => Some(PipeRequest::CalibrateApply { keep_pins: *keep_pins }),
         Intent::DiscardCalibration => Some(PipeRequest::CalibrateDiscard),
         Intent::SetProDrawerOpen(open) => Some(PipeRequest::SetProDrawerOpen { open: *open }),
+        Intent::StartMicCheck => Some(PipeRequest::MicCheckStart),
+        Intent::SetMicCheckMode(raw) => Some(PipeRequest::MicCheckSetMode { raw: *raw }),
+        Intent::StopMicCheck => Some(PipeRequest::MicCheckStop),
         Intent::OpenSettings | Intent::CloseWindow | Intent::InstallApo | Intent::RepairApo => None,
     };
     if matches!(
         intent,
         Intent::SelectEndpoint(_)
             | Intent::SetArchetype(_)
+            | Intent::SetDenoiseEngine(_)
+            | Intent::SetParkWhenUnused(_)
             | Intent::SetMacro(..)
             | Intent::SetParam(..)
             | Intent::Unpin(_)
             | Intent::UnpinAll
             | Intent::ToggleBypass
+            | Intent::SetMuted(_)
             | Intent::ToggleMonitor
             | Intent::PickMonitorDevice(_)
+            | Intent::PreviewCalibration { .. }
             | Intent::ApplyCalibration { .. }
     ) {
         model.last_local_edit = Some(Instant::now());
@@ -1470,29 +1782,100 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
             if let PipeRequest::Bypass { on } = req {
                 model.bypass = on;
             }
+            if let PipeRequest::Mute { on } = req
+                && let Some(m) = on
+            {
+                model.muted = m;
+            }
             if let PipeRequest::Monitor { on, .. } = req {
                 model.monitor_on = on;
             }
-            if let PipeRequest::Endpoint { id } = req {
-                model.endpoint_id = id;
+            if let PipeRequest::Endpoint { id } = &req {
+                model.endpoint_id.clone_from(id);
+            }
+            if let PipeRequest::Archetype { name } = &req
+                && let Some(arch) = crate::cli::archetype_from_name(name)
+            {
+                model.archetype = arch;
+            }
+            if let PipeRequest::SetDenoiseEngine { engine } = &req
+                && let Some(parsed) = DenoiseEngine::from_name(engine)
+            {
+                model.denoise_engine = parsed;
+            }
+            if let PipeRequest::SetParkWhenUnused { enabled } = req {
+                model.park_when_unused = enabled;
             }
             // The wizard poll starts only when the parent actually
             // began a run (a missing routing link answers otherwise).
-            started_calibrate
+            let running = started_calibrate
                 && data
                     .as_ref()
                     .and_then(|d| d.get("calibrate"))
                     .and_then(|c| c.get("flow"))
                     .and_then(Value::as_str)
-                    == Some("running")
+                    == Some("running");
+            if running {
+                handle.update_if(move |s, tx| {
+                    if matches!(s.model.autotune.step, AutoTuneStep::Idle) {
+                        s.ui.autotune_audition_raw = None;
+                        s.ui.autotune_style = tine_dsp::calibrator::VoiceStyle::AutoBalanced;
+                        s.model.autotune = AutoTuneUi {
+                            step: AutoTuneStep::Prepare {
+                                remaining_secs: tine_dsp::calibrator::LIVE_COUNTDOWN_S,
+                            },
+                            progress: 0.0,
+                            level_db: s.live.telemetry.input_rms_db.max(-60.0),
+                            prompt_text: String::new(),
+                            voiced_ms: 0,
+                        };
+                        tx.animated();
+                        true
+                    } else {
+                        false
+                    }
+                });
+            } else if started_calibrate {
+                let msg = data
+                    .as_ref()
+                    .and_then(|d| d.get("notes"))
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.iter().find_map(Value::as_str))
+                    .map_or_else(
+                        || {
+                            String::from(
+                                "Auto-Tune could not start — check your microphone and Virtual Cable status above.",
+                            )
+                        },
+                        str::to_owned,
+                    );
+                handle.update_if(move |s, _| {
+                    s.model.status_banner = Some(msg);
+                    true
+                });
+            }
+            running
         }
         Ok(resp) => {
             let msg = resp.error.unwrap_or_else(|| "request failed".to_owned());
             tracing::error!(target: "tine::ui", intent = ?intent, "{msg}");
+            if started_calibrate {
+                handle.update_if(move |s, _| {
+                    s.model.status_banner = Some(msg);
+                    true
+                });
+            }
             false
         }
         Err(e) => {
             tracing::error!(target: "tine::ui", intent = ?intent, "parent unreachable: {e}");
+            if started_calibrate {
+                let msg = format!("Auto-Tune could not start: {e}");
+                handle.update_if(move |s, _| {
+                    s.model.status_banner = Some(msg);
+                    true
+                });
+            }
             false
         }
     }
@@ -1505,7 +1888,18 @@ fn spawn_admin_check(handle: rune::AppHandle<AppState>) {
     if std::thread::Builder::new()
         .name("tine-ui-admin".to_owned())
         .spawn(move || {
-            let badge = badge_from_health(&apo_admin::health(""));
+            DEVICES_DIRTY.store(true, Ordering::Release);
+            let badge = match badge_from_health(&apo_admin::health("")) {
+                ApoBadge::Active => ApoBadge::Active,
+                ApoBadge::Inactive => {
+                    ApoBadge::Error("Virtual cable is disabled in Windows Sound Settings (mmsys.cpl)".to_owned())
+                }
+                ApoBadge::NotInstalled => ApoBadge::Error(
+                    "No virtual audio cable detected — install VB-Cable (or run setup-virtual-cable.ps1 -Install)"
+                        .to_owned(),
+                ),
+                other @ ApoBadge::Error(_) => other,
+            };
             if matches!(badge, ApoBadge::Active) {
                 tracing::info!(target: "tine::ui", "virtual cable healthy — starting audio routing");
                 let pipe = single_instance::pipe_name_for_user();
@@ -1588,6 +1982,18 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
     let in_edit_cooldown = model.last_local_edit.is_some_and(|t| t.elapsed() < EDIT_COOLDOWN);
     if !in_edit_cooldown {
         model.bypass = status.get("bypass").and_then(Value::as_bool).unwrap_or(model.bypass);
+        model.muted = status.get("muted").and_then(Value::as_bool).unwrap_or(model.muted);
+        if let Some(engine) = status
+            .get("denoise_engine")
+            .and_then(Value::as_str)
+            .and_then(DenoiseEngine::from_name)
+        {
+            model.denoise_engine = engine;
+        }
+        model.park_when_unused = status
+            .get("park_when_unused")
+            .and_then(Value::as_bool)
+            .unwrap_or(model.park_when_unused);
         model.monitor_on = status
             .get("monitor")
             .and_then(Value::as_bool)
@@ -1602,6 +2008,9 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
         }
     }
     let bypass = model.bypass;
+    let muted = model.muted;
+    let denoise_engine = model.denoise_engine;
+    let park_when_unused = model.park_when_unused;
     let monitor_on = model.monitor_on;
     let monitor_device = status.get("monitor_device").and_then(Value::as_str).map(str::to_owned);
     let latency = if monitor_on { nominal_monitor_latency_ms() } else { 0.0 };
@@ -1621,9 +2030,10 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
         }
         // Pro rack state: resolve the persisted profile (single writer is the
         // parent controller, 500 ms trailing debounce + flush-on-exit).
-        let (params, pins, archetype) = match EnginePaths::system() {
+        let (params, pins, archetype, active_calibration) = match EnginePaths::system() {
             Ok(paths) => {
                 let profile = persist::load_profile(&model.endpoint_id, &paths).into_value();
+                let cal = profile.calibration;
                 let app_model = AppModel {
                     endpoint: (!model.endpoint_id.is_empty()).then(|| EndpointId::new(model.endpoint_id.clone())),
                     bypass,
@@ -1633,7 +2043,12 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
                     },
                     profile,
                 };
-                (resolve(&app_model), app_model.profile.pins, app_model.profile.archetype)
+                (
+                    resolve(&app_model),
+                    app_model.profile.pins,
+                    app_model.profile.archetype,
+                    cal,
+                )
             }
             Err(e) => {
                 tracing::warn!(target: "tine::ui", "paths unavailable: {e}");
@@ -1641,33 +2056,56 @@ fn child_refresh_model(handle: &rune::AppHandle<AppState>, model: &mut ChildMode
                     DspParams::DEFAULT,
                     tine_protocol::presets::PinSet::default(),
                     Archetype::default(),
+                    None,
                 )
             }
         };
-        Some((macros, params, pins, archetype))
+        model.archetype = archetype;
+        Some((macros, params, pins, archetype, active_calibration))
     };
+    let raw_mic_apps: Vec<String> = status
+        .get("raw_mic_apps")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
     let selected_id = model.endpoint_id.clone();
     let badge = model.badge.clone();
-    handle.update_if(move |s, _| {
+    handle.update_if(move |s, tx| {
         if s.model.first_run && s.ui.onboarding_dismissed {
             s.model.first_run = false;
             persist_onboarding_async();
         }
-        if let Some((macros, params, pins, archetype)) = profile_update {
+        if s.model.raw_mic_apps != raw_mic_apps {
+            s.model.raw_mic_apps = raw_mic_apps;
+            s.ui.raw_mic_banner_dismissed = false;
+        }
+        if let Some((macros, params, pins, archetype, active_calibration)) = profile_update {
+            let changed = s.model.params != params
+                || s.model.macros != macros
+                || s.model.active_calibration != active_calibration;
             s.model.macros = macros;
             s.model.bypass = bypass;
+            s.model.muted = muted;
+            s.model.denoise_engine = denoise_engine;
+            s.model.park_when_unused = park_when_unused;
             s.model.archetype = archetype;
             s.model.params = params;
             s.model.pins = pins;
+            s.model.active_calibration = active_calibration;
             s.model.monitor.enabled = monitor_on;
             s.model.monitor.device_name = monitor_device;
             s.model.monitor.estimated_latency_ms = latency;
             if let Some(idx) = s.model.endpoints.iter().position(|e| e.id == selected_id) {
                 s.model.selected = Some(idx);
             }
+            if changed {
+                tx.animated();
+            }
         }
         s.model.monitor.available_devices = devices;
-        s.model.apo = badge;
+        if matches!(badge, ApoBadge::Active) || !matches!(s.model.apo, ApoBadge::Error(_)) {
+            s.model.apo = badge;
+        }
         if let Some(msg) = note_banner
             && s.model.status_banner.is_none()
         {
@@ -1810,27 +2248,34 @@ mod tests {
 
     #[test]
     fn wizard_state_maps_each_flow_of_the_wire_payload() {
-        // Running: phase + level drive the wizard's step + meter.
+        // Running: phase + level + live duration overrides drive the wizard's step + meter.
         let (ui, cal, terminal) = autotune_ui_from_state(&serde_json::json!({
             "flow": "running", "phase": "Noise", "progress": 0.5,
+            "remaining_secs": 1.75, "overall_progress": 0.184,
             "level_db": -40.0, "voiced_ms": 0
         }))
         .expect("running frame");
-        assert!(matches!(ui.step, AutoTuneStep::Silence { .. }), "{:?}", ui.step);
+        assert!(
+            matches!(ui.step, AutoTuneStep::Silence { remaining_secs } if (remaining_secs - 1.75).abs() < 0.01),
+            "{:?}",
+            ui.step
+        );
+        assert!((ui.progress - 0.184).abs() < 0.001);
         assert!((ui.level_db - (-40.0)).abs() < 0.01);
         assert!(!terminal && cal.is_none());
 
         // Report-pending: the results card carries the measured numbers
         // and SPECS-keyed diffs become labeled rows.
-        let (ui, cal, terminal) = autotune_ui_from_state(&serde_json::json!({
+        let pending_payload = serde_json::json!({
             "flow": "report-pending", "summary": "measured",
             "report": {
-                "noise_rms_db": -50.0, "speech_rms_db": -20.0,
+                "noise_rms_db": -50.0, "noise_peak_db": -38.0, "speech_rms_db": -20.0,
+                "crest_db": 14.5, "tilt_db": 4.2,
                 "simulated_peak_db": -4.5, "simulated_rms_db": -18.0,
                 "changes": [ { "key": "input_gain_db", "before": 0.0, "after": 6.5 } ]
             }
-        }))
-        .expect("results frame");
+        });
+        let (ui, cal, terminal) = autotune_ui_from_state(&pending_payload).expect("results frame");
         assert!(matches!(ui.step, AutoTuneStep::Results));
         let cal = cal.expect("results card");
         assert!((cal.simulated_peak_db - (-4.5)).abs() < 0.01);
@@ -1838,6 +2283,10 @@ mod tests {
         assert_eq!(cal.changes[0].param, ParamId::InputGainDb);
         assert_eq!(cal.changes[0].unit, "dB");
         assert!(terminal);
+        let full_cal = pending_calibration_from_state(&pending_payload, Archetype::Dynamic).expect("full cal");
+        assert!((full_cal.tilt_db - 4.2).abs() < 0.01);
+        assert!((full_cal.crest_db - 14.5).abs() < 0.01);
+        assert!((full_cal.derived.input_gain_db - 6.5).abs() < 0.01);
 
         // Failed: the typed rejection maps the failure card.
         let (ui, _, terminal) = autotune_ui_from_state(&serde_json::json!({

@@ -42,7 +42,19 @@ Tine is in beta: only the latest release from
 
 ## Signing
 
-The beta ships unsigned (with published SHA-256 sums and documented
-SmartScreen steps). Public code-signing via SignPath Foundation (or Azure
-Trusted Signing) is a maintainer runbook item; the runbook lives in
+The beta currently ships without an Authenticode signature (with documented
+SmartScreen steps), while `.github/workflows/release.yml` publishes both
+`SHA256SUMS.txt` and cryptographic GitHub Build Provenance Attestations
+(`actions/attest-build-provenance@v2`, per
+[D-041](docs/project/06-decisions.md)) so anyone can verify release artifacts
+came directly from this repository:
+
+```pwsh
+gh attestation verify tine-<version>-x64.msi -R abugeek/tine
+```
+
+Public Authenticode code-signing via SignPath Foundation (re-applying once
+public adoption criteria are met per [D-041](docs/project/06-decisions.md)) or
+Azure Artifact Signing is configured in `.github/workflows/release.yml`
+(`TINE_SIGN_COMMAND`); the signing runbook lives in
 [`docs/tasks/done/T23-packaging-release.md`](docs/tasks/done/T23-packaging-release.md).

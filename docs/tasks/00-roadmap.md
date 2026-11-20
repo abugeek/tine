@@ -12,7 +12,7 @@ games, OBS, browsers) hears processed audio through a native APO, with no virtua
 | **B — Windows / APO** | `tine-apo`, registration | T02 → T13 → T14 |
 | **C — Engine / App** | `tine-engine`, `tine-app`, devhost | T03 → T12 → T15 → T16 → T17 |
 | **D — UI** | `tine-ui` | T18 → T19 → T20 |
-| **Z — Integration & ship** | everything | T21 → T22 → T23 |
+| **Z — Integration & ship** | everything | T21 → T22 → T23 → T24 → T25 ‖ T26 ‖ T27 ‖ T28 |
 
 ## Task index
 
@@ -41,7 +41,11 @@ games, OBS, browsers) hears processed audio through a native APO, with no virtua
 | [T21](T21-end-to-end-integration.md) | End-to-end integration in `tine.exe` | Z | T14, T17, T20 | M |
 | [T22](T22-qa-soak-perf.md) | QA: soak, perf, mic/app matrix, listening tests | Z | T21 | M |
 | [T23](T23-packaging-release.md) | Installer, signing, release, OSS docs | Z | T22 | M |
-| [T24](T24-perf-competitor-followup.md) | Competitor benchmark follow-up: stream health, idle cost, memory | Z | T22 | M |
+| [T24](done/T24-perf-competitor-followup.md) | Competitor benchmark follow-up: stream health, idle cost, memory (`done`, #32) | Z | T22 | M |
+| [T25](done/T25-cli-cable-ux.md) | CLI & diagnostics virtual-cable completeness (`done`) | Z | T24 | S |
+| [T26](done/T26-package-managers-and-cable-bootstrap.md) | WinGet & Scoop package manifests + virtual-cable setup script (`done`) | Z | T24 | M |
+| [T27](done/T27-audio-demo-and-traction-kit.md) | Reproducible audio A/B showcase & launch/SignPath playbook (`done`) | Z | T24 | M |
+| [T28](done/T28-docs-release-sync.md) | Documentation, changelog, security & roadmap release sync (`done`, D-032..D-041) | Z | T24 | S |
 
 ## Dependency graph
 
@@ -55,7 +59,7 @@ Lane A                    T05 ──► T06 ┐
 Lane B   T01 ──► T02 ─────────────────────────► T13 ──► T14          (T13 also needs T05)
 Lane C   T01 ──► T03 ──► T12 ──► T15 ──► T16 ──► T17                 (T12 needs T05; T15 needs T10; T16 needs T11)
 Lane D   T03 + T04 ──► T18 ──► T19 ──► T20                           (T19 needs T10; T20 needs T11)
-Lane Z   T14 + T17 + T20 ──► T21 ──► T22 ──► T23
+Lane Z   T14 + T17 + T20 ──► T21 ──► T22 ──► T23 ──► T24 ──► T25 ‖ T26 ‖ T27 ‖ T28
 ```
 
 ## Maximum parallelism by stage
@@ -82,4 +86,4 @@ Lane Z   T14 + T17 + T20 ──► T21 ──► T22 ──► T23
 | **M1 — Sounds good offline** | T09–T11 done; fixtures processed through each archetype measurably improve. |
 | **M2 — Sounds good live** | T13–T17 done; Discord hears processed audio with no virtual cable, controlled from tray/CLI. |
 | **M3 — Usable by anyone** | T18–T21 done; full UI flow headless-verified and running live. |
-| **M4 — v0.1 released** | T22–T23 done; installer on GitHub Releases. |
+| **M4 — v0.1 released** | T22–T28 done; installer, package manifests, provenance, and docs synced for GitHub Releases. |

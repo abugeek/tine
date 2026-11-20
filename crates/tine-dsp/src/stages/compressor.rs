@@ -1,10 +1,11 @@
 //! Stage 5: Program-dependent vocal compressor.
 
-use tine_protocol::params::DspParams;
+use tine_protocol::params::{DspParams, FilterType};
 
 use super::Stage;
 use crate::meter::StageMeters;
-use crate::primitives::db::{DB_FLOOR, LIN_FLOOR};
+use crate::primitives::biquad::{Biquad, Coeffs};
+use crate::primitives::db::{DB_FLOOR, fast_db_to_lin, fast_sq_to_db};
 use crate::primitives::envelope::{PeakEnvelope, RmsEnvelope};
 use crate::primitives::math::exp_f64;
 use crate::primitives::smoother::Smoother;
@@ -12,56 +13,8 @@ use crate::primitives::smoother::Smoother;
 /// `10^(-6/20)` for `peak - 6 dB` comparison in linear domain.
 const MINUS_6_DB_LIN: f32 = 0.501_187_2;
 
-/// Fast `20 * log10(abs)` in `f32` for positive finite `abs` (no floor check).
-#[inline]
-fn fast_lin_to_db_raw(abs: f32) -> f32 {
-    let bits = abs.to_bits();
-    let exp = (bits >> 23).cast_signed() - 127;
-    let m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
-    let u = (m - 1.0) / (m + 1.0);
-    let u2 = u * u;
-    let ln_m = 2.0 * u * (1.0 + u2 * (1.0 / 3.0 + u2 * (1.0 / 5.0 + u2 * (1.0 / 7.0))));
-    // 20 / ln(10) = 8.68589, 20 * log10(2) = 6.0206
-    (exp as f32) * 6.020_6 + ln_m * 8.685_89
-}
-
-/// Fast `10 * log10(sq)` in `f32` for squared linear amplitude, floored at [`DB_FLOOR`].
-#[inline]
-fn fast_sq_to_db(sq: f32) -> f32 {
-    const LIN_FLOOR_SQ: f32 = LIN_FLOOR * LIN_FLOOR;
-    if !sq.is_finite() || sq <= LIN_FLOOR_SQ {
-        return DB_FLOOR;
-    }
-    0.5 * fast_lin_to_db_raw(sq)
-}
-
-/// Fast `lin_to_db` in `f32` (max error < 0.001 dB over `[-120, +48] dB`).
-#[cfg(test)]
-#[inline]
-fn fast_lin_to_db(lin: f32) -> f32 {
-    let abs = lin.abs();
-    if !abs.is_finite() || abs <= LIN_FLOOR {
-        return DB_FLOOR;
-    }
-    fast_lin_to_db_raw(abs)
-}
-
-/// Fast `db_to_lin` in `f32` (max error < 0.001 dB over `[-120, +48] dB`).
-#[inline]
-fn fast_db_to_lin(db: f32) -> f32 {
-    if !db.is_finite() || db < DB_FLOOR {
-        return 0.0;
-    }
-    let db = db.min(48.0);
-    // x = db * ln(10) / 20
-    let x = db * 0.115_129_255;
-    let k_f = x * core::f32::consts::LOG2_E;
-    let k = (k_f + if k_f >= 0.0 { 0.5 } else { -0.5 }) as i32;
-    let r = x - (k as f32) * core::f32::consts::LN_2;
-    let poly = 1.0 + r * (1.0 + r * (0.5 + r * (1.0 / 6.0 + r * (1.0 / 24.0 + r * (1.0 / 120.0)))));
-    let scale = f32::from_bits(((k + 127) as u32) << 23);
-    poly * scale
-}
+/// Sidechain high-pass cutoff (Hz) so sub-bass desk thumps and plosives do not pump vocal compression.
+const SC_HPF_HZ: f64 = 110.0;
 
 /// RMS detector window in milliseconds.
 const RMS_WINDOW_MS: f32 = 10.0;
@@ -92,6 +45,7 @@ fn time_coeff(ms: f32, fs: f32) -> f32 {
 #[derive(Debug)]
 pub struct CompressorStage {
     fs: f32,
+    sc_hpf: Biquad,
     rms_env: RmsEnvelope,
     peak_env: PeakEnvelope,
     makeup_smoother: Smoother,
@@ -116,6 +70,13 @@ impl CompressorStage {
     pub fn new() -> Self {
         let mut stage = Self {
             fs: 48_000.0,
+            sc_hpf: Biquad::new(Coeffs::design(
+                FilterType::HighPass,
+                48_000.0,
+                SC_HPF_HZ,
+                core::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+            )),
             rms_env: RmsEnvelope::new(RMS_WINDOW_MS, 48_000.0),
             peak_env: PeakEnvelope::new(0.0, PEAK_RELEASE_MS, 48_000.0),
             makeup_smoother: Smoother::new(10.0, 48_000.0, 0.0),
@@ -205,6 +166,13 @@ impl Stage for CompressorStage {
     fn prepare(&mut self, fs: f32, _max_block: usize) {
         let fs = if fs.is_finite() && fs > 0.0 { fs } else { 48_000.0 };
         self.fs = fs;
+        self.sc_hpf.set_coeffs(Coeffs::design(
+            FilterType::HighPass,
+            f64::from(fs),
+            SC_HPF_HZ,
+            core::f64::consts::FRAC_1_SQRT_2,
+            0.0,
+        ));
         self.rms_env.set_times(RMS_WINDOW_MS, RMS_WINDOW_MS, fs);
         self.peak_env.set_times(0.0, PEAK_RELEASE_MS, fs);
         self.makeup_smoother.set_time_constant(10.0, fs);
@@ -215,6 +183,7 @@ impl Stage for CompressorStage {
     }
 
     fn reset(&mut self) {
+        self.sc_hpf.reset();
         self.rms_env.reset();
         self.peak_env.reset();
         self.makeup_smoother.snap_to(0.0);
@@ -277,8 +246,9 @@ impl Stage for CompressorStage {
 
         for sample in buf.iter_mut() {
             let x = *sample;
-            let mean_sq = self.rms_env.process_sample_sq(x);
-            let peak = self.peak_env.process_sample(x);
+            let sc = self.sc_hpf.process_sample(x);
+            let mean_sq = self.rms_env.process_sample_sq(sc);
+            let peak = self.peak_env.process_sample(sc);
 
             let peak_scaled = peak * MINUS_6_DB_LIN;
             let det_sq = mean_sq.max(peak_scaled * peak_scaled);
@@ -338,26 +308,21 @@ impl Stage for CompressorStage {
 mod tests {
     use super::*;
     use crate::primitives::db::{db_to_lin, lin_to_db};
+    use crate::primitives::math::{sin_cos_f64, sqrt_f64};
 
-    #[test]
-    fn fast_db_approximations_within_0_01_db() {
-        for i in -1190..=240 {
-            let db = (i as f32) * 0.1;
-            let exact_lin = db_to_lin(db);
-            let fast_lin = fast_db_to_lin(db);
-            let err_db = (lin_to_db(fast_lin) - db).abs();
-            assert!(
-                err_db < 0.01,
-                "fast_db_to_lin({db}): err={err_db} dB (exact={exact_lin}, fast={fast_lin})"
-            );
-
-            let exact_db = lin_to_db(exact_lin);
-            let fast_db = fast_lin_to_db(exact_lin);
-            assert!(
-                (fast_db - exact_db).abs() < 0.01,
-                "fast_lin_to_db({exact_lin}): exact={exact_db}, fast={fast_db}"
-            );
+    fn sine_2k_into(out: &mut alloc::vec::Vec<f32>, rms_amp: f32, len: usize, start_idx: usize, fs: f32) {
+        let peak = f64::from(rms_amp) * core::f64::consts::SQRT_2;
+        let w = 2.0 * core::f64::consts::PI * 2_000.0 / f64::from(fs);
+        for k in 0..len {
+            let (s, _) = sin_cos_f64(w * ((start_idx + k) as f64));
+            out.push((peak * s) as f32);
         }
+    }
+
+    fn cycle_rms_db(chunk: &[f32]) -> f32 {
+        let sum_sq: f64 = chunk.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+        let rms = sqrt_f64(sum_sq / (chunk.len().max(1) as f64)) as f32;
+        lin_to_db(rms)
     }
 
     #[test]
@@ -383,22 +348,24 @@ mod tests {
         let preroll_len = (0.100 * fs) as usize;
         let high_len = (0.400 * fs) as usize;
         let low_len = (0.600 * fs) as usize;
-        let mut buf = alloc::vec![preroll_amp; preroll_len];
-        buf.extend(core::iter::repeat_n(high_amp, high_len));
-        buf.extend(core::iter::repeat_n(low_amp, low_len));
+        let mut buf = alloc::vec::Vec::with_capacity(preroll_len + high_len + low_len);
+        sine_2k_into(&mut buf, preroll_amp, preroll_len, 0, fs);
+        sine_2k_into(&mut buf, high_amp, high_len, preroll_len, fs);
+        sine_2k_into(&mut buf, low_amp, low_len, preroll_len + high_len, fs);
 
         let mut meters = StageMeters::default();
         for chunk in buf.chunks_mut(480) {
             comp.process(chunk, &p, &mut meters);
         }
 
+        let cycle: usize = 24; // 1 full cycle of 2 kHz @ 48 kHz = 0.5 ms
         let high_slice = &buf[preroll_len..preroll_len + high_len];
         let target_attack_gr = 4.5 * (1.0 - (-1.0f32).exp());
-        let attack_samples = high_slice
-            .iter()
-            .position(|&y| (-24.0 - lin_to_db(y.abs())) >= target_attack_gr)
+        let attack_cycle = high_slice
+            .chunks_exact(cycle)
+            .position(|c| (-24.0 - cycle_rms_db(c)) >= target_attack_gr)
             .expect("attack never reached 63.2%");
-        let measured_attack_ms = (attack_samples as f32) * 1000.0 / fs;
+        let measured_attack_ms = ((attack_cycle * cycle + cycle / 2) as f32) * 1000.0 / fs;
         assert!(
             (measured_attack_ms - p.comp_attack_ms).abs() <= p.comp_attack_ms * 0.10,
             "attack_ms={measured_attack_ms:.2}, expected={} ±10%",
@@ -407,11 +374,11 @@ mod tests {
 
         let low_slice = &buf[preroll_len + high_len..];
         let target_release_gr = 4.5 * (-1.0f32).exp();
-        let release_samples = low_slice
-            .iter()
-            .position(|&y| (-60.0 - lin_to_db(y.abs())) <= target_release_gr)
+        let release_cycle = low_slice
+            .chunks_exact(cycle)
+            .position(|c| (-60.0 - cycle_rms_db(c)) <= target_release_gr)
             .expect("release never reached 36.8%");
-        let measured_release_ms = (release_samples as f32) * 1000.0 / fs;
+        let measured_release_ms = ((release_cycle * cycle + cycle / 2) as f32) * 1000.0 / fs;
         assert!(
             (measured_release_ms - p.comp_release_ms).abs() <= p.comp_release_ms * 0.10,
             "release_ms={measured_release_ms:.2}, expected={} ±10%",
@@ -434,25 +401,27 @@ mod tests {
 
         let high_amp = db_to_lin(-24.0);
         let low_amp = db_to_lin(-60.0);
+        let cycle: usize = 24;
 
         let measure_release = |hold_ms: f32| -> f32 {
             let mut comp = CompressorStage::new();
             comp.prepare(fs, 480);
             let hold_len = (hold_ms * 1e-3 * fs) as usize;
             let low_len = (0.400 * fs) as usize;
-            let mut buf = alloc::vec![high_amp; hold_len];
-            buf.extend(core::iter::repeat_n(low_amp, low_len));
+            let mut buf = alloc::vec::Vec::with_capacity(hold_len + low_len);
+            sine_2k_into(&mut buf, high_amp, hold_len, 0, fs);
+            sine_2k_into(&mut buf, low_amp, low_len, hold_len, fs);
             let mut meters = StageMeters::default();
             for chunk in buf.chunks_mut(480) {
                 comp.process(chunk, &p, &mut meters);
             }
-            let start_gr = -60.0 - lin_to_db(buf[hold_len].abs());
+            let start_gr = -60.0 - cycle_rms_db(&buf[hold_len..hold_len + cycle]);
             let target_gr = start_gr * (-1.0f32).exp();
-            let samples = buf[hold_len..]
-                .iter()
-                .position(|&y| (-60.0 - lin_to_db(y.abs())) <= target_gr)
+            let c_idx = buf[hold_len..]
+                .chunks_exact(cycle)
+                .position(|c| (-60.0 - cycle_rms_db(c)) <= target_gr)
                 .expect("release did not reach 1/e");
-            (samples as f32) * 1000.0 / fs
+            ((c_idx * cycle) as f32) * 1000.0 / fs
         };
 
         let short_rel = measure_release(10.0);
@@ -460,6 +429,49 @@ mod tests {
         assert!(
             short_rel < long_rel * 0.75,
             "expected shorter release for 10 ms transient: short={short_rel:.1} ms, long={long_rel:.1} ms"
+        );
+    }
+
+    #[test]
+    fn sidechain_hpf_ignores_sub_bass_plosive_pumping() {
+        let fs = 48_000.0;
+        let mut p = DspParams::DEFAULT;
+        p.comp_enabled = true;
+        p.comp_thresh_db = -20.0;
+        p.comp_ratio = 4.0;
+        p.comp_knee_db = 0.0;
+        p.comp_attack_ms = 2.0;
+        p.comp_release_ms = 100.0;
+        p.comp_auto_makeup = false;
+        p.comp_makeup_db = 0.0;
+
+        let measure_gr = |freq_hz: f64| -> f32 {
+            let mut comp = CompressorStage::new();
+            comp.prepare(fs, 480);
+            let peak = f64::from(db_to_lin(-10.0)) * core::f64::consts::SQRT_2;
+            let w = 2.0 * core::f64::consts::PI * freq_hz / f64::from(fs);
+            let mut buf: alloc::vec::Vec<f32> = (0..24_000i32)
+                .map(|i| {
+                    let (s, _) = sin_cos_f64(w * f64::from(i));
+                    (peak * s) as f32
+                })
+                .collect();
+            let mut meters = StageMeters::default();
+            for chunk in buf.chunks_mut(480) {
+                comp.process(chunk, &p, &mut meters);
+            }
+            meters.comp_gain_reduction_db
+        };
+
+        let gr_45hz = measure_gr(45.0);
+        let gr_1khz = measure_gr(1_000.0);
+        assert!(
+            gr_45hz < 1.5,
+            "expected 45 Hz plosive band to trigger < 1.5 dB GR, got {gr_45hz:.2} dB"
+        );
+        assert!(
+            gr_1khz > 6.5,
+            "expected 1 kHz vocal band to trigger > 6.5 dB GR, got {gr_1khz:.2} dB"
         );
     }
 }

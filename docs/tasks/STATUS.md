@@ -25,4 +25,8 @@
 | T21 | End-to-end integration in `tine.exe` | Z — Integration & ship | done | `task/T21-end-to-end` | #24 | t21 (GLM) |
 | T22 | QA: soak, perf, mic/app matrix, listening tests | Z — Integration & ship | done | `task/T22-qa` | #31 | t22 (GLM) |
 | T23 | Installer, signing, release, OSS docs | Z — Integration & ship | done | `task/T23-packaging-release` | #29 | t23 (GLM) |
-| T24 | Competitor benchmark follow-up: stream health, idle cost, memory | Z — Integration & ship | review | (working tree) | — | Claude |
+| T24 | Competitor benchmark follow-up: stream health, idle cost, memory | Z — Integration & ship | done | `task/T24-perf-competitor-followup` | #32 | Claude |
+| T25 | CLI & diagnostics virtual-cable completeness | Z — Integration & ship | done | `—` | — | cli-cable-ux |
+| T26 | WinGet & Scoop package manifests + virtual-cable setup script | Z — Integration & ship | done | `—` | — | pkg-distribution |
+| T27 | Reproducible audio A/B showcase & launch/SignPath playbook | Z — Integration & ship | done | `—` | — | demo-showcase |
+| T28 | Documentation, changelog, security & roadmap release sync (D-032..D-041) | Z — Integration & ship | done | `—` | — | docs-sync |

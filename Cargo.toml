@@ -19,6 +19,7 @@ tine-ui       = { path = "crates/tine-ui" }
 
 # Audio
 cpal        = { version = "0.18.2", default-features = false, features = ["realtime"] }
+dfn3_rs     = { version = "0.1.2", default-features = false, features = ["embedded-model"] }
 nnnoiseless = { version = "0.5.2", default-features = false }
 rubato      = { version = "5.1.0", default-features = false }
 realfft     = { version = "3.5.1", default-features = false }

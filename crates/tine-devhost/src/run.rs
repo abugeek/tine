@@ -230,13 +230,40 @@ pub fn cmd_run(args: &RunArgs) -> Result<(), String> {
 }
 
 fn finalize_recorders(raw: Option<WavRecorder>, proc_rec: Option<WavRecorder>) -> Result<(), String> {
-    if let Some(rec) = raw {
-        let n = rec.finish()?;
-        println!("Saved raw WAV ({n} samples).");
-    }
-    if let Some(rec) = proc_rec {
-        let n = rec.finish()?;
-        println!("Saved processed WAV ({n} samples).");
+    let raw_stats = match raw {
+        Some(rec) => {
+            let st = rec.finish()?;
+            println!(
+                "Saved raw WAV ({} samples, RMS {:+.1} dBFS, peak {:+.1} dBFS).",
+                st.samples, st.rms_db, st.peak_db
+            );
+            Some(st)
+        }
+        None => None,
+    };
+    let proc_stats = match proc_rec {
+        Some(rec) => {
+            let st = rec.finish()?;
+            println!(
+                "Saved processed WAV ({} samples, RMS {:+.1} dBFS, peak {:+.1} dBFS).",
+                st.samples, st.rms_db, st.peak_db
+            );
+            Some(st)
+        }
+        None => None,
+    };
+    if let (Some(r), Some(p)) = (raw_stats, proc_stats) {
+        let r_crest = r.peak_db - r.rms_db;
+        let p_crest = p.peak_db - p.rms_db;
+        println!(
+            "A/B Summary: raw (RMS {:+.1} dBFS, peak {:+.1} dBFS, crest {r_crest:.1} dB) -> tine (RMS {:+.1} dBFS, peak {:+.1} dBFS, crest {p_crest:.1} dB | delta RMS {:+.1} dB, peak {:+.1} dB)",
+            r.rms_db,
+            r.peak_db,
+            p.rms_db,
+            p.peak_db,
+            p.rms_db - r.rms_db,
+            p.peak_db - r.peak_db,
+        );
     }
     Ok(())
 }

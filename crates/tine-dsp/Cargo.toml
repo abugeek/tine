@@ -9,11 +9,13 @@ repository.workspace = true
 [features]
 default = []
 std = ["tine-protocol/std"]
+deepfilter = ["std", "dep:dfn3_rs"]
 
 [dependencies]
 tine-protocol.workspace = true
 nnnoiseless.workspace = true
 rubato.workspace = true
+dfn3_rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 assert_no_alloc.workspace = true

@@ -32,14 +32,17 @@ use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
-use tine_dsp::calibrator::{AutoCalibrator, CHANGED_PARAM_COUNT};
+use tine_dsp::calibrator::{AutoCalibrator, CHANGED_PARAM_COUNT, LIVE_COUNTDOWN_S, LIVE_NOISE_S, LIVE_VOICE_S};
 use tine_dsp::presets::PresetDef;
 use tine_protocol::params::DspParams;
 use tine_protocol::presets::{MacroPositions, PinSet};
 use tine_protocol::sync::SpscRing;
 use tine_protocol::telemetry::flags;
 
-pub use tine_dsp::calibrator::{CalFailure, CalPhase, CalProgress, CalibrationReport};
+pub use tine_dsp::calibrator::{
+    CalFailure, CalPhase, CalProgress, CalibrationReport, RoomQuality, VoiceDiagnosis, VoiceDynamics, VoiceStyle,
+    VoiceTone, diagnose_voice, recommend_macros,
+};
 
 use crate::audio_io::{AudioIoError, DeviceRef, open_capture};
 use crate::controller::{Command, ControllerHandle};
@@ -95,6 +98,11 @@ pub trait Calibrator: Send {
         pins: PinSet,
         current: &DspParams,
     ) -> Result<CalibrationReport, CalFailure>;
+
+    /// Returns the captured voice-phase mono samples (`fs` Hz), when available.
+    fn captured_voice(&self) -> &[f32] {
+        &[]
+    }
 }
 
 /// Constructs a [`Calibrator`] once the capture's actual sample rate is known
@@ -105,13 +113,30 @@ pub trait CalibratorFactory: Send + Sync {
 }
 
 /// The production factory: builds the real
-/// [`tine_dsp::calibrator::AutoCalibrator`] for the negotiated capture rate.
+/// [`tine_dsp::calibrator::AutoCalibrator`] for the negotiated capture rate (9 s durations).
 #[derive(Debug, Default)]
 pub struct AutoCalibratorFactory;
 
 impl CalibratorFactory for AutoCalibratorFactory {
     fn make(&self, fs: f32) -> Box<dyn Calibrator> {
         Box::new(AutoCalibrator::new(fs))
+    }
+}
+
+/// Interactive live factory: uses human-paced durations ([`LIVE_COUNTDOWN_S`],
+/// [`LIVE_NOISE_S`], [`LIVE_VOICE_S`]) so real users have time to read instructions
+/// and take a breath before speaking.
+#[derive(Debug, Default)]
+pub struct LiveAutoCalibratorFactory;
+
+impl CalibratorFactory for LiveAutoCalibratorFactory {
+    fn make(&self, fs: f32) -> Box<dyn Calibrator> {
+        Box::new(AutoCalibrator::with_durations(
+            fs,
+            LIVE_COUNTDOWN_S,
+            LIVE_NOISE_S,
+            LIVE_VOICE_S,
+        ))
     }
 }
 
@@ -128,6 +153,10 @@ impl Calibrator for AutoCalibrator {
         current: &DspParams,
     ) -> Result<CalibrationReport, CalFailure> {
         AutoCalibrator::finish(self, preset, macros, pins, current)
+    }
+
+    fn captured_voice(&self) -> &[f32] {
+        AutoCalibrator::captured_voice(self)
     }
 }
 

@@ -70,11 +70,10 @@ Write-Host "== wix build $MsiName =="
     -o $Msi
 if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
 
-# Fast gate on the binary budget (release gate; the main 20 MB budget debate
-# is tracked as R-21 and stays with the T01-owned ci.yml gate).
+# Fast gate on the binary budget (release gate; D-037 covers the embedded DeepFilterNet3 weights).
 $ExeSize = (Get-Item $Exe).Length
 "{0} {1} = {2:N0} bytes ({3:N2} MiB)" -f 'tine.exe', $Version, $ExeSize, ($ExeSize / 1MB) | Write-Host
-if ($ExeSize -ge 24MB) { throw "tine.exe is $ExeSize bytes, over the 24 MiB release gate (R-21)" }
+if ($ExeSize -ge 30MB) { throw "tine.exe is $ExeSize bytes, over the 30 MiB release gate (D-037)" }
 
 $Sums = Join-Path $OutDir 'SHA256SUMS.txt'
 $hash = (Get-FileHash -Algorithm SHA256 $Msi).Hash

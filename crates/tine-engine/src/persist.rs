@@ -170,16 +170,30 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
     // SAFETY: `file` is a valid handle owned solely by this call.
     let _ = unsafe { windows::Win32::Foundation::CloseHandle(file) };
 
-    // SAFETY: both paths are valid NUL-terminated strings.
-    let replaced = unsafe {
-        ReplaceFileW(
-            PCWSTR(wide(path).as_ptr()),
-            PCWSTR(wide(&temp).as_ptr()),
-            PCWSTR::null(),
-            REPLACE_FILE_FLAGS(0),
-            None,
-            None,
-        )
+    // Transient Windows sharing/AV/indexer locks on the target are retried
+    // briefly so concurrent readers (`load_settings`/`load_profile`) never
+    // force a fallback to defaults.
+    let mut attempts = 0u8;
+    let replaced = loop {
+        // SAFETY: both paths are valid NUL-terminated strings.
+        let res = unsafe {
+            ReplaceFileW(
+                PCWSTR(wide(path).as_ptr()),
+                PCWSTR(wide(&temp).as_ptr()),
+                PCWSTR::null(),
+                REPLACE_FILE_FLAGS(0),
+                None,
+                None,
+            )
+        };
+        match res {
+            Ok(()) => break Ok(()),
+            Err(ref source) if attempts < 10 && is_transient_win32(source) => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(source) => break Err(source),
+        }
     };
     match replaced {
         Ok(()) => Ok(()),
@@ -187,6 +201,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
             // `ReplaceFileW` never creates the target; fall back to a plain
             // rename when the target does not exist yet (first write).
             if !is_win32(&source, ERROR_FILE_NOT_FOUND) && !is_win32(&source, ERROR_PATH_NOT_FOUND) {
+                let _ = std::fs::remove_file(&temp);
                 return Err(PersistError::Win {
                     context: "ReplaceFileW",
                     path: path.to_path_buf(),
@@ -201,6 +216,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
                     MOVEFILE_REPLACE_EXISTING,
                 )
             } {
+                let _ = std::fs::remove_file(&temp);
                 return Err(PersistError::Win {
                     context: "MoveFileExW",
                     path: path.to_path_buf(),
@@ -217,18 +233,43 @@ fn is_win32(source: &windows::core::Error, code: windows::Win32::Foundation::WIN
     source.code() == windows::core::HRESULT::from_win32(code.0)
 }
 
+/// Returns `true` for transient Win32 sharing/lock errors during atomic swap.
+fn is_transient_win32(source: &windows::core::Error) -> bool {
+    use windows::Win32::Foundation::WIN32_ERROR;
+    [5, 32, 33, 1176, 1177]
+        .into_iter()
+        .any(|code| is_win32(source, WIN32_ERROR(code)))
+}
+
 /// Reads a file's raw bytes; `Ok(None)` when it does not exist. Parse errors
 /// are deliberately *not* raised here: an unparseable file is "corrupt", and
 /// corruption is handled by the caller (backup + defaults).
 fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, PersistError> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(PersistError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
+    for attempt in 0..15u8 {
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // During `ReplaceFileW` / `MoveFileExW` on Windows there can be a
+                // brief transient window where an existing file is swapped. Only
+                // treat missing as final after checking once if we aren't mid-swap.
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                return Ok(None);
+            }
+            Err(e) if attempt < 14 && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(source) => {
+                return Err(PersistError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
     }
+    Ok(None)
 }
 
 /// Parses raw bytes as JSON.
@@ -358,4 +399,46 @@ pub fn load_profile(endpoint_id: &str, paths: &EnginePaths) -> Loaded<EndpointPr
     let default = EndpointProfile::new(endpoint_id, tine_protocol::presets::Archetype::default());
     let path = paths.profile_file(endpoint_id);
     load_with(&path, default, EndpointProfile::validate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_read_write_never_returns_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = EnginePaths::from_roots(
+            dir.path().join("app"),
+            dir.path().join("prog"),
+            dir.path().join("local"),
+        );
+        let settings = AppSettings {
+            onboarding_completed: true,
+            ..AppSettings::default()
+        };
+        save_settings(&settings, &paths).expect("initial save");
+
+        let paths_writer = paths.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..50u32 {
+                let s = AppSettings {
+                    onboarding_completed: true,
+                    pro_drawer_open: i % 2 == 0,
+                    ..AppSettings::default()
+                };
+                save_settings(&s, &paths_writer).expect("concurrent save_settings");
+            }
+        });
+
+        for _ in 0..50 {
+            let loaded = load_settings(&paths);
+            assert!(
+                matches!(loaded, Loaded::Fresh(_)),
+                "expected Fresh under concurrent ReplaceFileW, got {loaded:?}"
+            );
+            assert!(loaded.into_value().onboarding_completed);
+        }
+        writer.join().expect("writer join");
+    }
 }

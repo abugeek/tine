@@ -72,7 +72,7 @@ Reviewers (human or agent) check against this file.
 | Cold start to tray | < 150 ms | T17 |
 | Window open (closed → first frame) | < 250 ms | T03 |
 | Added latency | ≤ 21.6 ms at 48 kHz (1036 samples, per D-019) | T09 |
-| `tine.exe` size ✓ | < 24 MiB (release, no `tooling`; R-23) | CI + release artifact check |
+| `tine.exe` size ✓ | < 30 MiB (release, no `tooling`; D-037) | CI + release artifact check |
 
 ## 8. Testing pyramid
 

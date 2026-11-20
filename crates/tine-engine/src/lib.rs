@@ -8,6 +8,7 @@ pub mod audio_io;
 pub mod autotune;
 pub mod controller;
 pub mod listeners;
+pub mod mic_check;
 pub mod model;
 pub mod monitor;
 pub mod paths;

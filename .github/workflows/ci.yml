@@ -129,7 +129,7 @@ jobs:
           $appExe = Get-Item "target/release/tine.exe"
           Write-Host ("tine.exe size: {0:N0} bytes ({1:N2} MiB)" -f $appExe.Length, ($appExe.Length / 1MB))
 
-          if ($appExe.Length -ge 24MB) {
-            Write-Error "tine.exe exceeds 24 MB budget!"
+          if ($appExe.Length -ge 30MB) {
+            Write-Error "tine.exe exceeds 30 MB budget!"
             exit 1
           }

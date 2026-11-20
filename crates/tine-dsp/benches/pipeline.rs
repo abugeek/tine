@@ -14,7 +14,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use tine_dsp::{DspPipeline, NoMeters, NoTap};
-use tine_protocol::params::{DspParams, FilterType};
+use tine_protocol::params::{DenoiseEngine, DspParams, FilterType};
 
 /// Deterministic 480-sample speech-ish block (pink-ish noise + 220 Hz hum).
 fn bench_input(seed: u64, amp: f32) -> Vec<f32> {
@@ -46,7 +46,11 @@ fn full_chain_params() -> DspParams {
 }
 
 fn bench_pipeline_rate(c: &mut Criterion, name: &str, sample_rate: f32) {
-    let mut pipe = DspPipeline::new(sample_rate, 480);
+    bench_pipeline_engine(c, name, sample_rate, DenoiseEngine::Rnnoise);
+}
+
+fn bench_pipeline_engine(c: &mut Criterion, name: &str, sample_rate: f32, engine: DenoiseEngine) {
+    let mut pipe = DspPipeline::for_engine(sample_rate, 480, engine);
     let params = full_chain_params();
 
     let orig = bench_input(0x1234_5678_9abc_def0, 0.25);
@@ -165,6 +169,15 @@ fn bench_stage_breakdown(c: &mut Criterion) {
 fn pipeline_benches(c: &mut Criterion) {
     bench_pipeline_rate(c, "pipeline_480_48khz", 48_000.0);
     bench_pipeline_rate(c, "pipeline_480_44_1khz", 44_100.0);
+    #[cfg(feature = "deepfilter")]
+    bench_pipeline_engine(
+        c,
+        "pipeline_480_48khz_deepfilter",
+        48_000.0,
+        DenoiseEngine::DeepFilterNet3,
+    );
+    bench_pipeline_engine(c, "pipeline_480_48khz_low_latency", 48_000.0, DenoiseEngine::Off);
+    bench_pipeline_engine(c, "pipeline_480_48khz_low_latency", 48_000.0, DenoiseEngine::Off);
     bench_stage_breakdown(c);
 }
 

@@ -38,7 +38,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use tine_protocol::params::{DspParams, FilterType, ParamId};
-use tine_protocol::presets::{Calibration, CalibrationOverrides, MacroPositions, PinSet};
+use tine_protocol::presets::{Archetype, Calibration, CalibrationOverrides, MacroPositions, PinSet};
 
 use crate::macros::MacroMapper;
 use crate::meter::StageMeters;
@@ -49,12 +49,18 @@ use crate::primitives::math::log10_f64;
 use crate::rt::DenormalGuard;
 use crate::stages::{CleanupStage, CompressorStage, DeesserStage, EqStage, InputStage, LimiterStage, Stage};
 
-/// Countdown phase: seconds of audio discarded before measurement starts.
+/// Countdown phase: seconds of audio discarded before measurement starts (default/fixture).
 pub const COUNTDOWN_S: f32 = 1.0;
-/// Room-noise measurement phase duration in seconds.
+/// Room-noise measurement phase duration in seconds (default/fixture).
 pub const NOISE_S: f32 = 3.0;
-/// Voice measurement phase duration in seconds.
+/// Voice measurement phase duration in seconds (default/fixture).
 pub const VOICE_S: f32 = 5.0;
+/// Human-paced countdown duration for interactive live Auto-Tune (seconds).
+pub const LIVE_COUNTDOWN_S: f32 = 2.5;
+/// Human-paced room-noise measurement duration for interactive live Auto-Tune (seconds).
+pub const LIVE_NOISE_S: f32 = 3.5;
+/// Human-paced voice measurement duration for interactive live Auto-Tune (seconds).
+pub const LIVE_VOICE_S: f32 = 6.0;
 /// RMS window for the noise measurement (median of windows, click-robust).
 pub const NOISE_WINDOW_MS: f32 = 100.0;
 /// Voiced-detection window for the voice measurement.
@@ -235,7 +241,10 @@ struct Measurements {
 /// offline computation and may allocate.
 pub struct AutoCalibrator {
     fs: f32,
-    /// 9 s mono capture: `[0..countdown_len)` discarded,
+    countdown_s: f32,
+    noise_s: f32,
+    voice_s: f32,
+    /// Mono capture: `[0..countdown_len)` discarded,
     /// then the noise region, then the voice region.
     buf: Box<[f32]>,
     countdown_len: usize,
@@ -261,24 +270,41 @@ pub struct AutoCalibrator {
 }
 
 impl AutoCalibrator {
-    /// Creates a calibrator for `fs` Hz, preallocating the 9 s mono capture
-    /// buffer. Non-finite or out-of-range rates fall back to 48 kHz; the rate
+    /// Creates a calibrator for `fs` Hz with the standard 9 s durations
+    /// (`1 s` countdown, `3 s` noise, `5 s` voice), preallocating the capture buffer.
+    /// Non-finite or out-of-range rates fall back to 48 kHz; the rate
     /// is clamped to `8 kHz..=192 kHz` so the buffer stays bounded.
     #[must_use]
     pub fn new(fs: f32) -> Self {
+        Self::with_durations(fs, COUNTDOWN_S, NOISE_S, VOICE_S)
+    }
+
+    /// Creates a calibrator for `fs` Hz with explicit phase durations in seconds
+    /// (each clamped to `0.5..=15.0` s; non-finite values fall back to the defaults).
+    #[must_use]
+    pub fn with_durations(fs: f32, countdown_s: f32, noise_s: f32, voice_s: f32) -> Self {
         let fs = if (FS_MIN_HZ..=FS_MAX_HZ).contains(&fs) {
             fs
         } else {
             48_000.0
         };
-        let countdown_len = (f64::from(COUNTDOWN_S) * f64::from(fs)).round() as usize;
-        let noise_len = (f64::from(NOISE_S) * f64::from(fs)).round() as usize;
-        let voice_len = (f64::from(VOICE_S) * f64::from(fs)).round() as usize;
+        let clamp_dur = |v: f32, fallback: f32| {
+            if v.is_finite() { v.clamp(0.5, 15.0) } else { fallback }
+        };
+        let countdown_s = clamp_dur(countdown_s, COUNTDOWN_S);
+        let noise_s = clamp_dur(noise_s, NOISE_S);
+        let voice_s = clamp_dur(voice_s, VOICE_S);
+        let countdown_len = (f64::from(countdown_s) * f64::from(fs)).round() as usize;
+        let noise_len = (f64::from(noise_s) * f64::from(fs)).round() as usize;
+        let voice_len = (f64::from(voice_s) * f64::from(fs)).round() as usize;
         let noise_win_samples = (f64::from(NOISE_WINDOW_MS) * 1e-3 * f64::from(fs)).round() as usize;
         let voice_win_samples = (f64::from(VOICE_WINDOW_MS) * 1e-3 * f64::from(fs)).round() as usize;
         let voice_win_ms = VOICE_WINDOW_MS.round() as u32;
         Self {
             fs,
+            countdown_s,
+            noise_s,
+            voice_s,
             buf: vec![0.0; countdown_len + noise_len + voice_len].into_boxed_slice(),
             countdown_len,
             noise_len,
@@ -300,6 +326,50 @@ impl AutoCalibrator {
             win_filled: 0,
             voiced_ms: 0,
             live_level_db: DB_FLOOR,
+        }
+    }
+
+    /// Configured countdown duration in seconds.
+    #[must_use]
+    pub const fn countdown_secs(&self) -> f32 {
+        self.countdown_s
+    }
+
+    /// Configured room-noise measurement duration in seconds.
+    #[must_use]
+    pub const fn noise_secs(&self) -> f32 {
+        self.noise_s
+    }
+
+    /// Configured voice measurement duration in seconds.
+    #[must_use]
+    pub const fn voice_secs(&self) -> f32 {
+        self.voice_s
+    }
+
+    /// Returns the captured voice-phase mono samples (`[0..voice_filled)` of the voice region).
+    #[must_use]
+    pub fn captured_voice(&self) -> &[f32] {
+        let start = self.countdown_len + self.noise_len;
+        let end = start + self.voice_filled;
+        self.buf.get(start..end).unwrap_or(&[])
+    }
+
+    /// Configured capture sample rate in Hz.
+    #[must_use]
+    pub const fn sample_rate(&self) -> f32 {
+        self.fs
+    }
+
+    /// Remaining time in the active capture phase, in seconds.
+    #[must_use]
+    pub fn phase_remaining_secs(&self) -> f32 {
+        let p = self.progress().phase_progress.clamp(0.0, 1.0);
+        match self.phase {
+            CalPhase::Countdown => self.countdown_s * (1.0 - p),
+            CalPhase::Noise => self.noise_s * (1.0 - p),
+            CalPhase::Voice => self.voice_s * (1.0 - p),
+            CalPhase::Analyzing | CalPhase::Done | CalPhase::Failed => 0.0,
         }
     }
 
@@ -563,6 +633,9 @@ impl AutoCalibrator {
         let mut e_low = 0.0f64;
         let mut e_mid = 0.0f64;
         let mut segment_sum_sq = 0.0f64;
+        let mut seen_speech = false;
+        let mut active_sum_sq = 0.0f64;
+        let mut active_samples = 0u64;
 
         for win in region.chunks_exact(win_samples) {
             let mut raw = 0.0f64;
@@ -584,6 +657,7 @@ impl AutoCalibrator {
             segment_sum_sq += raw;
             let win_rms_db = lin_to_db(((raw / (win.len() as f64)).sqrt()) as f32);
             if win_rms_db > thr_db {
+                seen_speech = true;
                 voiced_ms += self.voice_win_ms;
                 voiced_samples += win.len() as u64;
                 voiced_sum_sq += raw;
@@ -593,6 +667,10 @@ impl AutoCalibrator {
                 e_low += low;
                 e_mid += mid;
             }
+            if seen_speech {
+                active_sum_sq += raw;
+                active_samples += win.len() as u64;
+            }
         }
 
         let speech_rms_db = if voiced_samples > 0 {
@@ -601,7 +679,10 @@ impl AutoCalibrator {
             DB_FLOOR
         };
         let crest_db = (lin_to_db(voiced_peak) - speech_rms_db).clamp(0.0, 40.0);
-        let segment_rms_db = if region.is_empty() {
+        let min_voiced_samples = (u64::from(MIN_VOICED_MS) * (win_samples as u64)) / u64::from(self.voice_win_ms);
+        let segment_rms_db = if voiced_samples >= min_voiced_samples && active_samples > 0 {
+            lin_to_db(((active_sum_sq / (active_samples as f64)).sqrt()) as f32)
+        } else if region.is_empty() {
             DB_FLOOR
         } else {
             lin_to_db(((segment_sum_sq / (region.len() as f64)).sqrt()) as f32)
@@ -904,6 +985,263 @@ fn rms_db(samples: &[f32]) -> f32 {
     lin_to_db(((sum_sq / (samples.len() as f64)).sqrt()) as f32)
 }
 
+// ---------------------------------------------------------------------------
+// Voice diagnosis & style-driven Golden Line macro recommendations
+// ---------------------------------------------------------------------------
+
+/// User preference target applied alongside acoustic calibration when Auto-Tune finishes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VoiceStyle {
+    /// Balances warmth, clarity, noise cleanup, and dynamic leveling for the measured room/voice.
+    #[default]
+    AutoBalanced,
+    /// Richer low end, stronger presence/de-essing, and tighter broadcast leveling.
+    Broadcast,
+    /// Transparent, airy vocal tone with lighter cleanup and gentle leveling.
+    Natural,
+    /// Cuts room mud and boosts vocal clarity for noisy rooms or headsets.
+    Crisp,
+    /// Leaves the user's current Golden Line macro node positions untouched.
+    KeepCurrent,
+}
+
+impl VoiceStyle {
+    /// All selectable voice styles in UI order.
+    pub const ALL: [Self; 5] = [
+        Self::AutoBalanced,
+        Self::Broadcast,
+        Self::Natural,
+        Self::Crisp,
+        Self::KeepCurrent,
+    ];
+
+    /// Short pill label for the Auto-Tune results card.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AutoBalanced => "Balanced",
+            Self::Broadcast => "Broadcast",
+            Self::Natural => "Natural",
+            Self::Crisp => "Crisp",
+            Self::KeepCurrent => "Keep Macros",
+        }
+    }
+
+    /// Machine identifier for pipe/CLI serialization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoBalanced => "auto",
+            Self::Broadcast => "broadcast",
+            Self::Natural => "natural",
+            Self::Crisp => "crisp",
+            Self::KeepCurrent => "keep",
+        }
+    }
+
+    /// Parses a machine identifier into a [`VoiceStyle`].
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "auto" | "balanced" | "auto_balanced" => Some(Self::AutoBalanced),
+            "broadcast" | "warm" | "mature" => Some(Self::Broadcast),
+            "natural" | "open" => Some(Self::Natural),
+            "crisp" | "clear" | "thin" => Some(Self::Crisp),
+            "keep" | "keep_current" | "keep_macros" => Some(Self::KeepCurrent),
+            _ => None,
+        }
+    }
+
+    /// Brief description of what this style emphasizes.
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::AutoBalanced => "Balances warmth, clarity & leveling for your measured room and voice.",
+            Self::Broadcast => "Warm, mature radio tone — deeper bass, clean low-mids & dense leveling.",
+            Self::Natural => "Open & transparent — gentle cleanup and light dynamic leveling.",
+            Self::Crisp => "Leaner bass & maximum speech clarity — cuts through busy game mixes.",
+            Self::KeepCurrent => "Applies calibrated gain, gate & compressor; keeps macro knobs as-is.",
+        }
+    }
+}
+
+/// Measured ambient room cleanliness classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomQuality {
+    /// Low post-gain noise floor (`<= -50 dBFS`) and clean SNR (`>= 28 dB`).
+    StudioQuiet,
+    /// Typical home/office room.
+    Normal,
+    /// Elevated background noise (`> -42 dBFS`) or tight SNR (`< 20 dB`).
+    Noisy,
+}
+
+/// Measured low-to-mid vocal tonal balance from `tilt_db`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceTone {
+    /// Strong low-end energy (`tilt_db > 6.5 dB`, e.g., close-mic proximity effect).
+    WarmClose,
+    /// Even low-to-mid balance.
+    Balanced,
+    /// Light low-end energy (`tilt_db < 0.5 dB`, e.g., distant or thin mic).
+    ThinDistant,
+}
+
+/// Measured vocal dynamic range classification from `crest_db`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceDynamics {
+    /// Tight, steady speech (`crest_db < 10.0 dB`).
+    Controlled,
+    /// Typical conversational speech dynamics.
+    Natural,
+    /// Wide dynamic peaks (`crest_db > 13.5 dB`) that benefit from stronger leveling.
+    Expressive,
+}
+
+/// Human-interpretable acoustic diagnosis derived from a [`Calibration`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoiceDiagnosis {
+    /// Ambient room noise classification.
+    pub room: RoomQuality,
+    /// Spectral tilt classification.
+    pub tone: VoiceTone,
+    /// Dynamic crest-factor classification.
+    pub dynamics: VoiceDynamics,
+    /// Measured speech-to-noise ratio (`speech_rms_db - noise_rms_db`, dB).
+    pub snr_db: f32,
+}
+
+/// Classifies the room, tonal balance, and vocal dynamics from a [`Calibration`].
+#[must_use]
+pub fn diagnose_voice(cal: &Calibration) -> VoiceDiagnosis {
+    let snr_db = (cal.speech_rms_db - cal.noise_rms_db).clamp(0.0, 90.0);
+    let post_gain_noise = cal.noise_rms_db + cal.derived.input_gain_db;
+    let room = if post_gain_noise <= -50.0 && snr_db >= 28.0 {
+        RoomQuality::StudioQuiet
+    } else if post_gain_noise > -42.0 || snr_db < 20.0 {
+        RoomQuality::Noisy
+    } else {
+        RoomQuality::Normal
+    };
+    let tone = if cal.tilt_db > 6.5 {
+        VoiceTone::WarmClose
+    } else if cal.tilt_db < 0.5 {
+        VoiceTone::ThinDistant
+    } else {
+        VoiceTone::Balanced
+    };
+    let dynamics = if cal.crest_db > 13.5 {
+        VoiceDynamics::Expressive
+    } else if cal.crest_db < 10.0 {
+        VoiceDynamics::Controlled
+    } else {
+        VoiceDynamics::Natural
+    };
+    VoiceDiagnosis {
+        room,
+        tone,
+        dynamics,
+        snr_db,
+    }
+}
+
+/// Recommends Golden Line [`MacroPositions`] using the measured [`Calibration`],
+/// the selected [`Archetype`], and the user's preferred [`VoiceStyle`].
+#[must_use]
+pub fn recommend_macros(
+    cal: &Calibration,
+    archetype: Archetype,
+    style: VoiceStyle,
+    current_macros: MacroPositions,
+) -> MacroPositions {
+    if style == VoiceStyle::KeepCurrent {
+        return current_macros.clamped();
+    }
+
+    let diag = diagnose_voice(cal);
+    let post_gain_noise = cal.noise_rms_db + cal.derived.input_gain_db;
+    let clicky_noise = (cal.noise_peak_db - cal.noise_rms_db) > 12.0;
+
+    // Continuous noise-floor & SNR curve for Purity (0.38 in studio quiet -> 0.68 in noisy rooms).
+    let noise_t = ((post_gain_noise - (-56.0)) / 18.0).clamp(0.0, 1.0);
+    let snr_t = ((30.0 - diag.snr_db) / 16.0).clamp(0.0, 1.0);
+    let mut purity: f32 = 0.38 + 0.18 * noise_t + 0.10 * snr_t;
+    if clicky_noise {
+        purity += 0.05;
+    }
+
+    // Continuous spectral-tilt compensation for Body:
+    // Thin/distant voices (tilt < 0 dB) get strong fundamental warmth + mud cleanup (~0.68..0.74);
+    // Boomy/close voices (tilt > 6.5 dB) pull back low-shelf (< 0.45) to prevent proximity mud.
+    let tilt_norm = ((cal.tilt_db - (-2.0)) / 12.0).clamp(0.0, 1.0);
+    let mut body: f32 = 0.70 - 0.32 * tilt_norm;
+
+    // Continuous spectral-tilt compensation for Presence & De-Esser:
+    // Dark/boomy voices (high tilt_db) need stronger 4.2 kHz clarity, 8.5 kHz air, and de-essing.
+    let mut presence: f32 = 0.56 + 0.18 * ((cal.tilt_db - (-2.0)) / 10.0).clamp(0.0, 1.0);
+
+    // Archetype capsule compensation.
+    match archetype {
+        Archetype::Dynamic => {
+            presence += 0.02;
+        }
+        Archetype::Condenser => {
+            presence -= 0.03;
+            if diag.tone == VoiceTone::ThinDistant {
+                body += 0.03;
+            }
+        }
+        Archetype::Headset => {
+            body += 0.04;
+            purity += 0.02;
+        }
+        Archetype::Laptop => {
+            purity += 0.05;
+            presence += 0.03;
+        }
+    }
+
+    // Continuous crest-factor curve for Leveler, tempered slightly in very noisy rooms
+    // so heavy compression makeup doesn't pump ambient room noise.
+    let crest_adj = ((cal.crest_db - 10.0) / 9.0).clamp(-0.10, 0.16);
+    let noise_penalty = if diag.room == RoomQuality::Noisy { 0.02 } else { 0.0 };
+    let mut leveler = 0.62 + crest_adj - noise_penalty;
+
+    match style {
+        VoiceStyle::AutoBalanced | VoiceStyle::KeepCurrent => {}
+        VoiceStyle::Broadcast => {
+            // Deep, warm, mature broadcast tone: strong 110 Hz chest warmth + deep 320 Hz
+            // mud cut, crisp presence with active de-essing, and dense radio leveling.
+            purity = (purity + 0.05).max(0.48);
+            body = (body + 0.28).clamp(0.76, 0.92);
+            presence = (presence + 0.10).clamp(0.70, 0.84);
+            leveler = (leveler + 0.18).clamp(0.78, 0.92);
+        }
+        VoiceStyle::Natural => {
+            // Open, transparent, uncolored vocal texture with gentle leveling.
+            purity = (purity - 0.08).clamp(0.32, 0.52);
+            body = (body - 0.06).clamp(0.42, 0.52);
+            presence = 0.44;
+            leveler = 0.36;
+        }
+        VoiceStyle::Crisp => {
+            // Lean, thinner low-end and high consonant clarity to cut through busy mixes.
+            purity = (purity + 0.12).max(0.60);
+            body = (body - 0.30).clamp(0.14, 0.26);
+            presence = (presence + 0.18).clamp(0.82, 0.95);
+            leveler = (leveler + 0.08).clamp(0.66, 0.84);
+        }
+    }
+
+    MacroPositions {
+        purity,
+        body,
+        presence,
+        leveler,
+    }
+    .clamped()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,5 +1288,157 @@ mod tests {
         assert_eq!(pct(10, 100), 10.0);
         assert_eq!(pct(10, 0), 0.0);
         assert_eq!(rms_db(&[]), DB_FLOOR);
+    }
+
+    #[test]
+    fn custom_durations_track_remaining_secs_and_skip_initial_reaction_pause() {
+        let fs = 48_000.0f32;
+        let mut cal = AutoCalibrator::with_durations(fs, LIVE_COUNTDOWN_S, LIVE_NOISE_S, LIVE_VOICE_S);
+        assert_eq!(cal.countdown_secs(), LIVE_COUNTDOWN_S);
+        assert_eq!(cal.noise_secs(), LIVE_NOISE_S);
+        assert_eq!(cal.voice_secs(), LIVE_VOICE_S);
+        assert!((cal.phase_remaining_secs() - LIVE_COUNTDOWN_S).abs() < 1e-4);
+
+        // Push 2.5 s countdown + 3.5 s noise at -55 dBFS + 2.0 s reaction silence + 4.0 s speech at -25 dBFS.
+        let n_cd = (LIVE_COUNTDOWN_S * fs) as usize;
+        let n_noise = (LIVE_NOISE_S * fs) as usize;
+        let n_pause = (2.0 * fs) as usize;
+        let n_speak = (4.0 * fs) as usize;
+
+        let p = cal.push(&vec![0.0; n_cd]);
+        assert_eq!(p.phase, CalPhase::Noise);
+        assert!((cal.phase_remaining_secs() - LIVE_NOISE_S).abs() < 1e-4);
+
+        let noise_amp = db_to_lin(-55.0);
+        let noise: Vec<f32> = (0..n_noise)
+            .map(|i| if i % 2 == 0 { noise_amp } else { -noise_amp })
+            .collect();
+        let p = cal.push(&noise);
+        assert_eq!(p.phase, CalPhase::Voice);
+
+        let pause: Vec<f32> = (0..n_pause)
+            .map(|i| if i % 2 == 0 { noise_amp } else { -noise_amp })
+            .collect();
+        let _ = cal.push(&pause);
+
+        let speech_amp = db_to_lin(-25.0) * core::f32::consts::SQRT_2;
+        let speak: Vec<f32> = (0..n_speak)
+            .map(|i| speech_amp * (2.0 * core::f32::consts::PI * 220.0 * (i as f32) / fs).sin())
+            .collect();
+        let p = cal.push(&speak);
+        assert_eq!(p.phase, CalPhase::Analyzing);
+
+        let preset = crate::presets::builtin(Archetype::Dynamic);
+        let report = cal
+            .finish(preset, preset.macro_defaults, PinSet::EMPTY, &DspParams::DEFAULT)
+            .expect("live paced calibration with initial pause must succeed");
+        assert!(report.calibration.speech_rms_db > -27.0);
+    }
+
+    #[test]
+    fn diagnose_and_recommend_macros_adapt_to_voice_and_style() {
+        let cal_boomy_noisy = Calibration {
+            noise_rms_db: -42.0,
+            noise_peak_db: -25.0,
+            speech_rms_db: -22.0,
+            crest_db: 15.0,
+            tilt_db: 8.5,
+            derived: CalibrationOverrides {
+                input_gain_db: 2.0,
+                gate_threshold_db: -32.0,
+                denoise_mix: 0.85,
+                comp_thresh_db: -18.0,
+                comp_makeup_db: 3.0,
+            },
+        };
+        let diag = diagnose_voice(&cal_boomy_noisy);
+        assert_eq!(diag.room, RoomQuality::Noisy);
+        assert_eq!(diag.tone, VoiceTone::WarmClose);
+        assert_eq!(diag.dynamics, VoiceDynamics::Expressive);
+
+        let current = MacroPositions {
+            purity: 0.4,
+            body: 0.5,
+            presence: 0.5,
+            leveler: 0.5,
+        };
+        assert_eq!(
+            recommend_macros(&cal_boomy_noisy, Archetype::Dynamic, VoiceStyle::KeepCurrent, current),
+            current
+        );
+        let balanced = recommend_macros(&cal_boomy_noisy, Archetype::Dynamic, VoiceStyle::AutoBalanced, current);
+        assert!(balanced.purity > 0.55);
+        assert!(balanced.body < 0.5, "boomy voice lowers body");
+        assert!(balanced.presence > 0.65, "boomy dark voice raises presence & de-esser");
+        assert!(balanced.leveler > 0.65, "expressive crest raises leveler");
+
+        let crisp = recommend_macros(&cal_boomy_noisy, Archetype::Dynamic, VoiceStyle::Crisp, current);
+        assert!(crisp.presence >= balanced.presence);
+        assert!(crisp.purity >= balanced.purity);
+    }
+
+    #[test]
+    fn voice_style_names_round_trip() {
+        for style in VoiceStyle::ALL {
+            assert_eq!(VoiceStyle::from_name(style.as_str()), Some(style));
+        }
+        assert_eq!(VoiceStyle::from_name("warm"), Some(VoiceStyle::Broadcast));
+        assert_eq!(VoiceStyle::from_name("mature"), Some(VoiceStyle::Broadcast));
+        assert_eq!(VoiceStyle::from_name("thin"), Some(VoiceStyle::Crisp));
+        assert_eq!(VoiceStyle::from_name("clear"), Some(VoiceStyle::Crisp));
+        assert_eq!(VoiceStyle::from_name("balanced"), Some(VoiceStyle::AutoBalanced));
+        assert_eq!(VoiceStyle::from_name("open"), Some(VoiceStyle::Natural));
+        assert_eq!(VoiceStyle::from_name("unknown_style"), None);
+    }
+
+    #[test]
+    fn style_presets_have_distinct_tonal_separation() {
+        let cal = Calibration {
+            noise_rms_db: -50.0,
+            noise_peak_db: -44.0,
+            speech_rms_db: -22.0,
+            crest_db: 12.0,
+            tilt_db: 3.0,
+            derived: CalibrationOverrides {
+                input_gain_db: 4.0,
+                gate_threshold_db: -44.0,
+                denoise_mix: 0.50,
+                comp_thresh_db: -16.0,
+                comp_makeup_db: 2.0,
+            },
+        };
+        let current = MacroPositions::default();
+        let broadcast = recommend_macros(&cal, Archetype::Dynamic, VoiceStyle::Broadcast, current);
+        let crisp = recommend_macros(&cal, Archetype::Dynamic, VoiceStyle::Crisp, current);
+        let natural = recommend_macros(&cal, Archetype::Dynamic, VoiceStyle::Natural, current);
+
+        assert!(broadcast.body >= 0.76);
+        assert!(broadcast.leveler >= 0.78);
+        assert!(crisp.body <= 0.26);
+        assert!(crisp.presence >= 0.82);
+        assert!(natural.leveler <= 0.40);
+        assert!(broadcast.body - crisp.body >= 0.50);
+    }
+
+    #[test]
+    fn captured_voice_exposes_only_voice_phase_samples() {
+        let fs = 48_000.0f32;
+        let mut cal = AutoCalibrator::with_durations(fs, 0.5, 0.5, 0.5);
+        assert!((cal.sample_rate() - fs).abs() < f32::EPSILON);
+        assert_eq!(cal.captured_voice(), []);
+
+        let half_sec = (0.5 * fs) as usize;
+        // Countdown (marker 1.0) + Noise (marker 2.0)
+        cal.push(&vec![0.1; half_sec]);
+        cal.push(&vec![0.2; half_sec]);
+        assert_eq!(cal.captured_voice(), []);
+
+        // Partial voice samples (marker 0.35)
+        let voice_chunk_len = 1024;
+        let voice_chunk: Vec<f32> = (0..voice_chunk_len).map(|i| (i as f32) * 1e-4).collect();
+        cal.push(&voice_chunk);
+        let captured = cal.captured_voice();
+        assert_eq!(captured.len(), voice_chunk_len);
+        assert_eq!(captured, voice_chunk.as_slice());
     }
 }

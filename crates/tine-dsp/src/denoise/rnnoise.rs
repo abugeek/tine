@@ -75,8 +75,16 @@ impl Denoiser for RnnoiseDenoiser {
     }
 
     fn reset(&mut self) {
-        self.state = DenoiseState::new();
         self.scratch_in.fill(0.0);
+        // Drain 4 silent frames through `DenoiseState` instead of `DenoiseState::new()`
+        // so wakeups from zero-mix idle and RT resets remain 100% allocation-free.
+        let mut sink = [0.0_f32; RNNOISE_FRAME];
+        for _ in 0..4 {
+            let _ = self.state.process_frame(&mut sink, &self.scratch_in);
+        }
+        if sink.iter().any(|s| !s.is_finite()) {
+            self.state = DenoiseState::new();
+        }
     }
 
     fn warm_up(&mut self) {

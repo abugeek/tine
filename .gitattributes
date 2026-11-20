@@ -2,3 +2,5 @@
 *.wav binary
 *.flac binary
 *.png binary
+*.ico binary
+*.rgba binary

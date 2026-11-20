@@ -623,6 +623,22 @@ impl<const N: usize> SpscRing<N> {
         to_read
     }
 
+    /// Returns the number of samples currently buffered for reading.
+    #[inline]
+    #[must_use]
+    pub fn used(&self) -> usize {
+        let head = self.head.0.load(Ordering::Acquire);
+        let tail = self.tail.0.load(Ordering::Acquire);
+        head.wrapping_sub(tail) as usize
+    }
+
+    /// Returns the number of free sample slots available for writing.
+    #[inline]
+    #[must_use]
+    pub fn free(&self) -> usize {
+        N.saturating_sub(self.used())
+    }
+
     /// Returns the cumulative number of dropped samples due to ring full conditions.
     #[inline]
     #[must_use]

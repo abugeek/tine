@@ -2,7 +2,11 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use assert_no_alloc::AllocDisabler;
+use tine_dsp::denoise::Denoiser;
 use tine_dsp::{DspPipeline, MeterSink, NoMeters, NoTap};
 use tine_protocol::params::DspParams;
 use tine_protocol::telemetry::AudioTelemetryFrame;
@@ -290,4 +294,330 @@ fn zero_allocations_in_stage1_and_stage2_at_48k_and_44_1k() {
             }
         }
     }
+}
+
+struct MockVadDenoiser {
+    vad_bits: Arc<AtomicU32>,
+}
+
+impl Denoiser for MockVadDenoiser {
+    fn frame_len(&self) -> usize {
+        480
+    }
+
+    fn native_rate(&self) -> u32 {
+        48_000
+    }
+
+    fn algo_latency(&self) -> u32 {
+        0
+    }
+
+    fn process_frame(&mut self, inp: &[f32], out: &mut [f32]) -> f32 {
+        out.copy_from_slice(inp);
+        f32::from_bits(self.vad_bits.load(Ordering::Relaxed))
+    }
+
+    fn reset(&mut self) {}
+}
+
+struct MinGateMeter {
+    min_gate_gr_db: f32,
+}
+
+impl Default for MinGateMeter {
+    fn default() -> Self {
+        Self { min_gate_gr_db: 0.0 }
+    }
+}
+
+impl MeterSink for MinGateMeter {
+    fn publish(&mut self, f: &AudioTelemetryFrame) {
+        if f.gate_attenuation_db < self.min_gate_gr_db {
+            self.min_gate_gr_db = f.gate_attenuation_db;
+        }
+    }
+}
+
+#[test]
+fn vad_low_raises_gate_threshold_for_non_speech_transients() {
+    let fs = 48_000.0;
+    let vad_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let mut pipe = DspPipeline::with_denoiser(
+        fs,
+        512,
+        Box::new(MockVadDenoiser {
+            vad_bits: Arc::clone(&vad_bits),
+        }),
+    );
+
+    let mut params = neutral_params();
+    params.denoise_mix = 1.0;
+    params.gate_enabled = true;
+    params.gate_threshold_db = -40.0;
+    params.gate_hysteresis_db = 4.0;
+    params.gate_ratio = 4.0;
+    params.gate_attack_ms = 1.0;
+    params.gate_release_ms = 30.0;
+
+    // -38 dBFS RMS 1 kHz sine: 2 dB above -40 dBFS gate threshold.
+    let rms_amp = 10.0f32.powf(-38.0 / 20.0) * std::f32::consts::SQRT_2;
+
+    // 1. Speech (VAD = 1.0): gate stays open.
+    vad_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+    let mut speech_buf = common::sine(1_000.0, fs, 48_000, rms_amp);
+    let mut meters_speech = MinGateMeter::default();
+    rt! {
+        for chunk in speech_buf.chunks_mut(480) {
+            pipe.process(chunk, &params, &mut meters_speech, &mut NoTap);
+        }
+    }
+    let speech_out_rms = common::rms_db(&speech_buf[24_000..]);
+    assert!(
+        (speech_out_rms - (-38.0)).abs() <= 0.6,
+        "speech should stay unattenuated: got {speech_out_rms:.2} dBFS"
+    );
+
+    // 2. Non-speech (VAD = 0.0): gate threshold rises up to +10 dB -> -38 dBFS is attenuated.
+    vad_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+    let mut click_buf = common::sine(1_000.0, fs, 48_000, rms_amp);
+    let mut meters_click = MinGateMeter::default();
+    rt! {
+        for chunk in click_buf.chunks_mut(480) {
+            pipe.process(chunk, &params, &mut meters_click, &mut NoTap);
+        }
+    }
+    let click_out_rms = common::rms_db(&click_buf[36_000..]);
+    assert!(
+        click_out_rms < -50.0,
+        "low-VAD non-speech signal should be attenuated by VAD boost: got {click_out_rms:.2} dBFS"
+    );
+    assert!(
+        meters_click.min_gate_gr_db <= -12.0,
+        "expected strong gate attenuation on low VAD (got {})",
+        meters_click.min_gate_gr_db
+    );
+}
+
+#[test]
+fn vad_boost_inactive_when_denoise_mix_zero() {
+    let fs = 48_000.0;
+    let vad_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let mut pipe = DspPipeline::with_denoiser(
+        fs,
+        512,
+        Box::new(MockVadDenoiser {
+            vad_bits: Arc::clone(&vad_bits),
+        }),
+    );
+
+    let mut params = neutral_params();
+    params.denoise_mix = 0.0;
+    params.gate_enabled = true;
+    params.gate_threshold_db = -40.0;
+    params.gate_hysteresis_db = 4.0;
+    params.gate_ratio = 4.0;
+    params.gate_attack_ms = 1.0;
+    params.gate_release_ms = 30.0;
+
+    let rms_amp = 10.0f32.powf(-38.0 / 20.0) * std::f32::consts::SQRT_2;
+    let mut buf = common::sine(1_000.0, fs, 48_000, rms_amp);
+    let mut meters = MinGateMeter::default();
+    rt! {
+        for chunk in buf.chunks_mut(480) {
+            pipe.process(chunk, &params, &mut meters, &mut NoTap);
+        }
+    }
+    let out_rms = common::rms_db(&buf[24_000..]);
+    assert!(
+        (out_rms - (-38.0)).abs() <= 0.6,
+        "denoise_mix=0.0 must disable VAD gate boost: got {out_rms:.2} dBFS"
+    );
+}
+
+#[cfg(feature = "deepfilter")]
+#[test]
+fn deepfilter_reduces_noise_and_clicks_alloc_free() {
+    use tine_protocol::params::DenoiseEngine;
+
+    let fs = 48_000.0;
+    let mut pipe = DspPipeline::for_engine(fs, 512, DenoiseEngine::DeepFilterNet3);
+    assert_eq!(pipe.latency_samples(), 480 + 1440 + 76);
+
+    let mut params = neutral_params();
+    params.denoise_mix = 1.0;
+
+    // 1. Steady background white/pink-ish noise at ~-30 dBFS must attenuate strongly after settle.
+    let mut noise = common::pink_noise(48_000, 0.08, 0xCAFE_BABE);
+    let in_noise_rms = common::rms_db(&noise[24_000..]);
+    rt! {
+        for chunk in noise.chunks_mut(480) {
+            pipe.process(chunk, &params, &mut NoMeters, &mut NoTap);
+        }
+    }
+    assert!(noise.iter().all(|s| s.is_finite()), "DeepFilter output must be finite");
+    let out_noise_rms = common::rms_db(&noise[32_000..]);
+    assert!(
+        in_noise_rms - out_noise_rms >= 10.0,
+        "DeepFilterNet3 must attenuate steady noise by >= 10 dB: in={in_noise_rms:.2}, out={out_noise_rms:.2}"
+    );
+
+    // Reset must also be allocation-free.
+    rt! {
+        pipe.reset();
+    }
+}
+
+#[test]
+fn bypass_denoiser_gives_76_sample_low_latency_and_runs_expander() {
+    use tine_protocol::params::DenoiseEngine;
+
+    let fs = 48_000.0;
+    let mut pipe = DspPipeline::for_engine(fs, 512, DenoiseEngine::Off);
+    assert_eq!(pipe.latency_samples(), 76);
+
+    // 1. Impulse alignment test (all stages except limiter neutral).
+    let mut neutral = neutral_params();
+    neutral.gate_enabled = false;
+    let mut impulse = vec![0.0_f32; 960];
+    impulse[100] = 0.2;
+    rt! {
+        for chunk in impulse.chunks_mut(480) {
+            pipe.process(chunk, &neutral, &mut NoMeters, &mut NoTap);
+        }
+    }
+    let peak_idx = impulse
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map_or(0, |(i, _)| i);
+    assert_eq!(peak_idx, 100 + 76, "Off mode must delay by exactly 76 limiter samples");
+
+    // 2. Stage 2b downward expander must still run in low-latency Off mode.
+    pipe.reset();
+    let mut gated = neutral_params();
+    gated.gate_enabled = true;
+    gated.gate_threshold_db = -30.0;
+    gated.gate_hysteresis_db = 4.0;
+    gated.gate_ratio = 4.0;
+    gated.gate_attack_ms = 1.0;
+    gated.gate_release_ms = 20.0;
+
+    let quiet_amp = 10.0f32.powf(-45.0 / 20.0) * std::f32::consts::SQRT_2;
+    let mut quiet = common::sine(1_000.0, fs, 48_000, quiet_amp);
+    let mut meters = MinGateMeter::default();
+    rt! {
+        for chunk in quiet.chunks_mut(480) {
+            pipe.process(chunk, &gated, &mut meters, &mut NoTap);
+        }
+    }
+    let out_rms = common::rms_db(&quiet[36_000..]);
+    assert!(
+        out_rms < -55.0,
+        "expander must attenuate in Off mode: got {out_rms:.2} dBFS"
+    );
+}
+
+struct CountingDenoiser {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    resets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Denoiser for CountingDenoiser {
+    fn frame_len(&self) -> usize {
+        480
+    }
+    fn native_rate(&self) -> u32 {
+        48_000
+    }
+    fn algo_latency(&self) -> u32 {
+        480
+    }
+    fn process_frame(&mut self, inp: &[f32], out: &mut [f32]) -> f32 {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let n = inp.len().min(out.len());
+        out[..n].copy_from_slice(&inp[..n]);
+        1.0
+    }
+    fn reset(&mut self) {
+        self.resets.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn zero_mix_skips_neural_inference_calls_and_preserves_latency() {
+    use std::sync::atomic::AtomicUsize;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resets = Arc::new(AtomicUsize::new(0));
+    let mut pipe = DspPipeline::with_denoiser(
+        48_000.0,
+        512,
+        Box::new(CountingDenoiser {
+            calls: Arc::clone(&calls),
+            resets: Arc::clone(&resets),
+        }),
+    );
+    let expected_latency = pipe.latency_samples();
+    assert_eq!(expected_latency, 960 + 76);
+
+    let mut params = neutral_params();
+    params.denoise_mix = 0.0;
+
+    // Warm through the 10 ms smoother until mix settles at <= 1e-6 (~140 ms).
+    let mut block = [0.05_f32; 480];
+    rt! {
+        for _ in 0..30 {
+            block.fill(0.05);
+            pipe.process(&mut block, &params, &mut NoMeters, &mut NoTap);
+        }
+    }
+    let settled_calls = calls.load(Ordering::Relaxed);
+
+    // Next 50 frames at mix=0.0 must invoke zero denoiser frames.
+    rt! {
+        for _ in 0..50 {
+            block.fill(0.05);
+            pipe.process(&mut block, &params, &mut NoMeters, &mut NoTap);
+        }
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        settled_calls,
+        "denoise_mix=0.0 must skip neural inference calls once smoother settles"
+    );
+
+    // Impulse alignment must still equal `expected_latency` while idle.
+    let mut impulse = vec![0.0_f32; 2_400];
+    impulse[200] = 0.2;
+    rt! {
+        for chunk in impulse.chunks_mut(480) {
+            pipe.process(chunk, &params, &mut NoMeters, &mut NoTap);
+        }
+    }
+    let peak_idx = impulse
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map_or(0, |(i, _)| i);
+    assert_eq!(peak_idx, 200 + expected_latency as usize);
+
+    // Raising mix > 0 resets cleanly and resumes inference calls.
+    let resets_before_wake = resets.load(Ordering::Relaxed);
+    params.denoise_mix = 0.5;
+    rt! {
+        for _ in 0..5 {
+            block.fill(0.05);
+            pipe.process(&mut block, &params, &mut NoMeters, &mut NoTap);
+            assert!(block.iter().all(|s| s.is_finite()));
+        }
+    }
+    assert!(
+        resets.load(Ordering::Relaxed) > resets_before_wake,
+        "waking denoiser must reset history"
+    );
+    assert!(
+        calls.load(Ordering::Relaxed) > settled_calls,
+        "waking denoiser must resume inference"
+    );
 }

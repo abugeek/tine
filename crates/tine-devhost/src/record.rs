@@ -9,15 +9,27 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
+use tine_dsp::primitives::db::lin_to_db;
 use tine_protocol::sync::SpscRing;
 
 /// Ring capacity for WAV recording tap (must be a power of two).
 pub const RECORD_RING_CAP: usize = 32_768;
 
+/// Summary metrics collected while writing a WAV recording.
+#[derive(Clone, Copy, Debug)]
+pub struct WavStats {
+    /// Total mono samples written.
+    pub samples: u64,
+    /// Peak amplitude in dBFS.
+    pub peak_db: f32,
+    /// Integrated RMS level in dBFS.
+    pub rms_db: f32,
+}
+
 /// Background WAV recorder draining mono `f32` samples from an [`SpscRing`].
 pub struct WavRecorder {
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<Result<u64, String>>>,
+    handle: Option<JoinHandle<Result<WavStats, String>>>,
 }
 
 impl WavRecorder {
@@ -45,13 +57,17 @@ impl WavRecorder {
         })
     }
 
-    /// Signals the writer thread to flush remaining samples and finalize the WAV header.
-    pub fn finish(mut self) -> Result<u64, String> {
+    /// Signals the writer thread to flush remaining samples, finalize the WAV header, and return recording stats.
+    pub fn finish(mut self) -> Result<WavStats, String> {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
             handle.join().map_err(|_| "wav writer thread panicked".to_owned())?
         } else {
-            Ok(0)
+            Ok(WavStats {
+                samples: 0,
+                peak_db: -120.0,
+                rms_db: -120.0,
+            })
         }
     }
 }
@@ -60,15 +76,22 @@ fn writer_loop(
     mut writer: WavWriter<BufWriter<File>>,
     ring: &SpscRing<RECORD_RING_CAP>,
     stop: &AtomicBool,
-) -> Result<u64, String> {
+) -> Result<WavStats, String> {
     let mut buf = [0.0f32; 2048];
     let mut total_samples = 0u64;
+    let mut peak = 0.0f32;
+    let mut sum_sq = 0.0f64;
 
     loop {
         let n = ring.pop_slice(&mut buf);
         if n > 0 {
             for &s in buf.iter().take(n) {
                 writer.write_sample(s).map_err(|e| format!("wav write error: {e}"))?;
+                let abs = s.abs();
+                if abs > peak {
+                    peak = abs;
+                }
+                sum_sq += f64::from(s) * f64::from(s);
             }
             total_samples = total_samples.saturating_add(n as u64);
             continue;
@@ -81,5 +104,14 @@ fn writer_loop(
     }
 
     writer.finalize().map_err(|e| format!("wav finalize error: {e}"))?;
-    Ok(total_samples)
+    let rms = if total_samples > 0 {
+        (sum_sq / (total_samples as f64)).sqrt() as f32
+    } else {
+        0.0
+    };
+    Ok(WavStats {
+        samples: total_samples,
+        peak_db: lin_to_db(peak),
+        rms_db: lin_to_db(rms),
+    })
 }

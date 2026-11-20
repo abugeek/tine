@@ -28,14 +28,22 @@
 //! D-007). `tine-ui` itself depends only on `tine-protocol` + `tine-dsp`,
 //! never `tine-engine`.
 
+use std::cell::RefCell;
+
 use rune::{El, Shape, col, el, row, text};
-use tine_dsp::calibrator::{COUNTDOWN_S, CalFailure, CalPhase, CalProgress, CalibrationReport, NOISE_S, VOICE_S};
+use tine_dsp::calibrator::{
+    CHANGED_PARAMS, COUNTDOWN_S, CalFailure, CalPhase, CalProgress, CalibrationReport, NOISE_S, RoomQuality, VOICE_S,
+    VoiceDynamics, VoiceStyle, VoiceTone, diagnose_voice, recommend_macros,
+};
+use tine_dsp::macros::{Macro as DspMacro, MacroMapper};
+use tine_dsp::presets::builtin;
 use tine_protocol::params::ParamId;
 
 use crate::intent::Intent;
-use crate::model::{AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, UiModel};
+use crate::model::{AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, Macro};
 use crate::state::AppState;
 use crate::theme::{TineTheme, radii, spacing, typography};
+use crate::views::canvas::calibration_from_ui;
 
 /// Suggested sentence read during the Speak phase.
 pub const SENTENCE: &str = "The quick brown fox jumps over the lazy dog.";
@@ -44,6 +52,33 @@ pub const SENTENCE: &str = "The quick brown fox jumps over the lazy dog.";
 pub const SILENCE_SECS: f32 = NOISE_S;
 /// Seconds in the measured speech phase (Voice — the real `tine-dsp` constant).
 pub const SPEAK_SECS: f32 = VOICE_S;
+
+thread_local! {
+    /// Tracks the active phase's total duration `(step_tag, last_remaining, total_secs)`
+    /// so live 2.5 s / 3.5 s / 6.0 s runs unwind their countdown ring smoothly from 100 %
+    /// while 9 s test fixtures keep using `COUNTDOWN_S` / `SILENCE_SECS` / `SPEAK_SECS`.
+    static PHASE_TOTAL: RefCell<(u8, f32, f32)> = const { RefCell::new((0, 0.0, 0.0)) };
+}
+
+fn phase_total_secs(step: &AutoTuneStep) -> f32 {
+    let (tag, rem, default_total) = match *step {
+        AutoTuneStep::Prepare { remaining_secs } => (1_u8, remaining_secs, COUNTDOWN_S),
+        AutoTuneStep::Silence { remaining_secs } => (2_u8, remaining_secs, SILENCE_SECS),
+        AutoTuneStep::Speak { remaining_secs } => (3_u8, remaining_secs, SPEAK_SECS),
+        _ => {
+            PHASE_TOTAL.with_borrow_mut(|st| *st = (0, 0.0, 0.0));
+            return 1.0;
+        }
+    };
+    PHASE_TOTAL.with_borrow_mut(|st| {
+        if st.0 != tag || rem > st.1 + 0.05 {
+            st.0 = tag;
+            st.2 = rem.max(default_total);
+        }
+        st.1 = rem;
+        st.2.max(0.1)
+    })
+}
 
 /// Narrow adapter: one `CalProgress` push → the wizard's whole view model.
 ///
@@ -167,6 +202,7 @@ pub fn failure_remedy(f: CalFailureUi) -> &'static str {
 #[must_use]
 pub fn view(s: &AppState, t: TineTheme) -> El {
     let au = &s.model.autotune;
+    let ring_total = phase_total_secs(&au.step);
 
     let mut card = col()
         .key("autotune-card")
@@ -174,9 +210,11 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
         .px(spacing::XL)
         .py(spacing::LG)
         .gap(spacing::MD)
-        .radius(radii::LG)
-        .fill(t.surface_raised)
-        .border(1.0, t.accent)
+        .radius(radii::LG + 4.0)
+        .fill(t.surface)
+        .gradient(t.surface_raised, t.surface)
+        .border(1.0, t.border_strong)
+        .shadow(24.0, 64.0, crate::views::kit::oklcha_black(0.6))
         .transition(
             rune::Transition::scale(0.96)
                 .combined(rune::Transition::opacity())
@@ -186,8 +224,11 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
         // header's Auto-Tune button.
         .focus_return("header/autotune")
         .modal_tx(false, |s: &mut AppState, tx: &mut rune::Tx| {
+            s.ui.autotune_audition_raw = None;
+            s.model.pending_calibration = None;
+            s.resolve_params_optimistic();
             s.emit(Intent::CancelAutoTune);
-            tx.instant();
+            tx.animated();
         })
         .child(step_indicator(au, t));
 
@@ -197,22 +238,31 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
             card = card
                 .child(title("Get ready", t.text))
                 .child(
-                    text("Tine measures your room first, then your voice: 8 seconds total.")
+                    text("Tine measures your room noise first, then your voice.")
                         .font(typography::BODY)
                         .color(t.text_dim),
                 )
-                .child(tip("1", "Stay silent for the first 3 seconds.", t))
-                .child(tip("2", "Then speak normally, at your usual distance.", t))
+                .child(tip("1", "Stay quiet while Tine samples your room floor.", t))
+                .child(tip(
+                    "2",
+                    "Take a breath, then speak normally at your usual mic distance.",
+                    t,
+                ))
                 .child(tip(
                     "3",
                     format!("Read this when prompted: \u{201c}{SENTENCE}\u{201d}"),
                     t,
                 ))
-                .child(countdown_ring(*remaining_secs, COUNTDOWN_S, t))
+                .child(countdown_ring(*remaining_secs, ring_total, t))
                 .child(level_bar(au.level_db, t))
                 .child(cancel_row(t));
         }
         AutoTuneStep::Silence { remaining_secs } => {
+            let (room_hint, room_color) = if au.level_db < -42.0 {
+                ("Room is quiet — capturing ambient noise floor…", t.success)
+            } else {
+                ("Sound detected — stay still and quiet for a clean floor", t.meter_amber)
+            };
             card = card
                 .child(title("Step 1 of 2 — Silence", t.text))
                 .child(
@@ -220,11 +270,27 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
                         .font(typography::BODY)
                         .color(t.text_dim),
                 )
-                .child(countdown_ring(*remaining_secs, SILENCE_SECS, t))
+                .child(
+                    text(room_hint)
+                        .key("autotune/room-hint")
+                        .font(typography::CAPTION)
+                        .color(room_color),
+                )
+                .child(countdown_ring(*remaining_secs, ring_total, t))
                 .child(level_bar(au.level_db, t))
                 .child(cancel_row(t));
         }
         AutoTuneStep::Speak { remaining_secs } => {
+            let (coach, coach_color) = if au.voiced_ms < 200 {
+                ("Take a breath, then read the sentence above aloud.", t.text_dim)
+            } else if au.voiced_ms < 2_000 {
+                ("Listening… keep speaking at your normal volume.", t.accent_text)
+            } else {
+                (
+                    "Voice profile captured — keep reading until the timer finishes.",
+                    t.success,
+                )
+            };
             card = card
                 .child(title("Step 2 of 2 — Speak normally", t.text))
                 .child(
@@ -233,17 +299,15 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
                         .color(t.text),
                 )
                 .child(
-                    text(format!(
-                        "Speak at your usual volume and distance. {:.1} s of speech captured so far.",
-                        au.voiced_ms as f32 / 1000.0
-                    ))
-                    .key("autotune/voiced-so-far")
-                    .role("label")
-                    .label(format!("{} ms of speech captured so far", au.voiced_ms))
-                    .font(typography::CAPTION)
-                    .color(t.text_dim),
+                    text(format!("{coach} ({:.1} s captured)", au.voiced_ms as f32 / 1000.0))
+                        .key("autotune/voiced-so-far")
+                        .role("label")
+                        .label(format!("{} ms of speech captured so far", au.voiced_ms))
+                        .font(typography::CAPTION)
+                        .color(coach_color),
                 )
-                .child(countdown_ring(*remaining_secs, SPEAK_SECS, t))
+                .child(voiced_bar(au.voiced_ms, t))
+                .child(countdown_ring(*remaining_secs, ring_total, t))
                 .child(level_bar(au.level_db, t))
                 .child(cancel_row(t));
         }
@@ -251,7 +315,7 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
             card = card
                 .child(title("Analyzing…", t.text))
                 .child(
-                    text("Simulating the full pipeline over your captured voice.")
+                    text("Simulating the full pipeline and shaping your voice profile.")
                         .font(typography::BODY)
                         .color(t.text_dim),
                 )
@@ -261,21 +325,16 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
         AutoTuneStep::Results => {
             card = card
                 .child(title("Auto-Tune Results", t.text))
-                .child(results_card(&s.model, t))
+                .child(results_card(s, t))
                 .child(keep_pins_checkbox(s.ui.autotune_keep_pins, t))
-                .child(
-                    // TODO(T11): the engine applies `ApplyCalibration { keep_pins }` by
-                    // replaying the calibration report's changes (respecting pins);
-                    // the UI only reports the intent (narrow adapter, see module docs).
-                    button_row(
-                        &[
-                            ("autotune/apply", "Apply", true),
-                            ("autotune/discard", "Discard", false),
-                            ("autotune/retry", "Retry", false),
-                        ],
-                        t,
-                    ),
-                );
+                .child(button_row(
+                    &[
+                        ("autotune/apply", "Apply", true),
+                        ("autotune/discard", "Discard", false),
+                        ("autotune/retry", "Retry", false),
+                    ],
+                    t,
+                ));
         }
         AutoTuneStep::Failed(reason) => {
             card = card
@@ -299,22 +358,22 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
         }
     }
 
-    scrim().child(card)
+    scrim(t).child(card)
 }
 
 /// The scrim behind the modal.
-fn scrim() -> El {
+fn scrim(t: TineTheme) -> El {
     el().key("autotune-scrim")
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
         .center()
-        .fill(rune::color::oklcha(0.0, 0.0, 0.0, 0.65))
+        .fill(t.scrim)
 }
 
 /// "Prepare / Silence / Speak / Analyze / Results" strip; the failed wizard dims it.
 fn step_indicator(au: &AutoTuneUi, t: TineTheme) -> El {
-    const STEPS: [&str; 5] = ["Prepare", "Silence 3 s", "Speak 5 s", "Analyze", "Results"];
+    const STEPS: [&str; 5] = ["Prepare", "Silence", "Speak", "Analyze", "Results"];
     let idx = match &au.step {
         AutoTuneStep::Idle | AutoTuneStep::Prepare { .. } => 0,
         AutoTuneStep::Silence { .. } => 1,
@@ -339,9 +398,17 @@ fn step_indicator(au: &AutoTuneUi, t: TineTheme) -> El {
                 .h(22.0)
                 .center()
                 .radius(radii::PILL)
-                .fill(if reached { t.accent_glow } else { t.surface })
-                .border(1.0, if i == idx { t.accent } else { t.border })
-                .child(text(name.to_owned()).font(typography::CAPTION).color(if reached {
+                .fill(if i == idx {
+                    t.accent_soft
+                } else if reached {
+                    t.surface_raised
+                } else {
+                    t.well
+                })
+                .border(1.0, if i == idx { t.accent_glow } else { t.border })
+                .child(text(name.to_owned()).font(typography::CAPTION).color(if i == idx {
+                    t.accent_text
+                } else if reached {
                     t.text
                 } else {
                     t.text_dim
@@ -368,7 +435,7 @@ fn tip(n: &str, body: impl Into<String>, t: TineTheme) -> El {
         .role("label")
         .label(format!("Tip {n}"))
         .gap(spacing::SM)
-        .child(text(n).font(typography::LABEL).color(t.accent))
+        .child(text(n).font(typography::LABEL).color(t.accent_text))
         .child(text(body).font(typography::BODY).color(t.text_dim))
 }
 
@@ -387,25 +454,47 @@ fn countdown_ring(remaining_secs: f32, total_secs: f32, t: TineTheme) -> El {
     let r = 34.0;
     let remaining = (remaining_secs / total_secs).clamp(0.0, 1.0);
 
-    let track = Shape::new().stroke(ring_points(r, 0.0, 1.0), 5.0, t.border);
-    let arc = Shape::new().stroke(ring_points(r, 1.0 - remaining, 1.0), 5.0, t.accent);
+    let track = Shape::new().stroke(ring_points(r, 0.0, 1.0), 6.0, t.well);
+    let glow = Shape::new().stroke(ring_points(r, 1.0 - remaining, 1.0), 12.0, t.accent_glow);
+    let arc = Shape::new().stroke(ring_points(r, 1.0 - remaining, 1.0), 6.0, t.accent);
 
     el().key("autotune/countdown")
         .role("timer")
         .label(format!("{remaining_secs:.1} s remaining"))
         .w(d)
         .h(d)
-        .center()
-        .child(rune::canvas(track).key("autotune/countdown-track"))
-        .child(rune::canvas(arc).key("autotune/countdown-arc").absolute(0.0, 0.0))
         .child(
-            text(format!("{remaining_secs:.1}s"))
-                .key("autotune/countdown-readout")
-                .role("label")
-                .label(format!("{remaining_secs:.1} seconds remaining"))
-                .absolute(28.0, 34.0)
-                .font(typography::CAPTION)
-                .color(t.text),
+            rune::canvas(track)
+                .key("autotune/countdown-track")
+                .absolute(0.0, 0.0)
+                .size(d, d),
+        )
+        .child(
+            rune::canvas(glow)
+                .key("autotune/countdown-glow")
+                .absolute(0.0, 0.0)
+                .size(d, d),
+        )
+        .child(
+            rune::canvas(arc)
+                .key("autotune/countdown-arc")
+                .absolute(0.0, 0.0)
+                .size(d, d),
+        )
+        .child(
+            row()
+                .key("autotune/countdown-center")
+                .absolute(0.0, 0.0)
+                .size(d, d)
+                .center()
+                .child(
+                    text(format!("{remaining_secs:.1}s"))
+                        .key("autotune/countdown-readout")
+                        .role("label")
+                        .label(format!("{remaining_secs:.1} seconds remaining"))
+                        .font(typography::HEADING)
+                        .color(t.text),
+                ),
         )
 }
 
@@ -436,9 +525,11 @@ fn level_bar(level_db: f32, t: TineTheme) -> El {
         .key("autotune/level-track")
         .grow(1.0)
         .h(8.0)
-        .radius(radii::SM)
-        .fill(t.surface)
+        .radius(radii::PILL)
+        .fill(t.well)
         .border(1.0, t.border)
+        .clip_rounded(4.0)
+        .animate_layout()
         .child(el().key("autotune/level-fill").grow(norm.max(0.001)).fill(color))
         .child(el().key("autotune/level-rest").grow((1.0 - norm).max(0.001)));
 
@@ -458,6 +549,21 @@ fn level_bar(level_db: f32, t: TineTheme) -> El {
         )
 }
 
+/// Compact voiced-capture fill toward the 2.0 s target during Speak.
+fn voiced_bar(voiced_ms: u32, t: TineTheme) -> El {
+    let norm = (voiced_ms as f32 / 2_000.0).clamp(0.0, 1.0);
+    let fill_color = if voiced_ms >= 2_000 { t.success } else { t.accent };
+    el().key("autotune/voiced-track")
+        .w_full()
+        .h(4.0)
+        .radius(radii::PILL)
+        .fill(t.well)
+        .clip_rounded(2.0)
+        .animate_layout()
+        .child(el().key("autotune/voiced-fill").grow(norm.max(0.001)).fill(fill_color))
+        .child(el().key("autotune/voiced-rest").grow((1.0 - norm).max(0.001)))
+}
+
 /// Determinate progress bar for the Analyzing phase.
 fn progress_bar(progress: f32, t: TineTheme) -> El {
     let norm = progress.clamp(0.0, 1.0);
@@ -467,14 +573,21 @@ fn progress_bar(progress: f32, t: TineTheme) -> El {
         .w_full()
         .h(8.0)
         .radius(radii::PILL)
-        .fill(t.surface)
+        .fill(t.well)
         .border(1.0, t.border)
-        .child(el().key("autotune/progress-fill").grow(norm.max(0.001)).fill(t.accent))
+        .clip_rounded(4.0)
+        .child(
+            el().key("autotune/progress-fill")
+                .grow(norm.max(0.001))
+                .fill(t.accent)
+                .linear_gradient(std::f32::consts::FRAC_PI_2, [(0.0, t.accent_hi), (1.0, t.accent_lo)]),
+        )
         .child(el().key("autotune/progress-rest").grow((1.0 - norm).max(0.001)))
 }
 
-/// Measured levels + the before → after parameter table.
-fn results_card(model: &UiModel, t: TineTheme) -> El {
+/// Measured levels, parameter diff table, and Voice Profile & Style recommendation.
+fn results_card(s: &AppState, t: TineTheme) -> El {
+    let model = &s.model;
     let Some(cal) = &model.calibration else {
         return col().key("autotune/results").child(
             text("No calibration results available.")
@@ -500,9 +613,200 @@ fn results_card(model: &UiModel, t: TineTheme) -> El {
             )),
     );
 
-    for diff in &cal.changes {
-        card = card.child(diff_row(diff.param, diff.label, diff.before, diff.after, diff.unit, t));
+    let preset = builtin(model.archetype);
+    let full_cal = model
+        .pending_calibration
+        .unwrap_or_else(|| calibration_from_ui(cal, &preset.base));
+    let preview_macros = recommend_macros(&full_cal, model.archetype, s.ui.autotune_style, model.macros);
+    let mut effective_pins = model.pins;
+    if !s.ui.autotune_keep_pins {
+        for id in CHANGED_PARAMS {
+            effective_pins.unpin(id);
+        }
+        if s.ui.autotune_style != VoiceStyle::KeepCurrent {
+            for m in DspMacro::ALL {
+                for &id in MacroMapper::drives(m) {
+                    effective_pins.unpin(id);
+                }
+            }
+        }
     }
+    let preview_after = MacroMapper::apply(preset, Some(&full_cal), preview_macros, effective_pins, &model.params);
+
+    for diff in &cal.changes {
+        card = card.child(diff_row(
+            diff.param,
+            diff.label,
+            diff.before,
+            preview_after.get(diff.param),
+            diff.unit,
+            t,
+        ));
+    }
+
+    let diag = diagnose_voice(&full_cal);
+    let room_str = match diag.room {
+        RoomQuality::StudioQuiet => "Quiet room",
+        RoomQuality::Normal => "Normal room",
+        RoomQuality::Noisy => "Noisy room",
+    };
+    let tone_str = match diag.tone {
+        VoiceTone::WarmClose => "Warm / close mic",
+        VoiceTone::Balanced => "Balanced tone",
+        VoiceTone::ThinDistant => "Thin / distant mic",
+    };
+    let dyn_str = match diag.dynamics {
+        VoiceDynamics::Controlled => "Steady speech",
+        VoiceDynamics::Natural => "Natural dynamics",
+        VoiceDynamics::Expressive => "Dynamic speech",
+    };
+
+    let mut style_pills = row()
+        .key("autotune/styles")
+        .role("radiogroup")
+        .label("Post-calibration voice style")
+        .w_full()
+        .gap(spacing::XS);
+    for style in VoiceStyle::ALL {
+        let selected = s.ui.autotune_style == style;
+        style_pills = style_pills.child(
+            row()
+                .key(style_key(style))
+                .role("radio")
+                .checked(selected)
+                .label(format!("Voice style: {}", style.label()))
+                .focusable(true)
+                .h(26.0)
+                .px(spacing::SM)
+                .center()
+                .radius(radii::PILL)
+                .cursor(rune::Cursor::Pointer)
+                .fill(if selected { t.accent_soft } else { t.well })
+                .border(1.0, if selected { t.accent_glow } else { t.border })
+                .hover(if selected { t.accent_soft } else { t.surface_raised })
+                .on_press(move |s: &mut AppState| {
+                    s.preview_autotune(style, s.ui.autotune_keep_pins, Some(false));
+                })
+                .child(text(style.label()).font(typography::CAPTION).color(if selected {
+                    t.accent_text
+                } else {
+                    t.text_dim
+                })),
+        );
+    }
+
+    let low_db = preview_after.eq_gain_db[0];
+    let mud_db = preview_after.eq_gain_db[1];
+    let pres_db = preview_after.eq_gain_db[3];
+    let air_db = preview_after.eq_gain_db[4];
+    let style_preview = format!(
+        "{} — Warmth {low_db:+.1} dB · Mud {mud_db:+.1} dB · Clarity {pres_db:+.1} dB · Air {air_db:+.1} dB · Comp {:.1}:1",
+        s.ui.autotune_style.summary(),
+        preview_after.comp_ratio,
+    );
+
+    let tuned_active = s.ui.autotune_audition_raw == Some(false);
+    let raw_active = s.ui.autotune_audition_raw == Some(true);
+    let audition_pills = row()
+        .key("autotune/audition-pills")
+        .gap(spacing::XS)
+        .center()
+        .child(
+            row()
+                .key("autotune/audition-tuned")
+                .role("button")
+                .label("Hear Tuned voice preview")
+                .focusable(false)
+                .h(22.0)
+                .px(spacing::SM)
+                .center()
+                .radius(radii::PILL)
+                .cursor(rune::Cursor::Pointer)
+                .fill(if tuned_active { t.accent_soft } else { t.surface_raised })
+                .border(1.0, if tuned_active { t.accent_glow } else { t.border })
+                .hover(if tuned_active { t.accent_soft } else { t.surface_hover })
+                .on_press(|s: &mut AppState| {
+                    let next = if s.ui.autotune_audition_raw == Some(false) {
+                        None
+                    } else {
+                        Some(false)
+                    };
+                    s.preview_autotune(s.ui.autotune_style, s.ui.autotune_keep_pins, next);
+                })
+                .child(text("▶ Hear Tuned").font(typography::CAPTION).color(if tuned_active {
+                    t.accent_text
+                } else {
+                    t.text
+                })),
+        )
+        .child(
+            row()
+                .key("autotune/audition-raw")
+                .role("button")
+                .label("Raw Mic voice preview")
+                .focusable(false)
+                .h(22.0)
+                .px(spacing::SM)
+                .center()
+                .radius(radii::PILL)
+                .cursor(rune::Cursor::Pointer)
+                .fill(if raw_active { t.accent_soft } else { t.surface_raised })
+                .border(1.0, if raw_active { t.accent_glow } else { t.border })
+                .hover(if raw_active { t.accent_soft } else { t.surface_hover })
+                .on_press(|s: &mut AppState| {
+                    let next = if s.ui.autotune_audition_raw == Some(true) {
+                        None
+                    } else {
+                        Some(true)
+                    };
+                    s.preview_autotune(s.ui.autotune_style, s.ui.autotune_keep_pins, next);
+                })
+                .child(text("Raw Mic").font(typography::CAPTION).color(if raw_active {
+                    t.accent_text
+                } else {
+                    t.text_dim
+                })),
+        );
+
+    card = card.child(
+        col()
+            .key("autotune/style-section")
+            .w_full()
+            .px(spacing::SM)
+            .py(spacing::XS + 2.0)
+            .gap(spacing::XS)
+            .radius(radii::MD)
+            .fill(t.well)
+            .border(1.0, t.border)
+            .child(
+                row()
+                    .key("autotune/style-header")
+                    .w_full()
+                    .gap(spacing::SM)
+                    .center()
+                    .child(
+                        col().grow(1.0).min_w(0.0).child(
+                            text(format!(
+                                "Profile: {room_str} ({:.1} dB SNR) · {tone_str} · {dyn_str}",
+                                diag.snr_db
+                            ))
+                            .key("autotune/diagnosis")
+                            .font(typography::CAPTION)
+                            .color(t.text)
+                            .wrap(),
+                        ),
+                    )
+                    .child(audition_pills),
+            )
+            .child(style_pills)
+            .child(
+                text(style_preview)
+                    .key("autotune/style-preview")
+                    .font(typography::CAPTION)
+                    .color(t.text_dim)
+                    .wrap(),
+            ),
+    );
 
     card.child(
         text(format!(
@@ -516,8 +820,19 @@ fn results_card(model: &UiModel, t: TineTheme) -> El {
             cal.simulated_peak_db, cal.simulated_rms_db
         ))
         .font(typography::CAPTION)
-        .color(t.text_dim),
+        .color(t.text_dim)
+        .wrap(),
     )
+}
+
+const fn style_key(style: VoiceStyle) -> &'static str {
+    match style {
+        VoiceStyle::AutoBalanced => "autotune/style-auto",
+        VoiceStyle::Broadcast => "autotune/style-broadcast",
+        VoiceStyle::Natural => "autotune/style-natural",
+        VoiceStyle::Crisp => "autotune/style-crisp",
+        VoiceStyle::KeepCurrent => "autotune/style-keep",
+    }
 }
 
 fn measurement(label: &str, value: String, t: TineTheme) -> El {
@@ -532,22 +847,25 @@ fn measurement(label: &str, value: String, t: TineTheme) -> El {
 
 fn diff_row(param: ParamId, label: &str, before: f32, after: f32, unit: &str, t: TineTheme) -> El {
     let value = |v: f32| {
-        if unit.is_empty() {
+        if param == ParamId::DenoiseMix {
+            format!("{:.0} %", v * 100.0)
+        } else if unit.is_empty() {
             format!("{v:.2}")
         } else {
             format!("{v:.1} {unit}")
         }
     };
-    let text_row = format!("{}: {} \u{2192} {}", label, value(before), value(after));
+    let delta_text = format!("{} \u{2192} {}", value(before), value(after));
+    let a11y_label = format!("{label}: {delta_text}");
     row()
         .key(format!("autotune/diff-{}", param.spec().key))
         .role("label")
-        .label(text_row.clone())
+        .label(a11y_label)
         .w_full()
         .gap(spacing::MD)
         .child(text(label.to_owned()).font(typography::CAPTION).color(t.text_dim))
         .child(el().key("autotune/diff-spacer").grow(1.0))
-        .child(text(text_row).font(typography::CAPTION).color(t.text))
+        .child(text(delta_text).font(typography::CAPTION).color(t.text))
 }
 
 /// The "Keep my Pro pins" checkbox (D-007).
@@ -566,15 +884,34 @@ pub fn keep_pins_checkbox(keep_pins: bool, t: TineTheme) -> El {
             }
         ))
         .focusable(true)
+        .gap(spacing::SM)
+        .center()
+        .cursor(rune::Cursor::Pointer)
         .on_press(|s: &mut AppState| {
-            s.ui.autotune_keep_pins = !s.ui.autotune_keep_pins;
+            s.preview_autotune(
+                s.ui.autotune_style,
+                !s.ui.autotune_keep_pins,
+                s.ui.autotune_audition_raw,
+            );
+        })
+        .child({
+            let b = row()
+                .key("autotune/keep-pins-box")
+                .size(16.0, 16.0)
+                .center()
+                .radius(4.0);
+            if keep_pins {
+                b.fill(t.accent)
+                    .child(text("✓").font(typography::CAPTION).color(t.text_on_accent))
+            } else {
+                b.fill(t.well).border(1.0, t.border_strong)
+            }
         })
         .child(
-            text(if keep_pins { "[x]" } else { "[ ]" })
+            text("Keep my Pro pins")
                 .font(typography::CAPTION)
-                .color(t.accent),
+                .color(if keep_pins { t.text } else { t.text_dim }),
         )
-        .child(text("Keep my Pro pins").font(typography::CAPTION).color(t.text_dim))
 }
 
 /// A row of wizard action buttons.
@@ -594,12 +931,63 @@ fn cancel_row(t: TineTheme) -> El {
 /// The button tagged `autotune/apply` carries the live keep-pins state.
 fn action_for(key: &str) -> impl Fn(&mut AppState) + 'static {
     match key {
-        "autotune/cancel" | "autotune/close" => |s: &mut AppState| s.emit(Intent::CancelAutoTune),
-        "autotune/discard" => |s: &mut AppState| s.emit(Intent::DiscardCalibration),
+        "autotune/cancel" | "autotune/close" => |s: &mut AppState| {
+            s.ui.autotune_audition_raw = None;
+            s.model.pending_calibration = None;
+            s.resolve_params_optimistic();
+            s.emit(Intent::CancelAutoTune);
+        },
+        "autotune/discard" => |s: &mut AppState| {
+            s.ui.autotune_audition_raw = None;
+            s.model.pending_calibration = None;
+            s.resolve_params_optimistic();
+            s.emit(Intent::DiscardCalibration);
+        },
         // Retry restarts the wizard (the runner re-enters the Countdown phase).
-        "autotune/retry" => |s: &mut AppState| s.emit(Intent::StartAutoTune),
-        // TODO(T11): engine replays the CalibrationReport changes, honoring pins.
+        "autotune/retry" => |s: &mut AppState| {
+            s.ui.autotune_audition_raw = None;
+            s.emit(Intent::StartAutoTune);
+        },
         "autotune/apply" => |s: &mut AppState| {
+            s.ui.autotune_audition_raw = None;
+            let preset = builtin(s.model.archetype);
+            let cal_opt = s.model.pending_calibration.take().or_else(|| {
+                s.model
+                    .calibration
+                    .as_ref()
+                    .map(|c| calibration_from_ui(c, &preset.base))
+            });
+            if let Some(cal) = cal_opt {
+                s.model.active_calibration = Some(cal);
+                if s.ui.autotune_style != VoiceStyle::KeepCurrent {
+                    let rec = recommend_macros(&cal, s.model.archetype, s.ui.autotune_style, s.model.macros);
+                    for (m, val) in [
+                        (Macro::Purity, rec.purity),
+                        (Macro::Body, rec.body),
+                        (Macro::Presence, rec.presence),
+                        (Macro::Leveler, rec.leveler),
+                    ] {
+                        if s.ui.autotune_keep_pins {
+                            m.set(&mut s.model.macros, val);
+                            s.emit(Intent::SetMacro(m, m.get(s.model.macros)));
+                        } else {
+                            s.set_macro_optimistic(m, val);
+                        }
+                    }
+                }
+                if !s.ui.autotune_keep_pins {
+                    for id in [
+                        ParamId::InputGainDb,
+                        ParamId::GateThresholdDb,
+                        ParamId::DenoiseMix,
+                        ParamId::CompThreshDb,
+                        ParamId::CompMakeupDb,
+                    ] {
+                        s.model.pins.unpin(id);
+                    }
+                }
+                s.resolve_params_optimistic();
+            }
             s.emit(Intent::ApplyCalibration {
                 keep_pins: s.ui.autotune_keep_pins,
             });
@@ -616,21 +1004,12 @@ fn button(
     t: TineTheme,
     on_press: impl Fn(&mut AppState) + 'static,
 ) -> El {
-    let bg = if primary { t.accent } else { t.surface };
-    let fg = if primary { t.text_on_accent } else { t.text };
-    row()
-        .key(key)
-        .role("button")
-        .label(label)
-        .focusable(true)
-        .h(28.0)
-        .px(spacing::LG)
-        .center()
-        .radius(radii::PILL)
-        .fill(bg)
-        .border(1.0, t.border)
-        .on_press(on_press)
-        .child(text(label).font(typography::LABEL).color(fg))
+    let tone = if primary {
+        crate::views::kit::Tone::Primary
+    } else {
+        crate::views::kit::Tone::Secondary
+    };
+    crate::views::kit::button(key, "button", label, tone, None, t, on_press)
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/brand/tine-128.png" width="96" height="96" alt="Tine icon"></p>
+
 # Tine
 
 **An ultra-lightweight, native, open-source microphone DSP engine for Windows.**
@@ -22,11 +24,19 @@ Consumer suites (SteelSeries GG Sonar) are heavy and closed; studio mixers
 - **Auto-Tune wizard**: 8 seconds of measurement and Tine adapts the whole
   chain (gate, EQ, dynamics, true-peak limiter, noise reduction) to *your*
   room, *your* voice, *your* mic.
+- **3 selectable denoiser engines**: pure-Rust **RNNoise** (default, 21.58 ms),
+  **Studio Clean** powered by embedded DeepFilterNet3 (41.58 ms), and **Low-Lat**
+  (`1.58 ms` total DSP latency for competitive FPS gaming).
+- **5-second A/B Mic Check & Raw-Mic App Detector**: record 5 seconds once to
+  compare sample-aligned Raw vs. Tine playback in-app, plus a live banner
+  warning you if an app is still recording your raw microphone instead of the
+  virtual cable.
 - **Two-tier control**: a one-line "Golden Line" for daily use, a full
   **Pro** rack when you want every parameter pinned.
-- **Footprint**: a single ~21 MB executable; the always-on tray parent is
-  GPU-free and targets under 12 MB of working memory at idle. No background
-  services, no accounts.
+- **Footprint**: a single native executable (~21–28 MB, under the 30 MiB release
+  gate even with embedded DeepFilterNet3 weights); the always-on tray parent is
+  GPU-free and idles at ~3.9–5.5 MB private bytes (0.16 % CPU when parked). No
+  background services, no accounts.
 
 ## How it works
 
@@ -48,28 +58,45 @@ Consumer suites (SteelSeries GG Sonar) are heavy and closed; studio mixers
 ## Requirements
 
 - Windows 10 22H2 or Windows 11, 64-bit.
-- A virtual audio cable. VB-Audio Virtual Cable is the tested configuration;
-  any WASAPI-compatible cable works. Onboarding checks for it.
+- A virtual audio cable. **VB-Audio Virtual Cable** is the primary tested
+  configuration, and Tine automatically discovers **VB-Audio Hi-Fi Cable**,
+  **Cables A–D**, **VoiceMeeter VAIO/AUX**, and **Virtual Audio Cable (VAC)**.
+  Onboarding and `tine apo status` verify the cable and show the exact capture
+  device to select in your apps.
 - A microphone (of course).
 
 ## Install
 
-1. Download `tine-<version>-x64.msi` from
-   [Releases](https://github.com/abugeek/tine/releases).
-2. (Recommended) verify the download against `SHA256SUMS.txt`:
+1. Download `tine-<version>-x64.msi` (or the portable ZIP) from
+   [Releases](https://github.com/abugeek/tine/releases), or use the package
+   manifests in [`packaging/winget/`](packaging/winget/) and
+   [`packaging/scoop/`](packaging/scoop/).
+2. (Recommended) verify the download against `SHA256SUMS.txt` (or verify the
+   cryptographic build provenance attestation with
+   `gh attestation verify tine-<version>-x64.msi -R abugeek/tine`):
 
    ```pwsh
    Get-FileHash .\tine-<version>-x64.msi -Algorithm SHA256
    ```
 
-3. Run the MSI (per-machine: it needs one UAC prompt). It installs
+3. Verify (or install) a virtual audio cable with the helper script:
+
+   ```pwsh
+   pwsh -File scripts/setup-virtual-cable.ps1 -CheckOnly
+   # or pass -Install to download and verify the official VB-Audio Virtual Cable installer:
+   pwsh -File scripts/setup-virtual-cable.ps1 -Install
+   ```
+
+4. Run the MSI (per-machine: it needs one UAC prompt). It installs
    `tine.exe` to `C:\Program Files\Tine\`, adds a Start-menu shortcut, sets
    autostart (`HKCU\...\Run`, toggleable from the tray), and offers **Run Tine
    now**.
-4. Onboarding: pick your mic → let the **Auto-Tune wizard** record you for
+5. Onboarding: pick your mic → let the **Auto-Tune wizard** record you for
    ~8 seconds → **Apply**. Done: your apps can use the processed mic.
-5. In Discord / OBS / your game, set the microphone to **CABLE Output
-   (VB-Audio Virtual Cable)**. In Tine, always pick your *normal* microphone.
+6. In Discord / OBS / your game, set the microphone to **CABLE Output
+   (VB-Audio Virtual Cable)** (or the capture device shown by
+   `tine apo status` / `setup-virtual-cable.ps1`). In Tine, always pick your
+   *normal* microphone.
 
 **SmartScreen note:** the beta is not yet code-signed, so Windows may show
 "Windows protected your PC". Choose *More info → Run anyway*. The SHA-256
@@ -82,14 +109,35 @@ sums above let you verify exactly what you downloaded; public code signing
   without leaving GPU memory behind.
 - **Golden Line mode** — one slider for the overall body/purity feel.
   **Pro mode** — every stage's parameters, pin any of them against Auto-Tune.
-- **Hear Myself**: monitor your microphone input on your headphones (in v0.1,
-  Hear Myself monitors the input signal rather than the post-cable processed
-  stream; see [D-029](docs/project/06-decisions.md)).
+- **Denoiser selector (`RNNoise` / `Studio Clean` / `Low-Lat`)**: switch live
+  between pure-Rust RNNoise (`21.6 ms`), embedded DeepFilterNet3 (`Studio Clean`,
+  `41.6 ms`, [D-037](docs/project/06-decisions.md)), or `Low-Lat` bypass
+  denoiser (`1.58 ms` total DSP latency, [D-039](docs/project/06-decisions.md)).
+- **5-Second Mic Check (A/B)**: record 5 seconds once and toggle
+  sample-aligned Raw vs. Tine playback in-app.
+- **Hear Myself**: monitor your **post-DSP processed microphone signal** in
+  real time (`VirtualCableProcessor` post-DSP monitor tap), with automatic
+  click-free mute and drift compensation.
+- **Global Hotkeys**: `Ctrl+Shift+M` (click-free 5 ms output mute, while input
+  meters keep showing your voice) and `Ctrl+Shift+B` (global A/B bypass).
+- **Keep Warm (PTT)** (`tine ptt on|off`): optional toggle to disable idle
+  listener parking for instant push-to-talk transmission.
 - **CLI** (from a terminal):
 
   ```text
-  tine status        live state of the running instance (incl. autostart)
-  tine diag [--out FILE]   privacy-safe diagnostics bundle (no audio inside)
+  tine status                            live state of the running instance (incl. autostart)
+  tine diag [--out FILE]                 privacy-safe diagnostics bundle (no audio inside)
+  tine mute [on|off|toggle]              click-free 5 ms output mute
+  tine bypass on|off                     global A/B bypass
+  tine denoise rnnoise|deepfilter|off    switch live denoiser engine
+  tine ptt on|off                        Keep Warm (disable idle parking for push-to-talk)
+  tine archetype <name>                  dynamic|condenser|headset|laptop
+  tine macro <name> <val>                move a macro (purity|body|presence|leveler, 0.0..=1.0)
+  tine set <key> <val>                   set one Pro parameter (SPECS key, pins it)
+  tine monitor on|off [--device ID]      "Hear Myself" post-DSP monitoring
+  tine calibrate                         run the 8-second Auto-Tune
+  tine meters                            live telemetry + spectrum
+  tine apo status|install|repair         verify/diagnose virtual-cable pairing
   tine --version
   ```
 
@@ -137,11 +185,12 @@ check. To update, watch [Releases](https://github.com/abugeek/tine/releases)
 manually; every release lists SHA-256 sums. `tine diag` is privacy-safe (no
 audio, FNV-1a-hashed device ids).
 
-**Why ~22 ms of latency?**
-The denoiser's 480-sample STFT framing + synthesis adds two frames at 48 kHz
-(decision [D-019](docs/project/06-decisions.md)); the rest of the chain adds
-~1.6 ms. A "low-latency mode" (denoiser off, < 2 ms added) is a planned
-option.
+**Why ~22 ms of latency (and how to get 1.58 ms)?**
+Added DSP latency depends on the active denoiser mode ([D-019](docs/project/06-decisions.md),
+[D-037](docs/project/06-decisions.md), [D-039](docs/project/06-decisions.md)):
+- **`Low-Lat` (`Off`)**: adds only **1.58 ms** (76 samples @ 48 kHz — limiter lookahead + true-peak FIR).
+- **`RNNoise` (default)**: adds **21.58 ms** (1036 samples @ 48 kHz — 480-sample FIFO + 480-sample STFT synthesis + 76-sample limiter).
+- **`Studio Clean` (DeepFilterNet3)**: adds **41.58 ms** (1996 samples @ 48 kHz).
 
 **SmartScreen / "unknown publisher"?**
 See the SmartScreen note under [Install](#install).
@@ -173,6 +222,16 @@ submitted for inclusion in the work by you, as defined in the Apache-2.0
 license, shall be dual-licensed as above, without any additional terms or
 conditions.
 
-## Code Signing
+Optional "Studio Clean" noise suppression embeds DeepFilterNet3 weights via
+[`dfn3_rs`](https://crates.io/crates/dfn3_rs) (`MIT OR Apache-2.0`).
 
-Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+## Code Signing & Build Provenance
+
+Release builds run reproducibly on GitHub Actions and publish both `SHA256SUMS.txt`
+and cryptographic [GitHub Build Provenance Attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
+so anyone can verify an artifact came directly from this repository (`gh attestation verify tine-<version>-x64.msi -R abugeek/tine`).
+
+Our release pipeline already supports Authenticode signing (`TINE_SIGN_COMMAND`,
+including Azure Artifact Signing), and we will reapply to
+[SignPath Foundation](https://signpath.org) for free open-source Authenticode
+signing once Tine reaches their public adoption milestone.

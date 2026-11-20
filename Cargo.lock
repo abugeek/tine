@@ -946,6 +946,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "dfn3_rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ccc5b8ba365194ed3cc4d74bc13946fb964f930808fccd692df99e48c4b1172"
+dependencies = [
+ "realfft",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3587,6 +3596,7 @@ dependencies = [
  "assert_no_alloc",
  "claxon",
  "criterion",
+ "dfn3_rs",
  "hound",
  "nnnoiseless",
  "proptest",

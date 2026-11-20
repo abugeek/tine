@@ -260,3 +260,95 @@ fn virtual_cable_sliders_eq_dynamics_measurably_shape_audio() {
         "limiter ceiling -6 dBFS must cap peak (got {peak_limited})"
     );
 }
+
+#[test]
+fn virtual_cable_raw_capture_feed_zero_alloc() {
+    let params = Arc::new(ParamBlock::new());
+    let telemetry = Arc::new(Triple::new(AudioTelemetryFrame::default()));
+    let tap = Arc::new(SpscRing::<4096>::new());
+
+    let mut proc = VirtualCableProcessor::new(48_000.0, 512, params, telemetry, tap);
+    let feed = proc.raw_capture_feed(48_000);
+    let mut scratch = [0.0_f32; 1024];
+
+    // Disabled by default: nothing pushed.
+    let mut block = [0.25_f32; 480];
+    assert_no_alloc(|| {
+        proc.process_block(&mut block);
+    });
+    assert_eq!(feed.pop_slice(&mut scratch), 0);
+
+    // Enabled: exact pre-DSP block lands in ring with zero allocations.
+    feed.set_enabled(true);
+    let expected = [0.33_f32; 480];
+    block.copy_from_slice(&expected);
+    assert_no_alloc(|| {
+        proc.process_block(&mut block);
+    });
+    let got = feed.pop_slice(&mut scratch);
+    assert_eq!(got, 480);
+    assert_eq!(scratch[..480], expected);
+}
+
+#[test]
+fn virtual_cable_rt_mute_ramps_click_free_over_5ms_and_zero_alloc() {
+    use std::sync::atomic::Ordering;
+
+    let params = Arc::new(ParamBlock::new());
+    params.store(&DspParams {
+        bypass: true,
+        ..DspParams::DEFAULT
+    });
+    let telemetry = Arc::new(Triple::new(AudioTelemetryFrame::default()));
+    let tap = Arc::new(SpscRing::<4096>::new());
+
+    let mut proc = VirtualCableProcessor::new(48_000.0, 512, params, telemetry, tap);
+    let mute = proc.mute_handle();
+
+    let mut block = [0.0_f32; 480];
+    // Warm past pipeline delay and 10 ms exponential bypass smoother (150 ms = 15 blocks).
+    for _ in 0..15 {
+        block.fill(0.4);
+        assert_no_alloc(|| proc.process_block(&mut block));
+    }
+    let settled = block[479];
+    assert!(
+        (settled - 0.4).abs() < 1e-3,
+        "unmuted bypass signal must settle near 0.4 (got {settled})"
+    );
+
+    // Engage RT mute: 5 ms @ 48 kHz = 240 samples -> must settle to exact 0.0 within 1 block (10 ms),
+    // with no step discontinuity exceeding 1.5x ramp slope (1/240 ≈ 0.00417).
+    mute.store(true, Ordering::Release);
+    block.fill(0.4);
+    assert_no_alloc(|| proc.process_block(&mut block));
+    let mut prev = settled;
+    for (idx, &sample) in block.iter().enumerate() {
+        let delta = (sample - prev).abs();
+        assert!(delta <= 0.01, "click discontinuity during mute at {idx}: delta={delta}");
+        prev = sample;
+    }
+    assert_eq!(
+        block[479], 0.0,
+        "mute ramp must reach exact 0.0 within 5 ms (<= 480 samples)"
+    );
+
+    // Unmute: ramps smoothly back up to `settled` within 480 samples.
+    mute.store(false, Ordering::Release);
+    block.fill(0.4);
+    assert_no_alloc(|| proc.process_block(&mut block));
+    let mut prev = 0.0_f32;
+    for (idx, &sample) in block.iter().enumerate() {
+        let delta = (sample - prev).abs();
+        assert!(
+            delta <= 0.01,
+            "click discontinuity during unmute at {idx}: delta={delta}"
+        );
+        prev = sample;
+    }
+    assert!(
+        (block[479] - settled).abs() < 1e-4,
+        "unmute must recover full signal within 5 ms (got {}, expected {settled})",
+        block[479]
+    );
+}

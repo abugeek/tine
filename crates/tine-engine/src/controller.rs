@@ -472,11 +472,13 @@ fn target_to_client(target: &Target) -> Option<Arc<ShmClient>> {
 /// Writes all persistence layers for the current state (debounce deadline or
 /// exit).
 fn flush_persistence(state: &mut Loop, tx: &Sender<Event>, paths: &EnginePaths) {
-    // Preserve UI-owned flags (`onboarding_completed`, `pro_drawer_open`) written
-    // by the shell/pipe so controller flushes never clobber them.
+    // Preserve shell/UI-owned flags (`onboarding_completed`, `pro_drawer_open`,
+    // `denoise_engine`, `park_when_unused`, hotkeys, etc.) written by the
+    // shell/pipe so controller flushes never clobber them.
     if let persist::Loaded::Fresh(disk) = persist::load_settings(paths) {
-        state.settings.onboarding_completed |= disk.onboarding_completed;
-        state.settings.pro_drawer_open = disk.pro_drawer_open;
+        let onboarding = state.settings.onboarding_completed || disk.onboarding_completed;
+        state.settings = disk;
+        state.settings.onboarding_completed = onboarding;
     }
     state.settings.selected_endpoint_id = state.model.endpoint.as_ref().map(|e| e.as_str().to_owned());
     state.settings.monitor_device_id = state.model.monitor.output_device.clone();

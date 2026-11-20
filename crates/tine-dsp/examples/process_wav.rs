@@ -23,7 +23,7 @@ use std::process;
 use tine_dsp::macros::MacroMapper;
 use tine_dsp::primitives::db::lin_to_db;
 use tine_dsp::{DspPipeline, MeterSink, NoTap, presets};
-use tine_protocol::params::{DspParams, FilterType, ParamId, SPECS};
+use tine_protocol::params::{DenoiseEngine, DspParams, FilterType, ParamId, SPECS};
 use tine_protocol::presets::{Archetype, MacroPositions, PinSet};
 use tine_protocol::telemetry::{AudioTelemetryFrame, flags};
 
@@ -268,10 +268,19 @@ fn run() -> Result<(), String> {
     let mut params = DspParams::DEFAULT;
     let mut preset_used: Option<&'static presets::PresetDef> = None;
     let mut macros_used: Option<MacroPositions> = None;
+    let mut denoise_engine = DenoiseEngine::Rnnoise;
 
     let mut i = 2usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--denoiser" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or("--denoiser requires an engine (rnnoise|deepfilter|off)")?;
+                denoise_engine = DenoiseEngine::from_name(raw)
+                    .ok_or_else(|| format!("unknown denoiser engine: {raw} (expected rnnoise|deepfilter|off)"))?;
+                i += 2;
+            }
             "--preset" => {
                 let id = args
                     .get(i + 1)
@@ -316,13 +325,15 @@ fn run() -> Result<(), String> {
     let (in_peak_db, in_rms_db) = compute_peak_rms_db(&input);
 
     let mut output = input;
-    let mut pipe = DspPipeline::new(sample_rate as f32, 480);
+    let mut pipe = DspPipeline::for_engine(sample_rate as f32, 480, denoise_engine);
     let mut meters = SummaryMeters::default();
     for chunk in output.chunks_mut(480) {
         pipe.process(chunk, &params, &mut meters, &mut NoTap);
     }
 
     let (out_peak_db, out_rms_db) = compute_peak_rms_db(&output);
+    let in_crest_db = in_peak_db - in_rms_db;
+    let out_crest_db = out_peak_db - out_rms_db;
     let latency_samples = pipe.latency_samples();
     let latency_ms = (latency_samples as f32) * 1000.0 / (sample_rate as f32);
 
@@ -335,6 +346,11 @@ fn run() -> Result<(), String> {
         output.len()
     );
     println!("Output:  {}", out_path.display());
+    println!(
+        "A/B:     raw (RMS {in_rms_db:+.2} dBFS, peak {in_peak_db:+.2} dBFS, crest {in_crest_db:.2} dB) -> tine (RMS {out_rms_db:+.2} dBFS, peak {out_peak_db:+.2} dBFS, crest {out_crest_db:.2} dB | delta RMS {:+.2} dB, peak {:+.2} dB)",
+        out_rms_db - in_rms_db,
+        out_peak_db - in_peak_db,
+    );
     if let Some(preset) = preset_used {
         let m = macros_used.unwrap_or(preset.macro_defaults);
         println!("Preset:  {} ({})", preset.id, preset.name);

@@ -44,6 +44,10 @@
 
     <SummaryInformation Description="Tine microphone conditioner $(var.Version) (virtual-cable routing)" />
 
+    <!-- Brand icon in Apps & features (the shortcut uses tine.exe's embedded icon). -->
+    <Icon Id="TineIcon" SourceFile="$(var.RepoDir)\assets\brand\tine.ico" />
+    <Property Id="ARPPRODUCTICON" Value="TineIcon" />
+
     <!-- Windows 10 22H2+ (build 19045) / Windows 11, x64 (D-001); VersionNT64
          is 603 for Win8.1/10/11, so CURRENTBUILD distinguishes Win10 22H2+. -->
     <Property Id="CURRENTBUILD">
@@ -133,6 +137,20 @@
       </Component>
       <Component Id="LicenseApache" Directory="LicenseDir" Bitness="always64">
         <File Id="license_apache.txt" Source="$(var.RepoDir)\LICENSE-APACHE" KeyPath="yes" />
+      </Component>
+
+      <!-- Virtual-cable check & setup helper script + user guide. -->
+      <Component Id="SetupVirtualCableScript" Directory="INSTALLDIR" Bitness="always64">
+        <File Id="setup_virtual_cable.ps1"
+              Name="setup-virtual-cable.ps1"
+              Source="$(var.RepoDir)\scripts\setup-virtual-cable.ps1"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="ReadmeDoc" Directory="INSTALLDIR" Bitness="always64">
+        <File Id="README.md"
+              Name="README.md"
+              Source="$(var.RepoDir)\README.md"
+              KeyPath="yes" />
       </Component>
 
       <!-- Autostart (D-025): HKCU Run value is the source of truth; install

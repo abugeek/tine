@@ -17,7 +17,7 @@ pub mod views;
 pub use intent::{Intent, IntentSink, NoopSink};
 pub use model::{
     ApoBadge, AutoTuneStep, AutoTuneUi, CalFailureUi, CalibrationParamDiff, CalibrationUi, EndpointRow, Macro,
-    MonitorUi, UiModel,
+    MicCheckStep, MonitorUi, UiModel,
 };
 pub use state::{AppState, LiveFrame, UiLocal};
 
@@ -56,6 +56,11 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
 #[must_use]
 pub fn on_key(s: &mut AppState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
     match &ev.key {
+        Key::Escape if !matches!(s.model.mic_check, MicCheckStep::Idle) => {
+            s.model.mic_check = MicCheckStep::Idle;
+            s.emit(Intent::StopMicCheck);
+            true
+        }
         Key::Escape if s.ui.pro_field.param.is_some() => {
             s.ui.pro_field.close();
             true

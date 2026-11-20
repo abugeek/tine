@@ -30,22 +30,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use tine_dsp::calibrator::{
+    CHANGED_PARAMS, COUNTDOWN_S, LIVE_COUNTDOWN_S, LIVE_NOISE_S, LIVE_VOICE_S, NOISE_S, VOICE_S, VoiceStyle,
+    recommend_macros,
+};
+use tine_dsp::macros::{Macro as DspMacro, MacroMapper};
 use tine_engine::audio_io::DeviceRef;
 use tine_engine::autotune::{
     AutoTuneConfig, AutoTuneEvent, AutoTuneOutcome, AutoTuneRunner, CalFailure, CalPhase, CaptureSpec,
+    LiveAutoCalibratorFactory,
 };
 use tine_engine::listeners::{
-    GateAction, PARKED_POLL, ParkPolicy, RUNNING_POLL, foreign_listener, is_sink_capture_side,
+    GateAction, PARKED_POLL, ParkPolicy, RUNNING_POLL, foreign_listener, is_sink_capture_side, raw_mic_app_names,
 };
+use tine_engine::mic_check::{CalibrationPreviewPlayer, MicCheckMode, MicCheckRunner, MicCheckState};
 use tine_engine::model::{AppModel, EndpointId, KeepPins, resolve};
 use tine_engine::monitor::Monitor;
 use tine_engine::paths::{EnginePaths, PathsError};
 use tine_engine::persist;
 use tine_engine::shm_client::{LinkState, ShmClient};
+use tine_engine::spectrum::SpectrumAnalyzer;
 use tine_engine::virtual_cable::VirtualCableRouter;
 use tine_engine::visualizer::{EngineSignals, InProcessSignals, UiFrame, Visualizer};
-use tine_engine::win::CaptureSessionWatcher;
-use tine_protocol::params::DspParams;
+use tine_engine::win::{CableSessionEventHook, CaptureSessionWatcher, SessionWake, process_name_for_pid};
+use tine_protocol::params::{DenoiseEngine, DspParams};
 use tine_protocol::presets::Calibration;
 use tine_protocol::shm::{ShmLayout, init_layout_in_place};
 use tine_protocol::sync::{ParamBlock, SpscRing, Triple};
@@ -101,6 +109,8 @@ enum AutotuneState {
         level_db: f32,
         /// Voiced audio seen so far in the voice phase (ms).
         voiced_ms: u32,
+        /// `(countdown_s, noise_s, voice_s)` durations for this run.
+        phase_durations: (f32, f32, f32),
     },
     /// The run produced a report the user has not applied or discarded
     /// yet; the pipe's `calibrate_apply` / `calibrate_discard` decide its
@@ -111,6 +121,16 @@ enum AutotuneState {
         report: tine_engine::autotune::CalibrationReport,
         /// Human-readable summary of the measured calibration.
         summary: String,
+        /// Voice-phase mono capture (`rate_hz` Hz) for instant Raw vs. Tuned preview looping.
+        captured_voice: Arc<Vec<f32>>,
+        /// Sample rate of `captured_voice` in Hz.
+        rate_hz: u32,
+        /// Currently previewed post-calibration voice style.
+        preview_style: VoiceStyle,
+        /// Whether pinned Pro parameters are kept in the preview.
+        preview_keep_pins: bool,
+        /// Active voice-loop audition mode (`None` = stopped, `Some(false)` = tuned, `Some(true)` = raw).
+        audition_mode: Option<bool>,
     },
     /// The run failed (or was cancelled); `failure` is the typed
     /// rejection when the calibrator produced one, `message` is always
@@ -184,10 +204,19 @@ struct Services {
     last_pull: Option<Instant>,
     monitor: Option<Monitor>,
     monitor_wanted: MonitorWanted,
+    denoise_engine: DenoiseEngine,
     router: Option<RouterSlot>,
     /// Routing loop stopped by the listener gate (T24): no app records the
     /// virtual mic and nothing in Tine needs the processed signal.
     parked: Option<ParkedRoute>,
+    /// When `false` (Keep Warm / PTT mode), the routing loop stays hot permanently.
+    park_when_unused: bool,
+    raw_mic_apps: Vec<String>,
+    raw_mic_checked_at: Option<Instant>,
+    mic_check: Option<MicCheckRunner>,
+    mic_check_paused_monitor: bool,
+    cal_preview_player: Option<CalibrationPreviewPlayer>,
+    cal_preview_paused_monitor: bool,
     autotune: Option<AutotuneState>,
     autotune_cancel: Arc<AtomicBool>,
     lease: Option<LeaseShim>,
@@ -216,8 +245,16 @@ impl Services {
             last_pull: None,
             monitor: None,
             monitor_wanted: MonitorWanted::Off,
+            denoise_engine: DenoiseEngine::default(),
             router: None,
             parked: None,
+            park_when_unused: true,
+            raw_mic_apps: Vec::new(),
+            raw_mic_checked_at: None,
+            mic_check: None,
+            mic_check_paused_monitor: false,
+            cal_preview_player: None,
+            cal_preview_paused_monitor: false,
             autotune: None,
             autotune_cancel: Arc::new(AtomicBool::new(false)),
             lease: None,
@@ -272,6 +309,20 @@ impl Drop for CalibratingGuard {
 struct ParamWriteState {
     last_controller_params: DspParams,
     lease_bypass_active: bool,
+    preview_params: Option<DspParams>,
+}
+
+fn effective_params(st: &ParamWriteState) -> DspParams {
+    if st.lease_bypass_active {
+        let mut e = st.last_controller_params;
+        e.bypass = true;
+        e.input_gain_db = 0.0;
+        e
+    } else if let Some(preview) = st.preview_params {
+        preview
+    } else {
+        st.last_controller_params
+    }
 }
 
 fn with_param_write<R>(f: impl FnOnce(&mut ParamWriteState) -> R) -> R {
@@ -280,6 +331,7 @@ fn with_param_write<R>(f: impl FnOnce(&mut ParamWriteState) -> R) -> R {
         Mutex::new(ParamWriteState {
             last_controller_params: DspParams::DEFAULT,
             lease_bypass_active: false,
+            preview_params: None,
         })
     });
     match lock.lock() {
@@ -294,24 +346,29 @@ fn with_param_write<R>(f: impl FnOnce(&mut ParamWriteState) -> R) -> R {
 pub fn publish_params(params: &DspParams) {
     with_param_write(|st| {
         st.last_controller_params = *params;
-        let mut effective = *params;
-        if st.lease_bypass_active {
-            effective.bypass = true;
-        }
-        param_block().store(&effective);
+        param_block().store(&effective_params(st));
     });
+}
+
+/// Latest resolved DSP parameters published by the controller.
+#[must_use]
+pub fn last_controller_params() -> DspParams {
+    with_param_write(|st| st.last_controller_params)
 }
 
 fn set_lease_bypass(active: bool) {
     with_param_write(|st| {
         if st.lease_bypass_active != active {
             st.lease_bypass_active = active;
-            let mut effective = st.last_controller_params;
-            if active {
-                effective.bypass = true;
-            }
-            param_block().store(&effective);
+            param_block().store(&effective_params(st));
         }
+    });
+}
+
+fn set_calibration_preview(preview: Option<DspParams>) {
+    with_param_write(|st| {
+        st.preview_params = preview;
+        param_block().store(&effective_params(st));
     });
 }
 
@@ -341,7 +398,11 @@ fn router_tap() -> Arc<SpscRing<ROUTER_TAP_N>> {
 fn input_rate(endpoint: &str) -> u32 {
     tine_engine::audio_io::list_inputs()
         .ok()
-        .and_then(|list| list.iter().find(|d| d.id == endpoint).map(|d| d.default_rate))
+        .and_then(|list| {
+            list.iter()
+                .find(|d| d.id == endpoint || d.id.ends_with(endpoint))
+                .map(|d| d.default_rate)
+        })
         .unwrap_or(ROUTER_FALLBACK_RATE)
 }
 
@@ -422,20 +483,23 @@ pub fn router_follow(endpoint: &str) -> bool {
             old.router.stop();
             old.endpoint
         });
-        match VirtualCableRouter::start::<ROUTER_TAP_N>(
+        match VirtualCableRouter::start_with_engine_and_mute::<ROUTER_TAP_N>(
             &DeviceRef::Id(wanted.clone()),
             &DeviceRef::Id(sink.id.clone()),
             param_block(),
             router_telemetry(),
             router_tap(),
+            s.denoise_engine,
+            muted_flag(),
         ) {
             Ok(router) => {
                 let new_feed = router.monitor_feed();
+                let actual_rate = router.input_rate();
                 s.router = Some(RouterSlot {
                     router,
                     endpoint: wanted.clone(),
                     sink: sink.name.clone(),
-                    rate_hz: rate,
+                    rate_hz: if actual_rate > 0 { actual_rate } else { rate },
                 });
                 if let Some(prev) = old_endpoint {
                     tracing::info!(target: "tine::services",
@@ -489,6 +553,46 @@ pub fn router_follow(endpoint: &str) -> bool {
     routed
 }
 
+static MUTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+fn muted_flag() -> Arc<AtomicBool> {
+    Arc::clone(MUTED.get_or_init(|| Arc::new(AtomicBool::new(false))))
+}
+
+/// Returns whether click-free RT microphone muting is active.
+#[must_use]
+pub fn is_muted() -> bool {
+    muted_flag().load(Ordering::Acquire)
+}
+
+/// Sets click-free RT microphone mute (`true` = muted) and returns the active state.
+#[must_use]
+pub fn set_muted(muted: bool) -> bool {
+    muted_flag().store(muted, Ordering::Release);
+    muted
+}
+
+/// Toggles click-free RT microphone mute and returns the new state.
+#[must_use]
+pub fn toggle_muted() -> bool {
+    let flag = muted_flag();
+    !flag.fetch_xor(true, Ordering::AcqRel)
+}
+
+/// Forces a clean tear-down and rebuild of the virtual-cable routing loop for `endpoint_id`
+/// (used on USB replug or Windows resume from sleep).
+#[must_use]
+pub fn router_force_rebuild(endpoint_id: &str) -> bool {
+    with(|s| {
+        s.parked = None;
+        if let Some(old) = s.router.take() {
+            tracing::info!(target: "tine::services", endpoint = %old.endpoint, "forcing routing loop rebuild");
+            old.router.stop();
+        }
+    });
+    router_follow(endpoint_id)
+}
+
 /// Returns `true` when an active routing loop has latched a stream
 /// error (e.g., mic unplug, sleep/wake, or format change).
 #[must_use]
@@ -521,13 +625,87 @@ pub fn telemetry_live() -> Option<AudioTelemetryFrame> {
     })
 }
 
+/// Active Stage 2 denoiser engine (`Rnnoise`, `DeepFilterNet3`, or `Off`).
+#[must_use]
+pub fn denoise_engine() -> DenoiseEngine {
+    with(|s| s.denoise_engine)
+}
+
+/// Switches the Stage 2 denoiser engine, rebuilding the routing loop immediately
+/// if currently running. Returns whether routing is healthy afterwards.
+#[must_use]
+pub fn set_denoise_engine(engine: DenoiseEngine) -> bool {
+    let rebuild_endpoint = with(|s| {
+        if s.denoise_engine == engine {
+            return None;
+        }
+        s.denoise_engine = engine;
+        s.router.take().map(|old| {
+            let ep = old.endpoint.clone();
+            tracing::info!(target: "tine::services", engine = engine.as_str(), endpoint = %ep, "rebuilding routing loop for denoiser change");
+            old.router.stop();
+            ep
+        })
+    });
+    match rebuild_endpoint {
+        Some(ep) => router_follow(&ep),
+        None => with(|s| s.router.is_some() || s.parked.is_some()),
+    }
+}
+
+/// Lists external active apps currently recording from the selected physical
+/// microphone directly (instead of Tine's `CABLE Output`), cached for 2 s.
+#[must_use]
+pub fn raw_mic_apps() -> Vec<String> {
+    const CACHE_TTL: Duration = Duration::from_secs(2);
+    enum Probe {
+        Cached(Vec<String>),
+        Query(String),
+    }
+    let probe = with(|s| {
+        let Some(slot) = s.router.as_ref() else {
+            s.raw_mic_apps.clear();
+            s.raw_mic_checked_at = None;
+            return Probe::Cached(Vec::new());
+        };
+        if s.raw_mic_checked_at.is_some_and(|t| t.elapsed() < CACHE_TTL) {
+            return Probe::Cached(s.raw_mic_apps.clone());
+        }
+        Probe::Query(slot.endpoint.clone())
+    });
+    let endpoint = match probe {
+        Probe::Cached(list) => return list,
+        Probe::Query(ep) => ep,
+    };
+    let own_pid = std::process::id();
+    let apps = CaptureSessionWatcher::new()
+        .ok()
+        .and_then(|mut w| w.sessions_by_id(&endpoint).ok().flatten())
+        .map(|sessions| raw_mic_app_names(&sessions, own_pid, process_name_for_pid))
+        .unwrap_or_default();
+    with(|s| {
+        s.raw_mic_apps.clone_from(&apps);
+        s.raw_mic_checked_at = Some(Instant::now());
+    });
+    apps
+}
+
 /// JSON-able routing snapshot for `status`-side consumers.
 #[must_use]
 pub fn router_status() -> Value {
     with(|s| match &s.router {
         None => match &s.parked {
-            Some(p) => json!({ "on": false, "parked": true, "endpoint": p.endpoint, "sink": p.sink }),
-            None => json!({ "on": false }),
+            Some(p) => json!({
+                "on": false,
+                "parked": true,
+                "endpoint": p.endpoint,
+                "sink": p.sink,
+                "denoise_engine": s.denoise_engine.as_str(),
+            }),
+            None => json!({
+                "on": false,
+                "denoise_engine": s.denoise_engine.as_str(),
+            }),
         },
         Some(slot) => {
             let stats = slot.router.stats();
@@ -535,6 +713,7 @@ pub fn router_status() -> Value {
                 "on": true,
                 "endpoint": slot.endpoint,
                 "sink": slot.sink,
+                "denoise_engine": s.denoise_engine.as_str(),
                 "rate_hz": slot.rate_hz,
                 "underruns": stats.underruns,
                 "overruns": stats.overruns,
@@ -596,7 +775,10 @@ pub fn spectrum_on(paths: &EnginePaths) -> FrameSnapshot {
     ensure_reaper();
     router_wake("meters");
     if CALIBRATING.load(Ordering::Acquire) {
-        return with(|s| s.last_frame.clone());
+        return with(|s| {
+            s.last_pull = Some(Instant::now());
+            s.last_frame.clone()
+        });
     }
     with(|s| {
         s.last_pull = Some(Instant::now());
@@ -665,8 +847,29 @@ pub fn autotune_start() {
 struct RouterTapSource {
     /// Post-DSP tap the routing loop publishes.
     tap: Arc<SpscRing<ROUTER_TAP_N>>,
+    /// Live telemetry triple published by the routing loop.
+    telemetry: Arc<Triple<AudioTelemetryFrame>>,
+    /// Spectrum analyzer keeping background UI bars live while Auto-Tune owns the tap.
+    spectrum: SpectrumAnalyzer,
+    /// Latest telemetry frame cached between pulls.
+    last_tel: AudioTelemetryFrame,
     /// Capture rate the loop runs at.
     rate_hz: u32,
+    /// `true` once stale pre-bypass samples in `tap` have been flushed.
+    flushed: bool,
+}
+
+impl RouterTapSource {
+    fn new(tap: Arc<SpscRing<ROUTER_TAP_N>>, telemetry: Arc<Triple<AudioTelemetryFrame>>, rate_hz: u32) -> Self {
+        Self {
+            tap,
+            telemetry,
+            spectrum: SpectrumAnalyzer::new(rate_hz as f32),
+            last_tel: silent_telemetry(),
+            rate_hz,
+            flushed: false,
+        }
+    }
 }
 
 impl tine_engine::autotune::SampleSource for RouterTapSource {
@@ -675,12 +878,159 @@ impl tine_engine::autotune::SampleSource for RouterTapSource {
     }
 
     fn read(&mut self, buf: &mut [f32]) -> usize {
-        self.tap.pop_slice(buf)
+        if !self.flushed {
+            // Allow DspPipeline's 10 ms bypass & dry-gain smoothers to settle to unity,
+            // then flush any pre-bypass audio buffered in the tap ring so it cannot
+            // eat into the Countdown or pollute room-noise measurements.
+            std::thread::sleep(Duration::from_millis(25));
+            while self.tap.pop_slice(buf) > 0 {}
+            self.flushed = true;
+            return 0;
+        }
+        let n = self.tap.pop_slice(buf);
+        if n > 0
+            && let Some(chunk) = buf.get(..n)
+        {
+            self.spectrum.feed(chunk);
+            let _ = self.telemetry.latest(&mut self.last_tel);
+            let tel = self.last_tel;
+            let bands = *self.spectrum.bands();
+            with(|s| {
+                s.last_frame = FrameSnapshot {
+                    spectrum: bands,
+                    telemetry: tel,
+                };
+            });
+        }
+        n
     }
 
     fn has_error(&self) -> bool {
         false
     }
+}
+
+struct CapturingCalibrator {
+    inner: Box<dyn tine_engine::autotune::Calibrator>,
+    fs: f32,
+    slot: Arc<Mutex<(Vec<f32>, u32)>>,
+}
+
+impl tine_engine::autotune::Calibrator for CapturingCalibrator {
+    fn push(&mut self, samples: &[f32]) -> tine_dsp::calibrator::CalProgress {
+        self.inner.push(samples)
+    }
+
+    fn finish(
+        &mut self,
+        preset: &tine_dsp::presets::PresetDef,
+        macros: tine_protocol::presets::MacroPositions,
+        pins: tine_protocol::presets::PinSet,
+        current: &DspParams,
+    ) -> Result<tine_engine::autotune::CalibrationReport, CalFailure> {
+        let voice = self.inner.captured_voice().to_vec();
+        let rate = self.fs as u32;
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = (voice, rate);
+        }
+        self.inner.finish(preset, macros, pins, current)
+    }
+
+    fn captured_voice(&self) -> &[f32] {
+        self.inner.captured_voice()
+    }
+}
+
+struct CapturingCalibratorFactory {
+    inner: Arc<dyn tine_engine::autotune::CalibratorFactory>,
+    slot: Arc<Mutex<(Vec<f32>, u32)>>,
+}
+
+impl tine_engine::autotune::CalibratorFactory for CapturingCalibratorFactory {
+    fn make(&self, fs: f32) -> Box<dyn tine_engine::autotune::Calibrator> {
+        Box::new(CapturingCalibrator {
+            inner: self.inner.make(fs),
+            fs,
+            slot: Arc::clone(&self.slot),
+        })
+    }
+}
+
+fn stop_cal_preview_loop_only() {
+    let (player, was_paused) = with(|s| {
+        let player = s.cal_preview_player.take();
+        let paused = std::mem::replace(&mut s.cal_preview_paused_monitor, false);
+        (player, paused)
+    });
+    if let Some(p) = player {
+        p.stop();
+    }
+    if was_paused {
+        with(|s| {
+            if let MonitorWanted::On(dev) = s.monitor_wanted.clone()
+                && let Some(slot) = s.router.as_ref()
+                && s.monitor.is_none()
+            {
+                let feed = slot.router.monitor_feed();
+                let out = dev.as_deref().map_or_else(DeviceRef::default, DeviceRef::parse);
+                match Monitor::start(&feed, &out) {
+                    Ok(m) => s.monitor = Some(m),
+                    Err(e) => s.surface(format!("Hear Myself resume failed: {e}")),
+                }
+            }
+        });
+    }
+}
+
+fn stop_cal_preview() {
+    stop_cal_preview_loop_only();
+    set_calibration_preview(None);
+}
+
+fn resolve_preview_params(
+    paths: Option<&EnginePaths>,
+    cal: &Calibration,
+    style: VoiceStyle,
+    keep_pins: bool,
+) -> DspParams {
+    let owned_paths;
+    let resolved_paths = if let Some(p) = paths {
+        Some(p)
+    } else {
+        owned_paths = EnginePaths::system().ok();
+        owned_paths.as_ref()
+    };
+    let profile = resolved_paths.map_or_else(
+        || tine_protocol::presets::EndpointProfile::new("default", tine_protocol::presets::Archetype::default()),
+        |p| {
+            let endpoint = service_endpoint(p);
+            persist::load_profile(endpoint.as_str(), p).into_value()
+        },
+    );
+    let current = last_controller_params();
+    let macros = recommend_macros(cal, profile.archetype, style, profile.macros);
+    let mut pins = profile.pins;
+    if !keep_pins {
+        for id in CHANGED_PARAMS {
+            pins.unpin(id);
+        }
+        if style != VoiceStyle::KeepCurrent {
+            for m in DspMacro::ALL {
+                for &id in MacroMapper::drives(m) {
+                    pins.unpin(id);
+                }
+            }
+        }
+    }
+    let mut out = MacroMapper::apply(
+        tine_dsp::presets::builtin(profile.archetype),
+        Some(cal),
+        macros,
+        pins,
+        &current,
+    );
+    out.bypass = current.bypass;
+    out.clamped()
 }
 
 /// [`autotune_start`] against explicit persistence roots (test seam).
@@ -749,6 +1099,23 @@ pub fn autotune_start_on(paths: &EnginePaths) {
     // `spectrum_on` call can re-open `router_tap()` while Auto-Tune owns it.
     CALIBRATING.store(true, Ordering::Release);
     let cal_guard = CalibratingGuard;
+    let is_live_routed = routed_rate.is_some();
+    let phase_durations = if is_live_routed {
+        (LIVE_COUNTDOWN_S, LIVE_NOISE_S, LIVE_VOICE_S)
+    } else {
+        (COUNTDOWN_S, NOISE_S, VOICE_S)
+    };
+    let base_factory: Arc<dyn tine_engine::autotune::CalibratorFactory> = if is_live_routed {
+        Arc::new(LiveAutoCalibratorFactory)
+    } else {
+        Arc::new(tine_engine::autotune::AutoCalibratorFactory)
+    };
+    let captured_slot: Arc<Mutex<(Vec<f32>, u32)>> = Arc::new(Mutex::new((Vec::new(), ROUTER_FALLBACK_RATE)));
+    let factory: Arc<dyn tine_engine::autotune::CalibratorFactory> = Arc::new(CapturingCalibratorFactory {
+        inner: base_factory,
+        slot: Arc::clone(&captured_slot),
+    });
+    let paths_owned = paths.clone();
     let capture = match routed_rate {
         Some(rate) => {
             with(|s| {
@@ -758,10 +1125,7 @@ pub fn autotune_start_on(paths: &EnginePaths) {
                 s.frames = None;
             });
             tracing::debug!(target: "tine::services", rate_hz = rate, "auto-tune captures from the routing tap");
-            CaptureSpec::Source(Box::new(RouterTapSource {
-                tap: router_tap(),
-                rate_hz: rate,
-            }))
+            CaptureSpec::Source(Box::new(RouterTapSource::new(router_tap(), router_telemetry(), rate)))
         }
         None => CaptureSpec::Device {
             device: DeviceRef::Id(endpoint.as_str().to_owned()),
@@ -772,7 +1136,7 @@ pub fn autotune_start_on(paths: &EnginePaths) {
         client,
         controller: None, // the pipe's calibrate_apply owns application
         capture,
-        factory: Arc::new(tine_engine::autotune::AutoCalibratorFactory),
+        factory,
         preset: *tine_dsp::presets::builtin(profile.archetype),
         macros: profile.macros,
         pins: profile.pins,
@@ -789,6 +1153,7 @@ pub fn autotune_start_on(paths: &EnginePaths) {
             progress: 0.0,
             level_db: -90.0,
             voiced_ms: 0,
+            phase_durations,
         });
     });
     let mut handle = AutoTuneRunner::start(cfg);
@@ -815,36 +1180,99 @@ pub fn autotune_start_on(paths: &EnginePaths) {
                         tracing::info!(target: "tine::services", rate_hz, "auto-tune capture started");
                     }
                     AutoTuneEvent::Progress(p) => with(|s| {
+                        let next_prog = if p.phase == CalPhase::Analyzing {
+                            0.15
+                        } else {
+                            p.phase_progress
+                        };
                         s.autotune = Some(AutotuneState::Running {
                             phase: p.phase,
-                            progress: p.phase_progress,
+                            progress: next_prog,
                             level_db: p.live_level_db,
                             voiced_ms: p.voiced_ms,
+                            phase_durations,
                         });
                     }),
                     AutoTuneEvent::Done(outcome) => {
+                        // Release the bypass lease first so live DSP resumes right away.
                         with(|s| {
                             s.lease = None;
-                            s.autotune = match outcome {
-                                AutoTuneOutcome::Applied(report) => Some(AutotuneState::ReportPending {
-                                    summary: format!(
-                                        "measured noise {:+.1} dBFS, speech {:+.1} dBFS, verified peak {:+.1} dBFS",
-                                        report.calibration.noise_rms_db,
-                                        report.calibration.speech_rms_db,
-                                        report.simulated_peak_db
-                                    ),
-                                    report: *report,
-                                }),
-                                AutoTuneOutcome::Failed(failure) => Some(AutotuneState::Failed {
+                        });
+                        if is_live_routed && matches!(outcome, AutoTuneOutcome::Applied(_)) {
+                            for step in 2..=10 {
+                                if cancel.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let p = (step as f32) / 10.0;
+                                with(|s| {
+                                    if let Some(AutotuneState::Running {
+                                        level_db, voiced_ms, ..
+                                    }) = s.autotune
+                                    {
+                                        s.autotune = Some(AutotuneState::Running {
+                                            phase: CalPhase::Analyzing,
+                                            progress: p,
+                                            level_db,
+                                            voiced_ms,
+                                            phase_durations,
+                                        });
+                                    }
+                                });
+                                std::thread::sleep(Duration::from_millis(35));
+                            }
+                        }
+                        if cancel.load(Ordering::Acquire) {
+                            with(|s| {
+                                s.autotune = Some(AutotuneState::Failed {
+                                    failure: None,
+                                    message: "Auto-Tune failed: cancelled".to_owned(),
+                                });
+                            });
+                            break;
+                        }
+                        match outcome {
+                            AutoTuneOutcome::Applied(report) => {
+                                let (voice_vec, cap_rate) = captured_slot.lock().map_or_else(
+                                    |p| std::mem::take(&mut *p.into_inner()),
+                                    |mut g| std::mem::take(&mut *g),
+                                );
+                                let preview_params = resolve_preview_params(
+                                    Some(&paths_owned),
+                                    &report.calibration,
+                                    VoiceStyle::AutoBalanced,
+                                    true,
+                                );
+                                set_calibration_preview(Some(preview_params));
+                                with(|s| {
+                                    s.autotune = Some(AutotuneState::ReportPending {
+                                        summary: format!(
+                                            "measured noise {:+.1} dBFS, speech {:+.1} dBFS, verified peak {:+.1} dBFS",
+                                            report.calibration.noise_rms_db,
+                                            report.calibration.speech_rms_db,
+                                            report.simulated_peak_db
+                                        ),
+                                        report: *report,
+                                        captured_voice: Arc::new(voice_vec),
+                                        rate_hz: cap_rate,
+                                        preview_style: VoiceStyle::AutoBalanced,
+                                        preview_keep_pins: true,
+                                        audition_mode: None,
+                                    });
+                                });
+                            }
+                            AutoTuneOutcome::Failed(failure) => with(|s| {
+                                s.autotune = Some(AutotuneState::Failed {
                                     failure: Some(failure),
                                     message: format!("Auto-Tune rejected the capture: {failure:?}"),
-                                }),
-                                AutoTuneOutcome::Error(e) => Some(AutotuneState::Failed {
+                                });
+                            }),
+                            AutoTuneOutcome::Error(e) => with(|s| {
+                                s.autotune = Some(AutotuneState::Failed {
                                     failure: None,
                                     message: format!("Auto-Tune failed: {e}"),
-                                }),
-                            };
-                        });
+                                });
+                            }),
+                        }
                         break;
                     }
                 }
@@ -864,7 +1292,16 @@ pub fn autotune_start_on(paths: &EnginePaths) {
 /// the flag, cancels the run, and settles on the runner's terminal event
 /// (which also clears the bypass lease, T16).
 pub fn autotune_cancel() {
-    with(|s| s.autotune_cancel.store(true, Ordering::Release));
+    with(|s| {
+        s.autotune_cancel.store(true, Ordering::Release);
+        if matches!(
+            s.autotune,
+            Some(AutotuneState::ReportPending { .. } | AutotuneState::Failed { .. })
+        ) {
+            s.autotune = None;
+        }
+    });
+    stop_cal_preview();
 }
 
 /// Takes the pending Auto-Tune calibration for application (the pipe's
@@ -872,22 +1309,122 @@ pub fn autotune_cancel() {
 /// when no run has produced results (or they were already handled).
 #[must_use]
 pub fn autotune_take_pending() -> Option<Calibration> {
-    with(|s| match s.autotune.take() {
+    let cal = with(|s| match s.autotune.take() {
         Some(AutotuneState::ReportPending { report, .. }) => Some(report.calibration),
         other => {
             s.autotune = other;
             None
         }
-    })
+    });
+    if cal.is_some() {
+        stop_cal_preview();
+    }
+    cal
 }
 
 /// Discards the pending Auto-Tune results (the pipe's
 /// `calibrate_discard`); a no-op when there are none.
 pub fn autotune_discard() {
     let cleared = with(|s| s.autotune.take().is_some());
+    stop_cal_preview();
     if cleared {
         tracing::info!(target: "tine::services", "auto-tune results discarded");
     }
+}
+
+/// Previews the pending Auto-Tune calibration with `style` and `keep_pins`
+/// on the live DSP parameter block, and optionally loops the recorded voice
+/// in Tuned (`Some(false)`) or Raw (`Some(true)`) mode (`None` stops looping).
+#[must_use]
+pub fn autotune_preview(
+    style: VoiceStyle,
+    keep_pins: bool,
+    audition_raw: Option<bool>,
+    output_device: Option<&str>,
+) -> Value {
+    let pending = with(|s| match &s.autotune {
+        Some(AutotuneState::ReportPending {
+            report,
+            captured_voice,
+            rate_hz,
+            ..
+        }) => Some((report.calibration, Arc::clone(captured_voice), *rate_hz)),
+        _ => None,
+    });
+    let Some((cal, voice, rate_hz)) = pending else {
+        return autotune_state();
+    };
+
+    let preview_params = resolve_preview_params(EnginePaths::system().ok().as_ref(), &cal, style, keep_pins);
+    set_calibration_preview(Some(preview_params));
+
+    if let Some(play_raw) = audition_raw
+        && !voice.is_empty()
+    {
+        let paused_mon = with(|s| {
+            if let Some(m) = s.monitor.take() {
+                s.cal_preview_paused_monitor = true;
+                Some(m)
+            } else {
+                None
+            }
+        });
+        if let Some(m) = paused_mon {
+            m.stop();
+        }
+
+        let still_pending = with(|s| {
+            if !matches!(s.autotune, Some(AutotuneState::ReportPending { .. })) {
+                return false;
+            }
+            let engine = s.denoise_engine;
+            if let Some(player) = s.cal_preview_player.as_ref() {
+                player.update(preview_params, engine, play_raw);
+            } else {
+                let out_ref = output_device.map_or_else(DeviceRef::default, DeviceRef::parse);
+                s.cal_preview_player = Some(CalibrationPreviewPlayer::start(
+                    (*voice).clone(),
+                    rate_hz,
+                    out_ref,
+                    preview_params,
+                    engine,
+                    play_raw,
+                ));
+            }
+            if let Some(AutotuneState::ReportPending {
+                preview_style,
+                preview_keep_pins,
+                audition_mode,
+                ..
+            }) = s.autotune.as_mut()
+            {
+                *preview_style = style;
+                *preview_keep_pins = keep_pins;
+                *audition_mode = Some(play_raw);
+            }
+            true
+        });
+        if !still_pending {
+            stop_cal_preview();
+        }
+    } else {
+        stop_cal_preview_loop_only();
+        with(|s| {
+            if let Some(AutotuneState::ReportPending {
+                preview_style,
+                preview_keep_pins,
+                audition_mode,
+                ..
+            }) = s.autotune.as_mut()
+            {
+                *preview_style = style;
+                *preview_keep_pins = keep_pins;
+                *audition_mode = None;
+            }
+        });
+    }
+
+    autotune_state()
 }
 
 /// JSON-able snapshot of the Auto-Tune flow for `status`-side consumers
@@ -904,25 +1441,57 @@ pub fn autotune_state() -> Value {
             progress,
             level_db,
             voiced_ms,
+            phase_durations: (cd_s, noise_s, voice_s),
         }) => {
+            let p = progress.clamp(0.0, 1.0);
+            let remaining_secs = match phase {
+                CalPhase::Countdown => cd_s * (1.0 - p),
+                CalPhase::Noise => noise_s * (1.0 - p),
+                CalPhase::Voice => voice_s * (1.0 - p),
+                CalPhase::Analyzing | CalPhase::Done | CalPhase::Failed => 0.0,
+            };
+            let denom = (noise_s + voice_s).max(0.001);
+            let overall_progress = match phase {
+                CalPhase::Countdown => 0.0,
+                CalPhase::Noise => (p * noise_s / denom).clamp(0.0, 1.0),
+                CalPhase::Voice => ((noise_s + p * voice_s) / denom).clamp(0.0, 1.0),
+                CalPhase::Analyzing | CalPhase::Done | CalPhase::Failed => 1.0,
+            };
             json!({
                 "flow": "running",
                 "phase": format!("{phase:?}"),
                 "progress": progress,
+                "remaining_secs": remaining_secs,
+                "overall_progress": overall_progress,
                 "level_db": level_db,
                 "voiced_ms": voiced_ms,
             })
         }
-        Some(AutotuneState::ReportPending { report, summary }) => {
+        Some(AutotuneState::ReportPending {
+            report,
+            summary,
+            captured_voice,
+            audition_mode,
+            ..
+        }) => {
             let cal = &report.calibration;
             json!({
                 "flow": "report-pending",
                 "summary": summary,
                 "report": {
                     "noise_rms_db": cal.noise_rms_db,
+                    "noise_peak_db": cal.noise_peak_db,
                     "speech_rms_db": cal.speech_rms_db,
+                    "crest_db": cal.crest_db,
+                    "tilt_db": cal.tilt_db,
                     "simulated_peak_db": report.simulated_peak_db,
                     "simulated_rms_db": report.simulated_rms_db,
+                    "audition_mode": match audition_mode {
+                        None => "stopped",
+                        Some(false) => "tuned",
+                        Some(true) => "raw",
+                    },
+                    "has_voice_preview": !captured_voice.is_empty(),
                     "changes": report.changes.iter().map(|&(id, before, after)| {
                         json!({
                             "key": crate::ui_bridge::param_key(id).unwrap_or_default(),
@@ -1177,17 +1746,158 @@ pub fn monitor_status() -> Value {
     })
 }
 
+/// Returns `true` when the active "Hear Myself" monitor stream reported a device error.
+#[must_use]
+pub fn monitor_has_error() -> bool {
+    with(|s| s.monitor.as_ref().is_some_and(Monitor::has_error))
+}
+
+/// Rebuilds the active "Hear Myself" monitor stream after an error or sleep/resume event.
+#[must_use]
+pub fn monitor_recover(output_device: Option<&str>) -> bool {
+    let should_recover = with(|s| {
+        if let Some(m) = s.monitor.take() {
+            m.stop();
+            true
+        } else {
+            !matches!(s.monitor_wanted, MonitorWanted::Off)
+        }
+    });
+    if !should_recover {
+        return false;
+    }
+    monitor_apply(true, output_device);
+    with(|s| s.monitor.is_some())
+}
+
+/// Starts a 5-second Mic Check (Raw vs Tine sample-aligned A/B) session.
+#[must_use]
+pub fn mic_check_start(params: DspParams, output_device: Option<&str>) -> Value {
+    stop_cal_preview();
+    let _ = router_wake("mic-check");
+    let out_ref = output_device.map_or_else(DeviceRef::default, DeviceRef::parse);
+    let mut err: Option<String> = None;
+    let prev = with(|s| s.mic_check.take());
+    if let Some(old) = prev {
+        old.stop();
+    }
+    let old_mon = with(|s| {
+        if let Some(m) = s.monitor.take() {
+            s.mic_check_paused_monitor = true;
+            Some(m)
+        } else {
+            None
+        }
+    });
+    if let Some(m) = old_mon {
+        m.stop();
+    }
+    with(|s| {
+        let Some(slot) = s.router.as_ref() else {
+            err = Some("Mic Check requires an active microphone routing loop.".to_owned());
+            return;
+        };
+        let feed = slot.router.raw_capture_feed();
+        s.mic_check = Some(MicCheckRunner::start(feed, out_ref, params, s.denoise_engine));
+    });
+    if let Some(message) = err {
+        mic_check_restore_monitor();
+        return json!({ "flow": "failed", "message": message });
+    }
+    mic_check_query()
+}
+
+/// Current state of the 5-second Mic Check flow for `mic_check_query`.
+#[must_use]
+pub fn mic_check_query() -> Value {
+    with(|s| match s.mic_check.as_ref().map(MicCheckRunner::state) {
+        None | Some(MicCheckState::Idle) => json!({ "flow": "idle" }),
+        Some(MicCheckState::Recording { progress, level_db }) => json!({
+            "flow": "recording",
+            "progress": progress,
+            "level_db": level_db,
+        }),
+        Some(MicCheckState::Playing {
+            mode,
+            progress,
+            duration_s,
+        }) => json!({
+            "flow": "playing",
+            "raw": mode == MicCheckMode::Raw,
+            "progress": progress,
+            "duration_s": duration_s,
+        }),
+        Some(MicCheckState::Failed(message)) => json!({
+            "flow": "failed",
+            "message": message,
+        }),
+    })
+}
+
+/// Switches Mic Check playback between Tine (`false`) and raw mic (`true`).
+#[must_use]
+pub fn mic_check_set_mode(raw: bool) -> bool {
+    with(|s| {
+        if let Some(mc) = s.mic_check.as_ref() {
+            mc.set_mode(if raw {
+                MicCheckMode::Raw
+            } else {
+                MicCheckMode::Processed
+            });
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// Stops any active Mic Check recording/playback and restores paused monitoring.
+pub fn mic_check_stop() {
+    let runner = with(|s| s.mic_check.take());
+    if let Some(mc) = runner {
+        mc.stop();
+    }
+    mic_check_restore_monitor();
+}
+
+fn mic_check_restore_monitor() {
+    with(|s| {
+        if !s.mic_check_paused_monitor {
+            return;
+        }
+        s.mic_check_paused_monitor = false;
+        if let MonitorWanted::On(dev) = s.monitor_wanted.clone()
+            && let Some(slot) = s.router.as_ref()
+            && s.monitor.is_none()
+        {
+            let feed = slot.router.monitor_feed();
+            let out = dev.as_deref().map_or_else(DeviceRef::default, DeviceRef::parse);
+            match Monitor::start(&feed, &out) {
+                Ok(m) => s.monitor = Some(m),
+                Err(e) => s.surface(format!("Hear Myself resume failed: {e}")),
+            }
+        }
+    });
+}
+
 /// Tears every service down (shutdown path): monitor streams, the
 /// Auto-Tune mirror and lease shim, the routing loop, and the
 /// visualizer pump. Idempotent.
 pub fn shutdown() {
     CALIBRATING.store(false, Ordering::Release);
     GATE_STOP.store(true, Ordering::Release);
-    with(|s| {
+    wake_gate();
+    let preview_player = with(|s| {
         s.monitor_wanted = MonitorWanted::Off;
         if let Some(m) = s.monitor.take() {
             m.stop();
         }
+        if let Some(mc) = s.mic_check.take() {
+            mc.stop();
+        }
+        s.mic_check_paused_monitor = false;
+        let player = s.cal_preview_player.take();
+        s.cal_preview_paused_monitor = false;
         s.autotune = None;
         s.autotune_cancel.store(true, Ordering::Release);
         s.lease = None;
@@ -1199,7 +1909,10 @@ pub fn shutdown() {
             v.stop();
         }
         s.frames = None;
+        player
     });
+    drop(preview_player);
+    set_calibration_preview(None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,15 +1921,43 @@ pub fn shutdown() {
 
 /// Set on shutdown so the gate never resumes a loop the app is tearing down.
 static GATE_STOP: AtomicBool = AtomicBool::new(false);
+static GATE_WAKE: OnceLock<Arc<SessionWake>> = OnceLock::new();
+
+fn gate_wake_signal() -> &'static Arc<SessionWake> {
+    GATE_WAKE.get_or_init(SessionWake::new)
+}
+
+/// Wakes the listener gate immediately when internal need or policy changes.
+pub fn wake_gate() {
+    gate_wake_signal().notify();
+}
+
+/// Returns `true` when automatic idle parking is enabled (`false` = Keep Warm / PTT mode).
+#[must_use]
+pub fn park_when_unused() -> bool {
+    with(|s| s.park_when_unused)
+}
+
+/// Enables or disables automatic idle parking (disabling keeps the DSP warm for PTT).
+pub fn set_park_when_unused(enabled: bool) {
+    with(|s| s.park_when_unused = enabled);
+    if !enabled {
+        let _ = router_wake("keep-warm");
+    }
+    wake_gate();
+}
 
 /// Whether something inside Tine consumes the processed signal right now:
-/// "Hear Myself", the window's meters/spectrum, or Auto-Tune.
+/// Keep-Warm PTT mode, "Hear Myself", the window's meters/spectrum, Mic Check,
+/// or Auto-Tune.
 fn internal_need(s: &Services) -> bool {
-    !matches!(s.monitor_wanted, MonitorWanted::Off)
+    !s.park_when_unused
+        || !matches!(s.monitor_wanted, MonitorWanted::Off)
         || s.monitor.is_some()
         || s.visualizer.is_some()
         || s.last_pull.is_some_and(|t| t.elapsed() < VISUALIZER_TAIL)
         || s.autotune.is_some()
+        || s.mic_check.is_some()
         || s.lease.is_some()
         || CALIBRATING.load(Ordering::Acquire)
 }
@@ -1241,6 +1982,7 @@ pub fn router_wake(reason: &str) -> bool {
             }
         });
     }
+    wake_gate();
     routed
 }
 
@@ -1284,11 +2026,11 @@ fn gate_loop() {
             return;
         }
     };
+    let wake = Arc::clone(gate_wake_signal());
     let own_pid = std::process::id();
     let mut policy = ParkPolicy::default();
+    let mut hook: Option<(String, CableSessionEventHook)> = None;
     loop {
-        let parked = with(|s| s.parked.is_some());
-        std::thread::sleep(if parked { PARKED_POLL } else { RUNNING_POLL });
         if GATE_STOP.load(Ordering::Acquire) {
             return;
         }
@@ -1300,13 +2042,28 @@ fn gate_loop() {
         // Router down for another reason (error backoff, no cable): the
         // shell's recovery owns it; the gate only acts on its own states.
         let Some(sink) = sink else {
+            hook = None;
             policy = ParkPolicy::default();
+            let _ = wake.wait_timeout(RUNNING_POLL);
             continue;
         };
+
+        if hook.as_ref().is_some_and(|(s, _)| s != &sink) {
+            hook = None;
+        }
+        if hook.is_none()
+            && let Ok(Some(h)) = watcher.attach_event_hook(&|name| is_sink_capture_side(name, &sink), Arc::clone(&wake))
+        {
+            tracing::debug!(target: "tine::services", sink = %sink, "attached event-driven WASAPI session hook");
+            hook = Some((sink.clone(), h));
+        }
+
         // Unknown (probe error, capture side missing) counts as listening.
-        let listener = match watcher.sessions(&|name| is_sink_capture_side(name, &sink)) {
-            Ok(Some(list)) => foreign_listener(&list, own_pid),
-            Ok(None) | Err(_) => true,
+        let listener = if let Ok(Some(list)) = watcher.sessions(&|name| is_sink_capture_side(name, &sink)) {
+            foreign_listener(&list, own_pid)
+        } else {
+            hook = None;
+            true
         };
         let needed = listener || with(|s| internal_need(s));
         match policy.decide(Instant::now(), parked, needed) {
@@ -1317,6 +2074,21 @@ fn gate_loop() {
                 }
             }
             GateAction::Stay => {}
+        }
+
+        let wait_dur = if hook.is_some() {
+            Duration::from_secs(if parked { 5 } else { 2 })
+        } else if parked {
+            PARKED_POLL
+        } else {
+            RUNNING_POLL
+        };
+        let signaled = wake.wait_timeout(wait_dur);
+        if GATE_STOP.load(Ordering::Acquire) {
+            return;
+        }
+        if signaled && let Some((_, h)) = hook.as_mut() {
+            h.refresh_sessions();
         }
     }
 }
@@ -1497,6 +2269,7 @@ mod tests {
                 progress: 0.0,
                 level_db: -90.0,
                 voiced_ms: 0,
+                phase_durations: (COUNTDOWN_S, NOISE_S, VOICE_S),
             });
         });
         autotune_start_on(&paths);
@@ -1536,6 +2309,11 @@ mod tests {
             s.autotune = Some(AutotuneState::ReportPending {
                 report,
                 summary: "measured".to_owned(),
+                captured_voice: Arc::new(Vec::new()),
+                rate_hz: ROUTER_FALLBACK_RATE,
+                preview_style: VoiceStyle::AutoBalanced,
+                preview_keep_pins: true,
+                audition_mode: None,
             });
         });
         autotune_start_on(&paths);
@@ -1545,6 +2323,78 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("apply or discard the pending Auto-Tune results")),
             "pending results must be protected with an actionable message"
+        );
+    }
+
+    #[test]
+    fn autotune_preview_updates_param_block_and_reverts_on_discard() {
+        let _guard = lock_test();
+        super::shutdown();
+        let baseline = DspParams::DEFAULT;
+        publish_params(&baseline);
+
+        let report = tine_engine::autotune::CalibrationReport {
+            calibration: tine_protocol::presets::Calibration {
+                noise_rms_db: -50.0,
+                noise_peak_db: -44.0,
+                speech_rms_db: -22.0,
+                crest_db: 12.0,
+                tilt_db: 3.0,
+                derived: tine_protocol::presets::CalibrationOverrides {
+                    input_gain_db: 4.0,
+                    gate_threshold_db: -44.0,
+                    denoise_mix: 0.50,
+                    comp_thresh_db: -16.0,
+                    comp_makeup_db: 2.0,
+                },
+            },
+            changes: [
+                (tine_protocol::params::ParamId::InputGainDb, 0.0, 4.0),
+                (tine_protocol::params::ParamId::GateThresholdDb, -40.0, -44.0),
+                (tine_protocol::params::ParamId::DenoiseMix, 0.5, 0.50),
+                (tine_protocol::params::ParamId::CompThreshDb, -20.0, -16.0),
+                (tine_protocol::params::ParamId::CompMakeupDb, 0.0, 2.0),
+            ],
+            simulated_peak_db: -7.5,
+            simulated_rms_db: -20.0,
+        };
+        with(|s| {
+            s.autotune = Some(AutotuneState::ReportPending {
+                report,
+                summary: "measured".to_owned(),
+                captured_voice: Arc::new(Vec::new()),
+                rate_hz: ROUTER_FALLBACK_RATE,
+                preview_style: VoiceStyle::AutoBalanced,
+                preview_keep_pins: true,
+                audition_mode: None,
+            });
+        });
+
+        let state_b = autotune_preview(VoiceStyle::Broadcast, true, None, None);
+        assert_eq!(state_b["flow"], "report-pending");
+        assert_eq!(state_b["report"]["audition_mode"], "stopped");
+        assert_eq!(state_b["report"]["has_voice_preview"], false);
+
+        let block = param_block();
+        let mut generation = 0_u64;
+        let mut params_broadcast = DspParams::DEFAULT;
+        assert!(block.load_if_changed(&mut generation, &mut params_broadcast));
+
+        let _state_c = autotune_preview(VoiceStyle::Crisp, true, None, None);
+        let mut params_crisp = DspParams::DEFAULT;
+        assert!(block.load_if_changed(&mut generation, &mut params_crisp));
+        assert_ne!(
+            params_broadcast, params_crisp,
+            "Broadcast and Crisp previews must differ"
+        );
+
+        autotune_discard();
+        let mut params_reverted = DspParams::DEFAULT;
+        assert!(block.load_if_changed(&mut generation, &mut params_reverted));
+        assert_eq!(
+            params_reverted,
+            last_controller_params(),
+            "discard must revert param_block() back to last_controller_params()"
         );
     }
 

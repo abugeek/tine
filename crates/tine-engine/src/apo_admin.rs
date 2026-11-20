@@ -89,9 +89,9 @@ pub fn list_capture_endpoints() -> Result<Vec<CaptureEndpoint>, ApoError> {
         .collect())
 }
 
-/// Scans Windows render endpoints for a true VB-Audio Virtual Cable sink
-/// (`CABLE Input` or `VB-Audio`), never matching `SteelSeries Sonar` or
-/// generic `Virtual Audio` playback devices.
+/// Scans Windows render endpoints for a supported virtual audio cable sink
+/// (`CABLE Input`, `Hi-Fi Cable`, `VB-Audio`, `VoiceMeeter`, or `Virtual Audio Cable`),
+/// never matching `SteelSeries Sonar` or generic `Virtual Audio` playback devices.
 ///
 /// Prefers active (`is_available == true`) endpoints and `CABLE Input` matches.
 pub fn find_virtual_cable_sink() -> Result<Option<VirtualSinkInfo>, ApoError> {
@@ -100,12 +100,17 @@ pub fn find_virtual_cable_sink() -> Result<Option<VirtualSinkInfo>, ApoError> {
 }
 
 /// Returns `true` if `name` identifies a virtual audio cable or virtual mixer
-/// capture endpoint (such as `CABLE Output`, `VB-Audio`, or `Sonar - Microphone`)
-/// that must not be chosen as Tine's default physical microphone input.
+/// capture endpoint (such as `CABLE Output`, `VB-Audio`, `VoiceMeeter`,
+/// `Virtual Audio Cable`, or `Sonar - Microphone`) that must not be chosen
+/// as Tine's default physical microphone input.
 #[must_use]
 pub fn is_virtual_cable_capture(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.contains("cable output") || lower.contains("vb-audio") || lower.contains("sonar - microphone")
+    lower.contains("cable output")
+        || lower.contains("vb-audio")
+        || lower.contains("voicemeeter")
+        || lower.contains("virtual audio cable")
+        || lower.contains("sonar - microphone")
 }
 
 /// Returns the preferred physical capture endpoint ID, preferring the Windows
@@ -162,10 +167,17 @@ fn virtual_cable_priority(name: &str, is_active: bool) -> Option<u8> {
     if lower.contains("steelseries") || lower.contains("sonar") {
         return None;
     }
-    let base = if lower.contains("cable input") {
+    let base = if lower.starts_with("cable input") {
         0
-    } else if lower.contains("vb-audio") {
+    } else if lower.contains("cable input") {
+        1
+    } else if lower.contains("vb-audio")
+        || lower.contains("voicemeeter input")
+        || lower.contains("voicemeeter aux input")
+    {
         2
+    } else if lower.contains("virtual audio cable") {
+        3
     } else {
         return None;
     };
@@ -307,10 +319,54 @@ mod tests {
         assert!(is_virtual_cable_capture("CABLE Output (VB-Audio Virtual Cable)"));
         assert!(is_virtual_cable_capture("Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)"));
         assert!(is_virtual_cable_capture(
+            "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)"
+        ));
+        assert!(is_virtual_cable_capture("Line 1 (Virtual Audio Cable)"));
+        assert!(is_virtual_cable_capture(
             "SteelSeries Sonar - Microphone (SteelSeries Sonar Virtual Audio Device)"
         ));
         assert!(!is_virtual_cable_capture("Microphone (FIFINE USB Microphone)"));
         assert!(!is_virtual_cable_capture("Headset Microphone (HyperX Cloud II)"));
+    }
+
+    #[test]
+    fn select_virtual_cable_supports_hifi_voicemeeter_and_vac_fallbacks() {
+        let hifi = vec![
+            rec("1", "Speakers (Realtek High Definition Audio)", true),
+            rec("2", "Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)", true),
+        ];
+        assert_eq!(
+            select_virtual_cable_sink(&hifi).map(|s| s.name),
+            Some("Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)".to_owned())
+        );
+
+        let voicemeeter = vec![
+            rec("1", "Speakers (Realtek High Definition Audio)", true),
+            rec("2", "VoiceMeeter Input (VoiceMeeter VAIO)", true),
+        ];
+        assert_eq!(
+            select_virtual_cable_sink(&voicemeeter).map(|s| s.name),
+            Some("VoiceMeeter Input (VoiceMeeter VAIO)".to_owned())
+        );
+
+        let vac = vec![
+            rec("1", "Speakers (Realtek High Definition Audio)", true),
+            rec("2", "Line 1 (Virtual Audio Cable)", true),
+        ];
+        assert_eq!(
+            select_virtual_cable_sink(&vac).map(|s| s.name),
+            Some("Line 1 (Virtual Audio Cable)".to_owned())
+        );
+
+        let all = vec![
+            rec("1", "Line 1 (Virtual Audio Cable)", true),
+            rec("2", "VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)", true),
+            rec("3", "CABLE Input (VB-Audio Virtual Cable)", true),
+        ];
+        assert_eq!(
+            select_virtual_cable_sink(&all).map(|s| s.name),
+            Some("CABLE Input (VB-Audio Virtual Cable)".to_owned())
+        );
     }
 
     #[test]

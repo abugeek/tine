@@ -18,7 +18,7 @@ use rune::{El, col, el, row, text};
 use tine_protocol::presets::Archetype;
 
 use crate::intent::Intent;
-use crate::model::ApoBadge;
+use crate::model::{ApoBadge, MicCheckStep};
 use crate::state::AppState;
 use crate::theme::{TineTheme, radii, spacing, typography};
 
@@ -35,9 +35,11 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
         .px(spacing::XL)
         .py(spacing::LG)
         .gap(spacing::MD)
-        .radius(radii::LG)
-        .fill(t.surface_raised)
-        .border(1.0, t.accent)
+        .radius(radii::LG + 4.0)
+        .fill(t.surface)
+        .gradient(t.surface_raised, t.surface)
+        .border(1.0, t.border_strong)
+        .shadow(24.0, 64.0, crate::views::kit::oklcha_black(0.6))
         .transition(
             rune::Transition::scale(0.96)
                 .combined(rune::Transition::opacity())
@@ -63,7 +65,7 @@ pub fn view(s: &AppState, t: TineTheme) -> El {
         .w_full()
         .h_full()
         .center()
-        .fill(rune::color::oklcha(0.0, 0.0, 0.0, 0.65))
+        .fill(t.scrim)
         .child(card)
 }
 
@@ -79,7 +81,7 @@ pub fn dots(step: u8, t: TineTheme) -> El {
                 .w(if i == step { 22.0 } else { 8.0 })
                 .h(8.0)
                 .radius(radii::PILL)
-                .fill(if i <= step { t.accent } else { t.border }),
+                .fill(if i <= step { t.accent } else { t.surface_hover }),
         );
     }
     strip
@@ -92,13 +94,21 @@ fn step1_mic(s: &AppState, t: TineTheme) -> El {
         .key("onboarding/step-1")
         .w_full()
         .gap(spacing::MD)
-        .child(title("Welcome to Tine", t.text))
+        .child(
+            row()
+                .key("onboarding/welcome")
+                .gap(spacing::MD)
+                .center()
+                .child(crate::views::kit::brand_mark("onboarding/mark", 40.0, t))
+                .child(title("Welcome to Tine", t.text)),
+        )
         .child(
             text(
-                "Pick the microphone you talk into. Tine's archetype suggestion comes from your device's form factor.",
+                "Pick the microphone you talk into. Tine suggests a mic type from your device; change it if it's wrong.",
             )
             .font(typography::BODY)
-            .color(t.text_dim),
+            .color(t.text_dim)
+            .wrap(),
         );
 
     // Endpoint list: radio pills; model.selected marks the current one.
@@ -120,23 +130,27 @@ fn step1_mic(s: &AppState, t: TineTheme) -> El {
                 .checked(selected)
                 .label(format!("Microphone {idx}: {name}"))
                 .focusable(true)
-                .h(30.0)
+                .h(36.0)
                 .px(spacing::MD)
                 .gap(spacing::SM)
                 .center()
                 .radius(radii::MD)
-                .fill(if selected { t.accent_glow } else { t.surface })
-                .border(1.0, if selected { t.accent } else { t.border })
+                .cursor(rune::Cursor::Pointer)
+                .fill(if selected { t.accent_soft } else { t.well })
+                .border(1.0, if selected { t.accent_glow } else { t.border })
+                .hover(if selected { t.accent_soft } else { t.surface_raised })
                 .on_press(move |s: &mut AppState| {
                     s.model.selected = Some(idx);
                     s.emit(Intent::SelectEndpoint(id.clone()));
                 })
-                .child(
-                    text(if selected { "(•)" } else { "( )" })
-                        .font(typography::CAPTION)
-                        .color(t.accent),
-                )
-                .child(text(name).font(typography::BODY).color(t.text)),
+                .child(radio_dot(format!("onboarding/mic-{idx}/dot"), selected, t))
+                .child(crate::views::kit::glyph_el(
+                    &crate::views::kit::glyph::MIC,
+                    15.0,
+                    if selected { t.accent_text } else { t.text_dim },
+                ))
+                .child(text(name).font(typography::BODY).color(t.text))
+                .child(el().key("spacer").grow(1.0)),
         );
     }
     body = body.child(list);
@@ -156,12 +170,14 @@ fn step1_mic(s: &AppState, t: TineTheme) -> El {
             .checked(selected)
             .label(name)
             .focusable(true)
-            .h(26.0)
+            .h(30.0)
             .px(spacing::MD)
+            .gap(6.0)
             .center()
             .radius(radii::PILL)
-            .fill(if selected { t.accent } else { t.surface })
-            .border(1.0, t.border)
+            .cursor(rune::Cursor::Pointer)
+            .fill(if selected { t.accent_soft } else { t.well })
+            .border(1.0, if selected { t.accent_glow } else { t.border })
             .on_press(move |s: &mut AppState| {
                 s.model.archetype = arch;
                 s.emit(Intent::SetArchetype(arch));
@@ -169,16 +185,20 @@ fn step1_mic(s: &AppState, t: TineTheme) -> El {
             .child(
                 text(name)
                     .font(typography::LABEL)
-                    .color(if selected { t.text_on_accent } else { t.text }),
+                    .color(if selected { t.accent_text } else { t.text }),
             );
         if selected {
             pill = pill.child(
-                text("suggested")
+                row()
                     .key(format!("onboarding/arch-suggested-{}", archetype_id(arch)))
                     .role("label")
                     .label("Suggested archetype")
-                    .font(typography::CAPTION)
-                    .color(t.text_on_accent),
+                    .h(16.0)
+                    .px(6.0)
+                    .center()
+                    .radius(radii::PILL)
+                    .fill(t.accent)
+                    .child(text("suggested").font(typography::EYEBROW).color(t.text_on_accent)),
             );
         }
         archs = archs.child(pill);
@@ -231,7 +251,8 @@ fn step2_apo(s: &AppState, t: TineTheme) -> El {
                  so Discord, OBS, and games can receive your processed voice.",
             )
             .font(typography::BODY)
-            .color(t.text_dim),
+            .color(t.text_dim)
+            .wrap(),
         );
 
     match (&s.model.apo, s.ui.apo_installing) {
@@ -329,7 +350,8 @@ fn step3_autotune(_s: &AppState, t: TineTheme) -> El {
                  baseline. You need 8 quiet seconds — 3 silent, 5 speaking normally.",
             )
             .font(typography::BODY)
-            .color(t.text_dim),
+            .color(t.text_dim)
+            .wrap(),
         )
         .child(
             row()
@@ -363,7 +385,8 @@ fn step4_finish(s: &AppState, t: TineTheme) -> El {
                  microphone. Try it with Hear Myself, and mind the ~30 ms monitoring delay.",
             )
             .font(typography::BODY)
-            .color(t.text_dim),
+            .color(t.text_dim)
+            .wrap(),
         )
         .child(
             row()
@@ -371,6 +394,14 @@ fn step4_finish(s: &AppState, t: TineTheme) -> El {
                 .gap(spacing::SM)
                 .child(button("onboarding/back-4", "Back", false, t, |s| {
                     s.ui.onboarding_step = 3;
+                }))
+                .child(button("onboarding/mic-check", "Record 5s Mic Check", false, t, |s| {
+                    s.ui.onboarding_dismissed = true;
+                    s.model.mic_check = MicCheckStep::Recording {
+                        progress: 0.0,
+                        level_db: -60.0,
+                    };
+                    s.emit(Intent::StartMicCheck);
                 }))
                 .child(monitor_test_button(s, t))
                 .child(button("onboarding/finish", "Finish", true, t, |s| {
@@ -428,21 +459,33 @@ fn button(
     t: TineTheme,
     on_press: impl Fn(&mut AppState) + 'static,
 ) -> El {
-    let bg = if primary { t.accent } else { t.surface };
-    let fg = if primary { t.text_on_accent } else { t.text };
-    row()
-        .key(key)
-        .role("button")
-        .label(label)
-        .focusable(true)
-        .h(28.0)
-        .px(spacing::LG)
-        .center()
-        .radius(radii::PILL)
-        .fill(bg)
-        .border(1.0, t.border)
-        .on_press(on_press)
-        .child(text(label).font(typography::LABEL).color(fg))
+    let tone = if primary {
+        crate::views::kit::Tone::Primary
+    } else {
+        crate::views::kit::Tone::Secondary
+    };
+    // Wrapped in a row so a button placed directly in the card's column keeps its
+    // natural width instead of stretching across the card.
+    row().key(format!("{key}/slot")).child(crate::views::kit::button(
+        key,
+        "button",
+        label.to_owned(),
+        tone,
+        None,
+        t,
+        on_press,
+    ))
+}
+
+/// A radio indicator: ring, with an ember dot when selected.
+fn radio_dot(key: String, selected: bool, t: TineTheme) -> El {
+    let ring = row().key(key).size(16.0, 16.0).center().radius(8.0);
+    if selected {
+        ring.border(2.0, t.accent)
+            .child(el().key("inner").size(8.0, 8.0).radius(4.0).fill(t.accent))
+    } else {
+        ring.border(1.5, t.border_strong)
+    }
 }
 
 #[cfg(test)]

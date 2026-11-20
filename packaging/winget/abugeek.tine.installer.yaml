@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: abugeek.tine
+PackageVersion: 0.1.0
+InstallerLocale: en-US
+MinimumOSVersion: 10.0.19045.0
+InstallerType: wix
+Scope: machine
+UpgradeBehavior: install
+AppsAndFeaturesEntries:
+  - DisplayName: Tine
+    Publisher: Tine Contributors
+    DisplayVersion: 0.1.0
+    UpgradeCode: '{159D5692-2CCF-4639-8F1A-B4B4331F41BC}'
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/abugeek/tine/releases/download/v0.1.0/tine-0.1.0-x64.msi
+    InstallerSha256: BA57FCED2EA75345F073D3B9E512FA1DB4709BCAAF73D6BAE22600862EB6E58A
+ManifestType: installer
+ManifestVersion: 1.6.0

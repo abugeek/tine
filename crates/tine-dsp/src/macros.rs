@@ -20,14 +20,15 @@
 //! * **Body** — low-shelf gain (band 0) swings ±4 dB around the base (documented
 //!   `−2 → +6 dB` span); the mud cut (band 1) only *deepens* above the centre,
 //!   down to `−5 dB` at `m = 1` (never boosts the mud).
-//! * **Presence** — the presence peak (band 3) and air shelf (band 4) only
-//!   *boost*, up to `+5 dB` / `+6 dB` above the centre. The de-esser turns on
-//!   above `0.6` (or stays on when the archetype base enables it), with its
-//!   amount scaling `0.6 → 1.0` ⇒ `3 → 8 dB`.
+//! * **Presence** — the presence peak (band 3) and air shelf (band 4) boost
+//!   above centre (up to `+5 dB` / `+6 dB` at `m = 1`) and soften below centre
+//!   (down to `−3 dB` / `−4 dB` at `m = 0`). The de-esser turns on above `0.6`
+//!   (or stays on when the archetype base enables it), with its amount scaling
+//!   `0.6 → 1.0` ⇒ `3 → 8 dB`.
 //! * **Leveler** — compressor ratio swings ±1.75 around the base (documented
-//!   `1.5 → 5` span); the threshold only *lowers* from the effective threshold,
-//!   by up to `10 dB` at `m = 1` (`calibrated threshold − 0..10 dB`); auto-makeup
-//!   is on (a calibration supplies a verified manual makeup instead).
+//!   `1.5 → 5` span); the threshold lowers by up to `10 dB` above centre
+//!   (`m = 1`) and relaxes up by up to `6 dB` below centre (`m = 0`);
+//!   auto-makeup is on (a calibration supplies a verified manual makeup instead).
 //!
 //! # Pin rule (D-007)
 //!
@@ -55,8 +56,12 @@ pub const BODY_MUD_CUT_DB: f32 = 5.0;
 
 /// Presence: presence-peak (band 3) boost in dB at `presence = 1` (doc: `0 → +5 dB`).
 pub const PRESENCE_PEAK_BOOST_DB: f32 = 5.0;
+/// Presence: presence-peak (band 3) cut magnitude in dB at `presence = 0` (`−3 dB`).
+pub const PRESENCE_PEAK_CUT_DB: f32 = 3.0;
 /// Presence: air-shelf (band 4) boost in dB at `presence = 1` (doc: `0 → +6 dB`).
 pub const PRESENCE_AIR_BOOST_DB: f32 = 6.0;
+/// Presence: air-shelf (band 4) cut magnitude in dB at `presence = 0` (`−4 dB`).
+pub const PRESENCE_AIR_CUT_DB: f32 = 4.0;
 /// Presence: macro position above which the dynamic de-esser engages.
 pub const PRESENCE_DEESSER_POS: f32 = 0.6;
 /// Presence: de-esser amount (dB) at the engagement position.
@@ -68,6 +73,8 @@ pub const PRESENCE_DEESSER_MAX_DB: f32 = 8.0;
 pub const LEVELER_RATIO_SPAN: f32 = 3.5;
 /// Leveler: threshold drop (dB) at `leveler = 1` (doc: `effective threshold − 0..10 dB`).
 pub const LEVELER_THRESH_CUT_DB: f32 = 10.0;
+/// Leveler: threshold relief (dB) at `leveler = 0` (`effective threshold + 6 dB`).
+pub const LEVELER_THRESH_RELIEF_DB: f32 = 6.0;
 
 /// The four Golden Line macro nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -258,20 +265,20 @@ impl MacroMapper {
             *gain -= upper(m.body) * BODY_MUD_CUT_DB;
         }
 
-        // Presence: peak/air boosts, dynamic de-essing above the engagement point.
+        // Presence: peak/air soften below centre, boost above centre, dynamic de-essing above 0.6.
         if let Some(gain) = out.eq_gain_db.get_mut(Band::B3.index()) {
-            *gain += upper(m.presence) * PRESENCE_PEAK_BOOST_DB;
+            *gain += upper(m.presence) * PRESENCE_PEAK_BOOST_DB + lower(m.presence) * PRESENCE_PEAK_CUT_DB;
         }
         if let Some(gain) = out.eq_gain_db.get_mut(Band::B4.index()) {
-            *gain += upper(m.presence) * PRESENCE_AIR_BOOST_DB;
+            *gain += upper(m.presence) * PRESENCE_AIR_BOOST_DB + lower(m.presence) * PRESENCE_AIR_CUT_DB;
         }
         out.deesser_enabled = out.deesser_enabled || m.presence > PRESENCE_DEESSER_POS;
         out.deesser_amount_db = out.deesser_amount_db.max(deesser_amount(m.presence));
 
-        // Leveler: ratio opens up, threshold eases down, auto-makeup on.
+        // Leveler: ratio opens up, threshold eases down above centre (relaxes up below), auto-makeup on when uncalibrated.
         let leveler = centered(m.leveler);
         out.comp_ratio += leveler * LEVELER_RATIO_SPAN * 0.5;
-        out.comp_thresh_db -= upper(m.leveler) * LEVELER_THRESH_CUT_DB;
+        out.comp_thresh_db -= upper(m.leveler) * LEVELER_THRESH_CUT_DB + lower(m.leveler) * LEVELER_THRESH_RELIEF_DB;
         out.comp_auto_makeup = cal.is_none();
 
         // D-007: pinned parameters are no longer driven — copy from `current`.
@@ -346,6 +353,12 @@ fn upper(m: f32) -> f32 {
     centered(m).max(0.0)
 }
 
+/// Lower half of the macro range: `-1.0..=0.0` below the centre, `0.0` at and above.
+#[inline]
+fn lower(m: f32) -> f32 {
+    centered(m).min(0.0)
+}
+
 /// De-esser amount curve: `3 → 8 dB` over `presence = 0.6 → 1.0`, flat below.
 #[inline]
 fn deesser_amount(presence: f32) -> f32 {
@@ -356,7 +369,13 @@ fn deesser_amount(presence: f32) -> f32 {
 // Unit tests for the curve primitives.
 #[cfg(test)]
 mod tests {
-    use super::{PRESENCE_DEESSER_MAX_DB, PRESENCE_DEESSER_MIN_DB, centered, deesser_amount, upper};
+    use super::{
+        LEVELER_THRESH_RELIEF_DB, MacroMapper, PRESENCE_AIR_CUT_DB, PRESENCE_DEESSER_MAX_DB, PRESENCE_DEESSER_MIN_DB,
+        PRESENCE_PEAK_CUT_DB, centered, deesser_amount, lower, upper,
+    };
+    use crate::presets::DYNAMIC;
+    use tine_protocol::params::{Band, DspParams};
+    use tine_protocol::presets::{MacroPositions, PinSet};
 
     #[test]
     fn centered_is_zero_at_half() {
@@ -371,6 +390,40 @@ mod tests {
         assert_eq!(upper(0.5), 0.0);
         assert!((upper(0.75) - 0.5).abs() < f32::EPSILON);
         assert_eq!(upper(1.0), 1.0);
+    }
+
+    #[test]
+    fn lower_is_zero_at_and_above_half() {
+        assert_eq!(lower(0.0), -1.0);
+        assert!((lower(0.25) - (-0.5)).abs() < f32::EPSILON);
+        assert_eq!(lower(0.5), 0.0);
+        assert_eq!(lower(1.0), 0.0);
+    }
+
+    #[test]
+    fn presence_and_leveler_respond_below_midpoint() {
+        let soft = MacroMapper::apply(
+            &DYNAMIC,
+            None,
+            MacroPositions {
+                presence: 0.0,
+                leveler: 0.0,
+                ..MacroPositions::default()
+            },
+            PinSet::EMPTY,
+            &DspParams::DEFAULT,
+        );
+        assert!(
+            (soft.eq_gain_db[Band::B3.index()] - (DYNAMIC.base.eq_gain_db[Band::B3.index()] - PRESENCE_PEAK_CUT_DB))
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            (soft.eq_gain_db[Band::B4.index()] - (DYNAMIC.base.eq_gain_db[Band::B4.index()] - PRESENCE_AIR_CUT_DB))
+                .abs()
+                < 1e-5
+        );
+        assert!((soft.comp_thresh_db - (DYNAMIC.base.comp_thresh_db + LEVELER_THRESH_RELIEF_DB)).abs() < 1e-5);
     }
 
     #[test]

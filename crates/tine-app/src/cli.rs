@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use lexopt::Parser;
 use serde_json::{Value, json};
 use tine_engine::model::Macro;
-use tine_protocol::params::{ParamId, SPECS};
+use tine_protocol::params::{DenoiseEngine, ParamId, SPECS};
 use tine_protocol::presets::Archetype;
 
 use crate::proto::{PipeRequest, PipeResponse, exit_code};
@@ -77,6 +77,21 @@ pub enum CliCommand {
     Bypass {
         /// Enable state.
         on: bool,
+    },
+    /// `mute [on|off|toggle]`.
+    Mute {
+        /// `Some(true|false)` to set explicitly, `None` to toggle.
+        on: Option<bool>,
+    },
+    /// `denoise rnnoise|deepfilter|off`.
+    Denoise {
+        /// Denoiser engine identifier (`rnnoise`, `deepfilter`, `off`).
+        engine: String,
+    },
+    /// `ptt on|off` — Keep Warm (disable idle parking for push-to-talk).
+    Ptt {
+        /// `true` keeps the DSP routing loop warm even when no app is actively listening.
+        keep_warm: bool,
     },
     /// `monitor on|off [--device <id>]`.
     Monitor {
@@ -234,6 +249,18 @@ pub fn parse(args: Vec<OsString>) -> Result<Mode, String> {
         "bypass" => CliCommand::Bypass {
             on: on_off(&p, 0, "bypass on|off")?,
         },
+        "mute" => CliCommand::Mute {
+            on: match p.positional.first().map(String::as_str) {
+                None | Some("toggle") => None,
+                Some(_) => Some(on_off(&p, 0, "mute [on|off|toggle]")?),
+            },
+        },
+        "denoise" => CliCommand::Denoise {
+            engine: take_word(&p, 0, "denoise rnnoise|deepfilter|off")?,
+        },
+        "ptt" => CliCommand::Ptt {
+            keep_warm: on_off(&p, 0, "ptt on|off")?,
+        },
         "monitor" => CliCommand::Monitor {
             on: on_off(&p, 0, "monitor on|off")?,
             device: p.value("device").map(str::to_owned),
@@ -334,6 +361,20 @@ pub fn run(cmd: CliCommand) -> i32 {
             forward(&PipeRequest::Archetype { name }, "archetype")
         }
         CliCommand::Bypass { on } => forward(&PipeRequest::Bypass { on }, "bypass"),
+        CliCommand::Mute { on } => forward(&PipeRequest::Mute { on }, "mute"),
+        CliCommand::Denoise { engine } => {
+            let Some(parsed) = DenoiseEngine::from_name(&engine) else {
+                println!("error: unknown denoiser `{engine}` (rnnoise|deepfilter|off)");
+                return exit_code::USAGE;
+            };
+            forward(
+                &PipeRequest::SetDenoiseEngine {
+                    engine: parsed.as_str().to_owned(),
+                },
+                "denoise",
+            )
+        }
+        CliCommand::Ptt { keep_warm } => forward(&PipeRequest::SetParkWhenUnused { enabled: !keep_warm }, "ptt"),
         CliCommand::Monitor { on, device } => forward(&PipeRequest::Monitor { on, device }, "monitor"),
         CliCommand::Calibrate => forward(&PipeRequest::Calibrate, "calibrate"),
         CliCommand::Meters => forward(&PipeRequest::Meters, "meters"),
@@ -536,6 +577,10 @@ fn cmd_apo(sub: ApoSub, endpoint: Option<&str>) -> i32 {
                             sink.name,
                             if sink.is_available { "available" } else { "unavailable" }
                         );
+                        println!(
+                            "app microphone target: {}",
+                            tine_engine::listeners::capture_name_for_sink(&sink.name)
+                        );
                         exit_code::OK
                     }
                     Ok(None) => {
@@ -553,12 +598,47 @@ fn cmd_apo(sub: ApoSub, endpoint: Option<&str>) -> i32 {
                 exit_code::FAILURE
             }
         },
-        ApoSub::Install | ApoSub::Uninstall | ApoSub::Repair => {
-            println!("Nothing to do: Tine v0.1 routes through a virtual audio cable (D-018), so no");
-            println!("system APO is installed and no elevation is ever required:");
-            println!("  1. install \"VB-Audio Virtual Cable\" (or an equivalent virtual cable),");
-            println!("  2. select your real microphone in Tine and set the cable input as the");
-            println!("     microphone in your apps (`tine apo status` shows the current state).");
+        ApoSub::Install | ApoSub::Repair => match tine_engine::apo_admin::find_virtual_cable_sink() {
+            Ok(Some(sink)) if sink.is_available => {
+                let target = tine_engine::listeners::capture_name_for_sink(&sink.name);
+                println!("Virtual-cable routing (D-018) is active and healthy (no system APO needed).");
+                println!("  sink: {}", sink.name);
+                println!("  app microphone target: {target}");
+                println!("Select your physical mic in Tine and pick `{target}` in Discord/OBS/games.");
+                exit_code::OK
+            }
+            Ok(Some(sink)) => {
+                let target = tine_engine::listeners::capture_name_for_sink(&sink.name);
+                println!(
+                    "Virtual cable `{}` is installed, but currently disabled or unavailable.",
+                    sink.name
+                );
+                println!("To repair routing:");
+                println!("  1. Open Windows Sound Settings (`mmsys.cpl`),");
+                println!("  2. Enable `{}` under the Playback tab,", sink.name);
+                println!("  3. Enable `{target}` under the Recording tab,");
+                println!("  4. Run `tine apo status` to confirm it reports `available`.");
+                exit_code::FAILURE
+            }
+            Ok(None) => {
+                println!(
+                    "No supported virtual audio cable was detected (D-018 routes in user-space, no system APO needed)."
+                );
+                println!("Install one of the supported signed virtual cable drivers:");
+                println!("  - VB-Audio Virtual Cable (recommended): https://vb-audio.com/Cable/");
+                println!("  - VB-Audio Hi-Fi Cable / VoiceMeeter VAIO");
+                println!("  - Virtual Audio Cable (VAC)");
+                println!("Then reboot if prompted and run `tine apo status` to verify.");
+                exit_code::OK
+            }
+            Err(e) => {
+                println!("error checking virtual cable status: {e}");
+                exit_code::FAILURE
+            }
+        },
+        ApoSub::Uninstall => {
+            println!("Nothing to uninstall: Tine v0.1 routes in user-space through a virtual audio cable (D-018),");
+            println!("so no system APO is registered in audiodg.exe and no HKLM audio registry keys were modified.");
             exit_code::OK
         }
     }
@@ -578,6 +658,9 @@ pub fn usage() -> String {
          \x20 tine macro NAME VALUE      move a macro (purity|body|presence|leveler, 0.0..=1.0)\n\
          \x20 tine archetype NAME        dynamic|condenser|headset|laptop\n\
          \x20 tine bypass on|off         global A/B bypass\n\
+         \x20 tine mute [on|off|toggle]  click-free 5 ms output mute\n\
+         \x20 tine denoise ENGINE        rnnoise|deepfilter|off\n\
+         \x20 tine ptt on|off            Keep Warm (disable idle parking for push-to-talk)\n\
          \x20 tine monitor on|off [--device ID]   \"Hear Myself\"\n\
          \x20 tine calibrate             run the 8-second Auto-Tune\n\
          \x20 tine meters                live telemetry + spectrum\n\
@@ -640,6 +723,12 @@ mod tests {
         assert_eq!(
             super::parse(argv(&["bypass", "off"])),
             Ok(Mode::Cli(CliCommand::Bypass { on: false }))
+        );
+        assert_eq!(
+            super::parse(argv(&["denoise", "deepfilter"])),
+            Ok(Mode::Cli(CliCommand::Denoise {
+                engine: "deepfilter".to_owned()
+            }))
         );
         assert_eq!(
             super::parse(argv(&["archetype", "laptop"])),
@@ -724,5 +813,62 @@ mod tests {
     fn known_specs_keys_lookup() {
         assert!(param_id_by_key("input_gain_db").is_some());
         assert_eq!(param_id_by_key("does_not_exist"), None);
+    }
+
+    #[test]
+    fn parses_ptt_keep_warm() {
+        assert_eq!(
+            super::parse(argv(&["ptt", "on"])),
+            Ok(Mode::Cli(CliCommand::Ptt { keep_warm: true }))
+        );
+        assert_eq!(
+            super::parse(argv(&["ptt", "off"])),
+            Ok(Mode::Cli(CliCommand::Ptt { keep_warm: false }))
+        );
+        assert!(super::parse(argv(&["ptt", "maybe"])).is_err());
+    }
+
+    #[test]
+    fn parses_mute_flag() {
+        assert_eq!(
+            super::parse(argv(&["mute"])),
+            Ok(Mode::Cli(CliCommand::Mute { on: None }))
+        );
+        assert_eq!(
+            super::parse(argv(&["mute", "toggle"])),
+            Ok(Mode::Cli(CliCommand::Mute { on: None }))
+        );
+        assert_eq!(
+            super::parse(argv(&["mute", "on"])),
+            Ok(Mode::Cli(CliCommand::Mute { on: Some(true) }))
+        );
+        assert_eq!(
+            super::parse(argv(&["mute", "off"])),
+            Ok(Mode::Cli(CliCommand::Mute { on: Some(false) }))
+        );
+        assert!(super::parse(argv(&["mute", "invalid"])).is_err());
+    }
+
+    #[test]
+    fn usage_lists_all_cli_subcommands() {
+        let text = super::usage();
+        for cmd in [
+            "tine status",
+            "tine diag",
+            "tine set",
+            "tine macro",
+            "tine archetype",
+            "tine bypass",
+            "tine mute",
+            "tine denoise",
+            "tine ptt",
+            "tine monitor",
+            "tine calibrate",
+            "tine meters",
+            "tine apo",
+            "tine soak",
+        ] {
+            assert!(text.contains(cmd), "usage() missing `{cmd}`");
+        }
     }
 }
