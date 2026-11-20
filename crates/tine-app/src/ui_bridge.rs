@@ -1817,7 +1817,10 @@ fn child_dispatch(handle: &rune::AppHandle<AppState>, pipe: &str, model: &mut Ch
                     == Some("running");
             if running {
                 handle.update_if(move |s, tx| {
-                    if matches!(s.model.autotune.step, AutoTuneStep::Idle) {
+                    if matches!(
+                        s.model.autotune.step,
+                        AutoTuneStep::Idle | AutoTuneStep::Results | AutoTuneStep::Failed(_)
+                    ) {
                         s.ui.autotune_audition_raw = None;
                         s.ui.autotune_style = tine_dsp::calibrator::VoiceStyle::AutoBalanced;
                         s.model.autotune = AutoTuneUi {

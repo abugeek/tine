@@ -378,24 +378,57 @@ impl Drop for CalibrationPreviewPlayer {
     }
 }
 
+struct PlaybackPacer {
+    start: Instant,
+    rate_hz: u32,
+    prefill_samples: u64,
+    max_burst_samples: u64,
+    samples_pushed: u64,
+}
+
+impl PlaybackPacer {
+    fn new(rate_hz: u32, target_fill: usize) -> Self {
+        Self {
+            start: Instant::now(),
+            rate_hz: rate_hz.max(8_000),
+            prefill_samples: target_fill as u64,
+            max_burst_samples: target_fill as u64,
+            samples_pushed: 0,
+        }
+    }
+
+    fn due_samples(&mut self, now: Instant) -> usize {
+        let elapsed_s = now.saturating_duration_since(self.start).as_secs_f64();
+        let target_total = (elapsed_s * f64::from(self.rate_hz)) as u64 + self.prefill_samples;
+        if target_total.saturating_sub(self.samples_pushed) > self.max_burst_samples {
+            // Clamp catch-up after an OS scheduling stall so we never flood the
+            // playback ring or trigger adaptive-resampler speed-up.
+            self.samples_pushed = target_total.saturating_sub(self.max_burst_samples);
+        }
+        usize::try_from(target_total.saturating_sub(self.samples_pushed)).unwrap_or(usize::MAX)
+    }
+
+    fn record_pushed(&mut self, count: usize) {
+        self.samples_pushed = self.samples_pushed.saturating_add(count as u64);
+    }
+}
+
 fn fill_playback_ring(
     play_ring: &SpscRing<PLAY_RING_CAP>,
     fader: &mut AbCrossfader,
+    pacer: &mut PlaybackPacer,
     out_chunk: &mut [f32; 240],
-    target_fill: usize,
     want_raw: bool,
 ) {
-    let free = play_ring.free();
-    let buffered = PLAY_RING_CAP.saturating_sub(free);
-    if buffered < target_fill {
-        let push_blocks = ((target_fill - buffered) / out_chunk.len()).max(1);
-        for _ in 0..push_blocks {
-            if play_ring.free() < out_chunk.len() {
-                break;
-            }
-            fader.render_chunk(out_chunk, want_raw);
-            let _ = play_ring.push_slice(out_chunk);
-        }
+    let due = pacer.due_samples(Instant::now());
+    let mut pushed = 0usize;
+    while pushed < due && play_ring.free() >= out_chunk.len() {
+        fader.render_chunk(out_chunk, want_raw);
+        let _ = play_ring.push_slice(out_chunk);
+        pushed += out_chunk.len();
+    }
+    if pushed > 0 {
+        pacer.record_pushed(pushed);
     }
 }
 
@@ -433,7 +466,8 @@ fn run_calibration_preview(
     };
 
     let mut out_chunk = [0.0_f32; 240];
-    let target_fill = (safe_rate as usize / 20).clamp(1024, 4096);
+    let target_fill = (safe_rate as usize * 3 / 100).clamp(1024, 4096);
+    let mut pacer = PlaybackPacer::new(safe_rate, target_fill);
 
     while !stop.load(Ordering::Acquire) && !stream.has_error() {
         if let Some((new_params, new_engine)) = pending_update.lock().ok().and_then(|mut g| g.take()) {
@@ -442,7 +476,7 @@ fn run_calibration_preview(
         }
 
         let want_raw = is_raw.load(Ordering::Acquire);
-        fill_playback_ring(&play_ring, &mut fader, &mut out_chunk, target_fill, want_raw);
+        fill_playback_ring(&play_ring, &mut fader, &mut pacer, &mut out_chunk, want_raw);
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -554,7 +588,8 @@ fn run_worker(
     };
 
     let mut out_chunk = [0.0_f32; 240];
-    let target_fill = (rate_hz as usize / 20).clamp(1024, 4096);
+    let target_fill = (rate_hz as usize * 3 / 100).clamp(1024, 4096);
+    let mut pacer = PlaybackPacer::new(rate_hz, target_fill);
 
     while !stop.load(Ordering::Acquire) {
         if stream.has_error() {
@@ -566,7 +601,7 @@ fn run_worker(
         }
 
         let want_raw = is_raw.load(Ordering::Acquire);
-        fill_playback_ring(&play_ring, &mut fader, &mut out_chunk, target_fill, want_raw);
+        fill_playback_ring(&play_ring, &mut fader, &mut pacer, &mut out_chunk, want_raw);
 
         let mode = if want_raw {
             MicCheckMode::Raw

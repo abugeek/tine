@@ -944,8 +944,19 @@ fn action_for(key: &str) -> impl Fn(&mut AppState) + 'static {
             s.emit(Intent::DiscardCalibration);
         },
         // Retry restarts the wizard (the runner re-enters the Countdown phase).
+        // When invoked from the Results card, discard the pending calibration
+        // first so the backend clears `ReportPending` before starting anew.
         "autotune/retry" => |s: &mut AppState| {
             s.ui.autotune_audition_raw = None;
+            let has_pending = matches!(s.model.autotune.step, AutoTuneStep::Results)
+                || s.model.pending_calibration.is_some()
+                || s.model.calibration.is_some();
+            if has_pending {
+                s.model.pending_calibration = None;
+                s.model.calibration = None;
+                s.resolve_params_optimistic();
+                s.emit(Intent::DiscardCalibration);
+            }
             s.emit(Intent::StartAutoTune);
         },
         "autotune/apply" => |s: &mut AppState| {

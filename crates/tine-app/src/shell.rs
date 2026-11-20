@@ -174,7 +174,7 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     //    D-018: the target is the in-process parameter block the
     //    virtual-cable routing loop reads (the router is started below).
     let settings = persist::load_settings(&paths).into_value();
-    let endpoint = settings
+    let mut endpoint = settings
         .selected_endpoint_id
         .clone()
         .map(EndpointId::new)
@@ -247,6 +247,25 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     //     the block target the engine never emits `ApoLink`.
     let _ = services::set_denoise_engine(settings.denoise_engine);
     services::set_park_when_unused(settings.park_when_unused);
+    if settings.selected_endpoint_id.is_some()
+        && !capture_endpoint_exists(endpoint.as_str())
+        && let Some(fallback) = default_capture_endpoint()
+        && fallback != endpoint
+    {
+        tracing::warn!(
+            target: "tine::shell",
+            stale = endpoint.as_str(),
+            fallback = fallback.as_str(),
+            "saved capture endpoint no longer exists; falling back to default physical mic"
+        );
+        endpoint = fallback.clone();
+        let mut updated = settings.clone();
+        updated.selected_endpoint_id = Some(fallback.as_str().to_owned());
+        if let Err(e) = persist::save_settings(&updated, &shell.paths) {
+            tracing::warn!(target: "tine::shell", error = %e, "failed to persist fallback endpoint");
+        }
+        let _ = handle.send(Command::SelectEndpoint(fallback));
+    }
     let routed = services::router_follow(endpoint.as_str());
     shell.link = link_from_router(routed);
     shell.sync_tray(&tx);
@@ -472,6 +491,23 @@ pub fn run_app(background: bool, metrics: bool) -> i32 {
     drop(forwarder);
     drop(guard); // releases `Local\Tine.SingleInstance` and closes the pipe name
     code
+}
+
+/// Returns `true` if `target` matches an active capture device (or if
+/// enumeration fails, so a transient COM error never overwrites a saved
+/// endpoint).
+fn capture_endpoint_exists(target: &str) -> bool {
+    let Ok(inputs) = tine_engine::audio_io::list_inputs() else {
+        return true;
+    };
+    if inputs.is_empty() {
+        return true;
+    }
+    let raw_target = target.strip_prefix("wasapi:").unwrap_or(target);
+    inputs.iter().any(|d| {
+        let raw_id = d.id.strip_prefix("wasapi:").unwrap_or(&d.id);
+        d.id == target || raw_id == raw_target
+    })
 }
 
 /// Best-effort default capture endpoint: prefers the Windows default
