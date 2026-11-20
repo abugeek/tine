@@ -17,7 +17,7 @@ jobs:
     name: Miri (tine-protocol)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -29,7 +29,7 @@ jobs:
     name: Loom (tine-protocol)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
@@ -44,7 +44,7 @@ jobs:
     name: DSP Benchmarks
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
@@ -56,7 +56,7 @@ jobs:
     name: Headless UI Verification
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
