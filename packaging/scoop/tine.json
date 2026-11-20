@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/abugeek/tine/releases/download/v0.1.0/tine-0.1.0-portable-win-x64.zip",
-      "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+      "hash": "0f0c9018a6c0398725a22aa89ccf95fb744dd2b4c023c8799da3322397bfc081"
     }
   },
   "bin": "tine.exe",
